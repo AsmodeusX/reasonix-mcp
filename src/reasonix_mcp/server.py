@@ -36,7 +36,7 @@ detached agent daemon. Use reasonix_spawn once per child task and retain each
 session_id. Agents keep running even if this MCP server (or the MCP host —
 Claude Code, Codex, …) restarts — reasonix_list shows the fleet, reasonix_resume revives a session
 whose process died. For multiple children keep one reasonix_watch call in
-flight with all ids; it returns complete results for completion, permission,
+flight with all ids; it returns compact results for completion, permission,
 or process death without a follow-up poll. Use one non-overlapping watch per
 orchestrator fleet; remove terminal ids and watch the remaining ids again. If
 a result contains
@@ -57,7 +57,8 @@ and agent questions; the selected option is returned to the child
 automatically. Watch remains authoritative when elicitation is unavailable,
 declined, or canceled. reasonix_poll is for explicit snapshots and
 reasonix_wait is the legacy output-sensitive long poll.
-Terminal errors include error_text; poll exposes plan and current_work. The
+Set watch detail=true, poll, or read the transcript only when deeper output is
+needed. Terminal errors include error_text; watch exposes plan and current_work. The
 daemon and MCP server log event emission/relay results to stderr.
 Lifecycle controls:
 - reasonix_restart_mcp_server() reloads only this orchestrator's MCP stdio
@@ -495,6 +496,7 @@ async def reasonix_wait(
 async def reasonix_watch(
     session_ids: list[str],
     timeout: float | None = None,
+    detail: bool = False,
     include_events: list[str] | None = None,
     exclude_events: list[str] | None = None,
     include_thought: bool = common.DEFAULT_INCLUDE_THOUGHT,
@@ -503,9 +505,10 @@ async def reasonix_watch(
     ctx: Context | None = None,
 ) -> dict:
     """Wait for completion, permission/question, or process death and return
-    complete poll-shaped results for every woken agent. No follow-up poll is
-    needed. The default timeout is disabled: keep one call in flight as the
-    reliable model-visible callback. Wire notifications are diagnostic only.
+    compact results for every woken agent. The default omits event history,
+    thought, duplicate turn text, and full history; set detail=true for the
+    poll-shaped result. The timeout is disabled by default. Wire notifications
+    are diagnostic only.
     """
     _capture_relay_ctx(ctx)
     for session_id in session_ids:
@@ -514,6 +517,7 @@ async def reasonix_watch(
     return await _rpc("watch", {
         "session_ids": session_ids,
         "timeout": timeout,
+        "detail": detail,
         "include_events": include_events,
         "exclude_events": exclude_events,
         "include_thought": include_thought,

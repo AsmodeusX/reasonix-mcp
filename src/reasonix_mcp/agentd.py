@@ -388,11 +388,11 @@ class Agentd:
             await asyncio.sleep(0.2)
 
     async def watch(self, params: dict) -> dict:
-        """Block for an actionable event and return its complete poll result.
+        """Block for an actionable event and return a compact result by default.
 
         Unlike wait, this does not wake for text chunks or plan updates and it
-        consumes the result itself, so the orchestrator needs no follow-up
-        poll. With no timeout it is a durable in-flight MCP callback.
+        drains the bounded event queue while omitting its detail unless
+        detail=true. With no timeout it is a durable in-flight MCP callback.
         """
         session_ids = params.get("session_ids", [])
         if not session_ids:
@@ -444,7 +444,7 @@ class Agentd:
         while True:
             woke = [sid for sid, agent in agents.items() if actionable(agent)]
             if woke:
-                results = {
+                detailed = {
                     sid: self.poll({
                         "session_id": sid,
                         "owner_id": owner_id,
@@ -456,6 +456,10 @@ class Agentd:
                     })
                     for sid in woke
                 }
+                results = (
+                    detailed if params.get("detail")
+                    else {sid: self._compact_watch_result(result) for sid, result in detailed.items()}
+                )
                 return {"woke": woke, "timed_out": False, "results": results}
             waiter = asyncio.get_running_loop().create_future()
             self._watch_waiters.add(waiter)
@@ -482,6 +486,42 @@ class Agentd:
                     await waiter
                 finally:
                     self._watch_waiters.discard(waiter)
+
+    @staticmethod
+    def _compact_watch_result(detailed: dict) -> dict:
+        """Reduce a consumed poll result to one context-lean outcome."""
+        turns = detailed.get("turns") or []
+        message = str(turns[-1].get("text") or "") if turns else str(detailed.get("text") or "")
+        limit = max(0, common.MAX_WATCH_MESSAGE)
+        message_truncated = len(message) > limit
+        if message_truncated:
+            if limit == 0:
+                message = ""
+            else:
+                marker = "\n…[watch message truncated]…\n"
+                available = max(0, limit - len(marker))
+                head = available // 2
+                tail = available - head
+                message = (
+                    marker[:limit] if not available
+                    else message[:head] + marker + message[-tail:]
+                )
+        result = {
+            "session_id": detailed.get("session_id"),
+            "status": detailed.get("status"),
+            "stop_reason": detailed.get("stop_reason"),
+            "message": message,
+            "message_truncated": message_truncated,
+            "permission_request": detailed.get("permission_request"),
+            "plan": detailed.get("plan") or [],
+            "current_work": detailed.get("current_work"),
+            "transcript_path": detailed.get("transcript_path"),
+            "detail_available": True,
+        }
+        if detailed.get("error") is not None:
+            result["error"] = detailed["error"]
+            result["error_text"] = detailed.get("error_text")
+        return result
 
     def list(self, params: dict | None = None) -> dict:
         params = params or {}

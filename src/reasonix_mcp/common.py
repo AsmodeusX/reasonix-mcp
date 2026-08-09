@@ -24,6 +24,7 @@ MAX_EVENTS_PER_POLL = int(os.environ.get("REASONIX_MCP_MAX_EVENTS_PER_POLL", "20
 DEFAULT_MAX_EVENTS_PER_POLL = int(os.environ.get("REASONIX_MCP_DEFAULT_MAX_EVENTS_PER_POLL", "50"))  # ordinary poll tail
 MAX_DELTA_TEXT = int(os.environ.get("REASONIX_MCP_MAX_DELTA_TEXT", "100000"))  # chars of new text/thought per poll (tail kept)
 MAX_FULL_TEXT = int(os.environ.get("REASONIX_MCP_MAX_FULL_TEXT", "200000"))  # chars of full_text/full_thought (tail kept)
+MAX_WATCH_MESSAGE = int(os.environ.get("REASONIX_MCP_MAX_WATCH_MESSAGE", "4000"))
 
 # Poll defaults: thought and the full_* accumulators are OPT-IN — reasoning is
 # the bulk of what effort=max models emit; orchestrators act on answer + tool

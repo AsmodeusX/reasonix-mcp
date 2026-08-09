@@ -103,12 +103,19 @@ async def main() -> None:
                 watched_result = watched["results"][sid2]
                 assert watched_result["status"] in ("idle", "exited"), watched_result
                 assert watched_result["stop_reason"] == "error", watched_result
+                assert watched_result["detail_available"] is True
+                assert not ({"events", "turns", "text", "thought", "full_text"} & watched_result.keys())
                 print("reasonix_watch returned terminal result without poll")
                 repeated = await call(session, "reasonix_watch", {
                     "session_ids": [sid2], "timeout": 0,
                 })
                 assert repeated["timed_out"] and repeated["woke"] == [], repeated
                 print("reasonix_watch delivers each terminal turn once")
+                retained = await call(session, "reasonix_poll", {
+                    "session_id": sid2, "include_full": True,
+                })
+                assert "full_text" in retained, "full accumulated output must remain retrievable"
+                print("compact watch leaves full output available for opt-in retrieval")
 
                 # first poll: static boilerplate must be filtered out; if the
                 # 401 turn already ended, turns carries it (consumed here);

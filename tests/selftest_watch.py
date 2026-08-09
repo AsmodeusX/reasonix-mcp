@@ -12,6 +12,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src", "reasonix_mcp"))
 
 from agentd import Agentd, AgentdError  # noqa: E402
+import common  # noqa: E402
 
 
 async def main() -> None:
@@ -49,6 +50,22 @@ async def main() -> None:
 
     assert not daemon._watch_waiters, daemon._watch_waiters
     assert not daemon._active_watch_sessions, daemon._active_watch_sessions
+
+    long_text = "A" * (max(0, common.MAX_WATCH_MESSAGE) + 100)
+    compact = daemon._compact_watch_result({
+        "session_id": "compact",
+        "status": "idle",
+        "stop_reason": "end_turn",
+        "text": long_text,
+        "turns": [{"text": long_text, "stop_reason": "end_turn"}],
+        "permission_request": None,
+        "plan": [],
+        "current_work": None,
+        "transcript_path": "/tmp/compact.jsonl",
+    })
+    assert compact["message_truncated"] is True
+    assert len(compact["message"]) <= max(0, common.MAX_WATCH_MESSAGE)
+    assert not ({"events", "turns", "text", "thought", "full_text"} & compact.keys())
     print("WATCH CONCURRENCY SELFTEST PASS")
 
 

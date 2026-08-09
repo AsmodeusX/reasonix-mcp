@@ -176,7 +176,7 @@ def main() -> None:
             results.update(w["results"])
             remaining.difference_update(w["woke"])
         got = [
-            "".join(t.get("text", "") for t in results[sid].get("turns", []))[:20]
+            results[sid].get("message", "")[:20]
             for sid in ids
         ]
         print("watch collected:", len(results), "of 6 without polling")

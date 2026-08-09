@@ -34,7 +34,7 @@ shut down (killing the daemon kills its agents — they carry PDEATHSIG).
   disabled by default. Use `keep_alive=true` for interactive follow-up turns.
 - **Resume** revives a stopped/crashed session from its persisted transcript.
 - **Stop** cancels + closes + kills; the session stays listed and resumable.
-- **Wake-up**: keep `reasonix_watch` in flight. It returns complete terminal or
+- **Wake-up**: keep `reasonix_watch` in flight. It returns compact terminal or
   permission results directly, with no timeout and no follow-up poll by default.
   Wire notifications are diagnostics only.
 
@@ -76,7 +76,7 @@ your MCP client and verify the server is listed.
 | `reasonix_send(session_id, message, expect?)` | Forced steer: queue as mid-turn guidance, or start a new turn if idle. Never dropped. `expect="steer"` refuses to start a new turn. |
 | `reasonix_poll(session_id, include_events?, exclude_events?, include_thought?, include_full?, max_events?)` | New output / status / completed turns / current `plan` / pending permission request. Static boilerplate is filtered and events are a recent tail by default. |
 | `reasonix_transcript(session_id, max_tool_calls?)` | What the agent actually did: tool calls with args, files touched (write/read/bash), roles, work duration, last text — powers rebase decisions. (Reasonix does not persist token/cost usage; these are activity metrics.) |
-| `reasonix_watch(session_ids, timeout?, …poll options)` | Primary callback: block indefinitely by default until completion, permission/question, or process death, then return complete poll-shaped results. |
+| `reasonix_watch(session_ids, timeout?, detail?, …poll options)` | Primary callback: block indefinitely by default until completion, permission/question, or process death. Returns a compact result; `detail=true` opts into the poll-shaped result. |
 | `reasonix_wait(session_ids, timeout?)` | Block until any watched session produces output, finishes a turn, or raises a permission request. |
 | `reasonix_list(include_task?)` | All live sessions: id, status, cwd, compact task preview, transcript_path. Set `include_task=true` for full prompts. |
 | `reasonix_respond_permission(session_id, option_id)` | Answer a tool-approval request (`option_id` from watch/poll's `permission_request.options`, or `"cancel"`). |
@@ -87,8 +87,10 @@ your MCP client and verify the server is listed.
 ### Completion and decision delivery
 
 Keep `reasonix_watch(session_ids)` in flight while agents work. It returns when
-a child finishes, exits, or needs a decision, with each complete poll-shaped
-result in `results[session_id]`. Its timeout is disabled by default and it does
+a child finishes, exits, or needs a decision, with each compact result in
+`results[session_id]`. By default each result contains only status,
+stop reason, one capped message, permission details, plan/current work, errors,
+and transcript path. Its timeout is disabled by default and it does
 not wake for ordinary text chunks, so no timer loop or follow-up poll is needed.
 Use one non-overlapping watch per orchestrator fleet. If another child finishes
 while a result is being handled, its terminal state remains pending and the
@@ -97,6 +99,12 @@ rejected to prevent duplicate permission delivery. If the MCP host or server
 restarts during a watch, reconnect, recover the owned fleet with
 `reasonix_list`, and watch it again; undelivered terminal state remains pending
 in agentd.
+
+Compact watch consumes queued events so long-running sessions stay bounded.
+Use `reasonix_watch(..., detail=true)` when raw event/turn detail is wanted
+immediately. Full accumulated text remains available afterward through
+`reasonix_poll(include_full=true)`, and tool history through
+`reasonix_transcript`.
 
 For diagnostics, the server also emits this custom notification on the wire:
 
@@ -232,7 +240,7 @@ env-overridable: `REASONIX_MCP_INCLUDE_THOUGHT=1`, `REASONIX_MCP_INCLUDE_FULL=1`
 ```
 spawn 6–8 agents (note session_ids, each spawn reports its sandbox posture)
 loop:
-  event = reasonix_watch(all ids)      # no timeout; full terminal/permission results
+  event = reasonix_watch(all ids)      # no timeout; compact terminal/permission results
   handle event.results                 # no follow-up poll
   reasonix_send(sid, msg, expect="steer") when a discovery invalidates a round
   drop finished ids from the watch list; reasonix_stop() the rest when done
@@ -248,6 +256,7 @@ the cuts are reported, never silent:
 | --- | --- |
 | `events` | recent tail (50 by default; explicit cap 200) — `events_dropped` counts the cut |
 | `text` | last `MAX_DELTA_TEXT` (100k) chars — `text_truncated` |
+| compact watch `message` | first/last `MAX_WATCH_MESSAGE` (4k) chars — `message_truncated` |
 | `thought` / `full_thought` (only with `include_thought`) | last `MAX_FULL_TEXT` (200k) chars — `*_truncated` |
 | `full_text` (only with `include_full`) | last `MAX_FULL_TEXT` (200k) chars — `full_text_truncated` |
 

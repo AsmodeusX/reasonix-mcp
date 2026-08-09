@@ -80,12 +80,12 @@ async def main() -> None:
                 print("responded:", r)
 
                 watched = await call(session, "reasonix_watch", {
-                    "session_ids": [sid], "timeout": 180, "include_full": True,
+                    "session_ids": [sid], "timeout": 180,
                 })
                 assert not watched["timed_out"] and watched["woke"] == [sid], watched
                 final = watched["results"][sid]
                 assert final["status"] in ("idle", "exited"), final
-                print("stop_reason:", final.get("stop_reason"), "| text:", final.get("full_text", "")[-200:])
+                print("stop_reason:", final.get("stop_reason"), "| text:", final.get("message", "")[-200:])
                 wrote = os.path.isfile(PROBE) and open(PROBE).read() == "PERMISSION_OK"
                 print("probe file written after approval:", wrote)
                 assert wrote, "approved bash command did not produce the file"
