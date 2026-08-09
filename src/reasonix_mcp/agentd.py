@@ -324,6 +324,28 @@ class Agentd:
     def shutdown(self, params: dict | None = None) -> dict:
         """Close every agent and stop the daemon (used by tests; the real
         deployment just leaves the daemon running)."""
+        return self._shutdown_agents()
+
+    def restart(self, params: dict | None = None) -> dict:
+        """Stop this daemon so the MCP server can start a fresh copy.
+
+        Refuse by default when live agents exist: restarting the daemon kills
+        them because they are deliberately tied to its lifetime. Exited
+        tombstones are safe to discard. A caller must explicitly opt into
+        disrupting live agents with force=true.
+        """
+        force = bool((params or {}).get("force", False))
+        with self._lock:
+            agents = list(self._registry.items())
+        live = [sid for sid, agent in agents if common.agent_status(agent) != "exited"]
+        if live and not force:
+            raise AgentdError(
+                "cannot restart agentd while live agents exist; stop them first "
+                f"or call reasonix_restart_agentd(force=true): {live}"
+            )
+        return self._shutdown_agents()
+
+    def _shutdown_agents(self) -> dict:
         with self._lock:
             agents = list(self._registry.values())
             self._registry.clear()
@@ -334,7 +356,7 @@ class Agentd:
                 pass
         if self._serve_stop is not None:
             self._loop.call_soon_threadsafe(self._serve_stop.set)
-        return {"shutdown": True}
+        return {"shutdown": True, "agents_stopped": len(agents)}
 
     # ------------------------------------------------------------- dispatch
 

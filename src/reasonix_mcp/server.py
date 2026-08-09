@@ -13,7 +13,7 @@ the fleet running; reasonix_resume revives sessions whose process died.
 Tools:
   reasonix_spawn / reasonix_resume / reasonix_send / reasonix_poll
   reasonix_wait / reasonix_list / reasonix_models / reasonix_transcript
-  reasonix_respond_permission / reasonix_stop
+  reasonix_respond_permission / reasonix_stop / reasonix_restart_agentd
 """
 
 from __future__ import annotations
@@ -43,8 +43,10 @@ expect=steer to redirect an active turn, expect=new_turn to start work only
 when idle. reasonix_transcript summarizes what an agent actually did (tool
 calls, files touched) for rebasing decisions. Each child pushes a
 reasonix/agent_event notification (best-effort) when it finishes a turn, needs
-a permission decision, or exits; terminal errors include error_text. The custom notification may be dropped by the
-client, so reasonix_wait/poll are the guaranteed control path. Keep
+a permission decision, or exits; terminal errors include error_text. The
+custom notification may be dropped by the client, so reasonix_wait/poll are the
+guaranteed control path. Use reasonix_restart_agentd after updating this
+server; it reloads the daemon once no live agents remain. Keep
 orchestration state in the parent agent, and do not claim a child is complete
 until its poll reports idle/exited status and a stop reason."""
 
@@ -93,14 +95,14 @@ async def _ensure_agentd() -> None:
         else:
             raise RuntimeError(f"agentd did not start on {sock} — see agentd.log")
     _agentd_reader, _agentd_writer = reader, writer
-    asyncio.create_task(_read_agentd())
+    asyncio.create_task(_read_agentd(reader, writer))
 
 
-async def _read_agentd() -> None:
-    global _agentd_writer
+async def _read_agentd(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    global _agentd_reader, _agentd_writer
     try:
         while True:
-            line = await _agentd_reader.readline()
+            line = await reader.readline()
             if not line:
                 break
             try:
@@ -119,7 +121,12 @@ async def _read_agentd() -> None:
             if not fut.done():
                 fut.set_result({"error": {"code": -32000, "message": "agentd disconnected (its agents exited)"}})
         _pending.clear()
-        _agentd_writer = None
+        # An old reader can finish after a replacement connection is already
+        # installed. Do not let it clear the replacement writer.
+        if _agentd_reader is reader:
+            _agentd_reader = None
+        if _agentd_writer is writer:
+            _agentd_writer = None
 
 
 async def _rpc(method: str, params: dict, timeout: float = _rpc_default_timeout) -> dict:
@@ -297,6 +304,51 @@ async def reasonix_stop(session_id: str) -> dict:
     The session stays listed as a tombstone and is resumable via
     reasonix_resume (its transcript is persisted)."""
     return await _rpc("stop", {"session_id": session_id})
+
+
+@mcp.tool()
+async def reasonix_restart_agentd(force: bool = False) -> dict:
+    """Restart the detached agent daemon so it loads updated code.
+
+    By default this refuses while live agents exist. Set force=true only when
+    terminating those agents is acceptable; their transcripts remain
+    resumable. The next Reasonix tool call automatically starts the fresh
+    daemon.
+    """
+    global _agentd_reader, _agentd_writer
+    try:
+        result = await _rpc("restart", {"force": force})
+    except ValueError as exc:
+        # A daemon started before this tool existed only knows `shutdown`.
+        # Use its existing ping method to preserve the safe refusal behavior
+        # before falling back to shutdown.
+        if "unknown method 'restart'" not in str(exc):
+            raise
+        state = await _rpc("ping", {})
+        sessions = int(state.get("sessions", 0))
+        if sessions and not force:
+            raise ValueError(
+                "the running agentd predates restart support and has "
+                f"{sessions} session(s); stop them first or retry with force=true"
+            )
+        result = await _rpc("shutdown", {})
+        result["compatibility_fallback"] = "shutdown"
+    result["restarted"] = True
+    result["note"] = (
+        "agentd has stopped; the next Reasonix tool call starts a fresh daemon "
+        "from the current code. Other MCP clients sharing this daemon must "
+        "reconnect on their next call."
+    )
+    writer = _agentd_writer
+    _agentd_reader = None
+    _agentd_writer = None
+    if writer is not None:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+    return result
 
 
 def main() -> None:

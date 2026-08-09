@@ -75,6 +75,7 @@ your MCP client and verify the server is listed.
 | `reasonix_list(include_task?)` | All live sessions: id, status, cwd, compact task preview, transcript_path. Set `include_task=true` for full prompts. |
 | `reasonix_respond_permission(session_id, option_id)` | Answer a tool-approval request (`option_id` from poll's `permission_request.options`, or `"cancel"`). |
 | `reasonix_stop(session_id)` | Cancel + close + kill the agent (tombstone: poll keeps reporting `exited`). |
+| `reasonix_restart_agentd(force?)` | Reload the detached daemon from updated code. Refuses while live agents exist unless `force=true`; the next tool call starts the fresh daemon. |
 
 ### Agent-done callbacks (push)
 
@@ -245,6 +246,16 @@ change that agent; inspect the spawn response for its effective posture. Under
 `permission_request` in poll — answer with `reasonix_respond_permission`;
 approving blind is not required: the request's `tool_call` carries the tool
 name (`title`/`kind`) and `rawInput` (the JSON arguments).
+
+### Updating the daemon
+
+After updating this repository, call `reasonix_restart_agentd()` from the MCP
+client. It safely reloads `agentd` when no live agents remain. If live agents
+can be discarded, use `reasonix_restart_agentd(force=true)`; their persisted
+transcripts can be resumed after the fresh daemon starts. The next tool call
+automatically starts the new daemon, so no shell command or socket cleanup is
+needed. The daemon is shared by MCP clients, so a restart disconnects other
+clients too; they reconnect automatically on their next tool call.
 
 ## Safety
 
