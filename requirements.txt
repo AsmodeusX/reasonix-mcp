@@ -1,1 +1,5 @@
-mcp>=1.2
+# reasonix-mcp — requires Python >= 3.11 (uses tomllib and `X | None` unions).
+# Pinned to the tested version: the code uses the mcp 2.x MCPServer API
+# (mcp.server.mcpserver) and touches the connection's outbound channel for
+# notification relay — mcp 1.x does not provide these.
+mcp==2.0.0
