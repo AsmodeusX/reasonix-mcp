@@ -46,6 +46,24 @@ DEFAULT_TOOL_APPROVAL = os.environ.get("REASONIX_MCP_DEFAULT_TOOL_APPROVAL", "yo
 # also disables it per spawn for interactive sessions.
 DEFAULT_IDLE_TIMEOUT = float(os.environ.get("REASONIX_MCP_IDLE_TIMEOUT", "-1"))
 
+# The native ACP `plan` update is the authoritative todo channel. This small
+# contract makes agents use it consistently for coding tasks while preserving
+# explicit task-level restrictions such as "use exactly this one tool".
+STATUS_PROMPT_MARKER = "[reasonix-mcp orchestrator status protocol]"
+STATUS_PROMPT = f"""
+{STATUS_PROMPT_MARKER}
+The orchestrator can read your structured todo and current activity. Unless
+the task explicitly restricts which tools you may use or asks for an exact
+tool sequence, use the native plan tool for non-trivial work:
+- create a concise todo of concrete steps before making changes;
+- keep exactly the current step marked in_progress;
+- update the plan when the current focus changes and mark finished steps
+  completed;
+- do not mark a step completed until it is actually verified.
+Keep the plan factual and concise. This is machine-readable progress state;
+you do not need to narrate it in every response.
+""".strip()
+
 # Spawn cwd confinement: agents may only root at the caller's project dir (and
 # subdirs) plus the [sandbox] allow_write dirs. Escapes with
 # REASONIX_MCP_ALLOW_ANY_CWD=1.
@@ -140,6 +158,13 @@ def task_preview(task: object, limit: int = 120) -> str:
     return value[: max(0, limit - 1)].rstrip() + "…"
 
 
+def task_with_status_protocol(task: str) -> str:
+    """Add the progress contract without overriding explicit task constraints."""
+    if STATUS_PROMPT_MARKER in task:
+        return task
+    return f"{task.rstrip()}\n\n{STATUS_PROMPT}"
+
+
 def agent_status(agent: acp_bridge.ReasonixAgent) -> str:
     if agent.status == "exited":
         return "exited"
@@ -147,7 +172,8 @@ def agent_status(agent: acp_bridge.ReasonixAgent) -> str:
 
 
 def build_agent_event(agent: acp_bridge.ReasonixAgent, kind: str, payload: dict) -> dict:
-    """The agent_event payload pushed on turn end / permission / process exit.
+    """The agent_event payload pushed on progress / turn end / permission /
+    process exit.
 
     Built by the daemon (which owns the agents), relayed verbatim by the MCP
     server as both the custom `reasonix/agent_event` notification and a
@@ -184,6 +210,11 @@ def build_agent_event(agent: acp_bridge.ReasonixAgent, kind: str, payload: dict)
             event["error"] = payload["error"]
         if payload.get("error_text"):
             event["error_text"] = payload["error_text"]
+    elif kind == acp_bridge.EV_STATUS:
+        event["event"] = "status"
+        event["plan"] = list(payload.get("plan") or [])
+        event["current_work"] = payload.get("current_work")
+        event["note"] = "agent progress plan changed"
     return event
 
 
@@ -487,6 +518,10 @@ def shape_poll(
         "text_truncated": text_truncated,
         "turns": agent.snapshot_turns(),
         "plan": list(getattr(agent, "plan_entries", []) or []),
+        "current_work": (
+            dict(getattr(agent, "current_work", None))
+            if getattr(agent, "current_work", None) else None
+        ),
         "events": events,
         "events_dropped": dropped_events,
         "events_filtered": filtered,

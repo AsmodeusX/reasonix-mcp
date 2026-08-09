@@ -44,8 +44,9 @@ expect=steer to redirect an active turn, expect=new_turn to start work only
 when idle. reasonix_transcript summarizes what an agent actually did (tool
 calls, files touched) for rebasing decisions. Each child pushes a
 reasonix/agent_event notification (best-effort) when it finishes a turn, needs
-a permission decision, or exits; terminal errors include error_text. The
-custom notification may be dropped by the client, so reasonix_wait/poll are the
+a permission decision, reports a plan change, or exits; terminal errors
+include error_text. Progress events include the current plan and current_work.
+The custom notification may be dropped by the client, so reasonix_wait/poll are the
 guaranteed control path. Use reasonix_restart_agentd after updating this
 server; it reloads the daemon once no live agents remain. Keep
 orchestration state in the parent agent. Completed agents can be cleaned up
@@ -321,7 +322,7 @@ async def reasonix_poll(
     """Read recent output the agent produced since the last poll.
 
     Always returns text (delta), turns (completed, with stop_reason), plan,
-    events, status, permission_request. Ordinary polls return a small recent
+    current_work, events, status, permission_request. Ordinary polls return a small recent
     event tail; include_events opts event types back in (and gets the larger
     event cap). Static setup events are filtered by default. thought/full_* are
     opt-in (include_thought / include_full). Errors include error_text.

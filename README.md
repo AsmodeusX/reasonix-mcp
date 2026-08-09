@@ -94,7 +94,7 @@ of having to poll:
   "stop_reason": "end_turn", "transcript_path": "…", "note": "…"}}
 ```
 
-- Events: `turn_end` (done/stopped/errored, with `stop_reason`),
+- Events: `status` (plan/current-work update), `turn_end` (done/stopped/errored, with `stop_reason`),
   `permission_request` (a tool-approval **or an agent question** — see
   below), `process_exited`.
 - Best-effort: MCP custom notifications are never fatal, and a client that
@@ -190,6 +190,11 @@ from `events` (they are implied by spawn and available via `transcript_path`);
 - `exclude_events=[...]` — drop additional types;
 - the orchestrator-relevant set is `tool_call`, `tool_call_update`, `plan`,
   `permission_request`.
+
+Every poll also includes `current_work`: the active native tool call when one
+is running, or the plan step marked `in_progress`. Agents spawned through this
+server receive a small status contract asking them to keep that plan current;
+explicit task restrictions on tools take precedence.
 
 `turns` in poll results gives completed turns as `[{text, stop_reason}]` —
 clean turn boundaries (full_text alone concatenates turns).

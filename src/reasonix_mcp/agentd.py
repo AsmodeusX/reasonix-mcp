@@ -184,7 +184,7 @@ class Agentd:
         agent.keep_alive = keep_alive
         agent.idle_timeout = idle_timeout
         self._register(agent)
-        agent.start_turn(task)
+        agent.start_turn(common.task_with_status_protocol(task))
         posture = common.sandbox_posture()
         for warning in posture.get("warnings", []):
             print(f"warning: {warning}", file=sys.stderr, flush=True)
@@ -284,7 +284,7 @@ class Agentd:
                 if e.code != acp_bridge.ERR_INVALID_REQUEST:
                     raise AgentdError(e.message, e.code) from e
             try:
-                agent.start_turn(message)
+                agent.start_turn(common.task_with_status_protocol(message))
                 delivered = "new_turn"
                 note = "no active turn; started a new turn with the message"
                 break
@@ -335,6 +335,11 @@ class Agentd:
                     "has_new": has_new,
                     "permission_request": pending,
                     "stop_reason": a.stop_reason if status != "running" else None,
+                    "plan": list(getattr(a, "plan_entries", []) or []),
+                    "current_work": (
+                        dict(getattr(a, "current_work", None))
+                        if getattr(a, "current_work", None) else None
+                    ),
                 }
                 if getattr(a, "last_error", None) is not None:
                     states[sid]["error"] = a.last_error
@@ -369,6 +374,11 @@ class Agentd:
                 "stop_reason": a.stop_reason,
                 "transcript_path": getattr(a, "transcript_path", None),
                 "permission_request": a._pending_permission is not None,
+                "plan": list(getattr(a, "plan_entries", []) or []),
+                "current_work": (
+                    dict(getattr(a, "current_work", None))
+                    if getattr(a, "current_work", None) else None
+                ),
                 "resumable": status in ("idle", "exited") and os.path.isfile(persisted),
             }
             if getattr(a, "last_error", None) is not None:

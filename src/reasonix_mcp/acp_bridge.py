@@ -63,6 +63,7 @@ EV_UPDATE = "update"  # payload: session/update notification dict (params.update
 EV_PERMISSION = "permission_request"  # payload: {"id": ..., "params": {...}}
 EV_TURN_END = "turn_end"  # payload: {"stopReason": ..., "transcriptPath": ...}
 EV_PROCESS_EXIT = "process_exited"  # payload: {"stderr": "...", "code": ...}
+EV_STATUS = "agent_status"  # payload: {"plan": ..., "current_work": ...}
 
 # Hours-long turns stream a lot: bound the unpolled event queue (dropping only
 # droppable update events — critical ones are never dropped) so an agent that
@@ -157,7 +158,8 @@ class ReasonixAgent:
         """
         on_event: optional callback invoked (from the reader thread) when the
         agent emits an orchestrator-relevant event: EV_TURN_END (done/stopped),
-        EV_PERMISSION (needs approval), EV_PROCESS_EXIT (process died).
+        EV_PERMISSION (needs approval), EV_PROCESS_EXIT (process died), or
+        EV_STATUS (the plan changed).
         """
         self.session_id: str | None = None
         self.status = "starting"  # starting | idle | running | exited
@@ -197,6 +199,9 @@ class ReasonixAgent:
         # The agent's current todo list (last `plan` sessionUpdate), so the
         # orchestrator can see what the agent is doing right now.
         self.plan_entries: list[dict] = []
+        self._tool_calls: dict[str, dict] = {}
+        self._last_tool_call: dict | None = None
+        self.current_work: dict | None = None
 
         binary = resolve_reasonix_binary(reasonix_bin)
         env = dict(os.environ)
@@ -390,6 +395,7 @@ class ReasonixAgent:
         queue is full, oldest droppable update events are discarded; critical
         events (permission, turn_end, process_exit) are kept.
         """
+        status_payload: dict | None = None
         with self._qlock:
             if kind == EV_UPDATE:
                 su = payload.get("sessionUpdate")
@@ -404,6 +410,24 @@ class ReasonixAgent:
                         self.full_thought_parts.append(text)
                 if su == "plan":
                     self.plan_entries = payload.get("entries") or []
+                    self._refresh_current_work()
+                    status_payload = {
+                        "plan": list(self.plan_entries),
+                        "current_work": dict(self.current_work) if self.current_work else None,
+                    }
+                elif su in ("tool_call", "tool_call_update"):
+                    tool_call_id = payload.get("toolCallId") or payload.get("tool_call_id")
+                    if tool_call_id:
+                        key = str(tool_call_id)
+                        call = self._tool_calls.setdefault(key, {})
+                        call.update(payload)
+                        if str(call.get("status", "")).lower() in {
+                            "completed", "failed", "cancelled", "declined"
+                        }:
+                            self._tool_calls.pop(key, None)
+                    else:
+                        self._last_tool_call = dict(payload)
+                    self._refresh_current_work()
                 if self._events.qsize() >= MAX_QUEUED_EVENTS:
                     dropped = 0
                     while self._events.qsize() >= MAX_QUEUED_EVENTS and dropped < MAX_QUEUED_EVENTS:
@@ -430,6 +454,7 @@ class ReasonixAgent:
                 self.turns.append(turn)
                 self._current_parts = []
                 self.stop_reason = payload.get("stopReason") or self.stop_reason
+                self.current_work = None
                 if payload.get("transcriptPath"):
                     self.transcript_path = payload["transcriptPath"]
             elif kind == EV_PROCESS_EXIT:
@@ -443,11 +468,62 @@ class ReasonixAgent:
             self.event_seq += 1
             # Orchestrator callback (best-effort, from the reader thread):
             # push when the agent finishes/stops, needs approval, or dies.
-            if self.on_event is not None and kind in (EV_TURN_END, EV_PERMISSION, EV_PROCESS_EXIT):
+            callback_kind = EV_STATUS if status_payload is not None else kind
+            callback_payload = status_payload if status_payload is not None else payload
+            if self.on_event is not None and (
+                callback_kind in (EV_TURN_END, EV_PERMISSION, EV_PROCESS_EXIT, EV_STATUS)
+            ):
                 try:
-                    self.on_event(kind, payload)
+                    self.on_event(callback_kind, callback_payload)
                 except Exception:
                     pass
+
+    def _refresh_current_work(self) -> None:
+        """Derive a compact, JSON-safe current-work snapshot.
+
+        Called while `_qlock` is held. Native tool-call updates are more
+        concrete than a plan step, so they take precedence when active.
+        """
+        calls = list(self._tool_calls.values())
+        if self._last_tool_call is not None:
+            calls.append(self._last_tool_call)
+        active = [
+            call for call in calls
+            if str(call.get("status", "in_progress")).lower()
+            not in {"completed", "failed", "cancelled", "declined"}
+        ]
+        plan_step = next(
+            (
+                entry for entry in reversed(self.plan_entries)
+                if str(entry.get("status", "")).lower() in {"in_progress", "working"}
+            ),
+            None,
+        )
+        if active:
+            call = active[-1]
+            title = call.get("title") or call.get("name") or call.get("kind") or "tool call"
+            work = {
+                "source": "tool_call",
+                "status": call.get("status") or "in_progress",
+                "summary": str(title),
+            }
+            if call.get("toolCallId") or call.get("tool_call_id"):
+                work["tool_call_id"] = call.get("toolCallId") or call.get("tool_call_id")
+            if call.get("kind"):
+                work["kind"] = call["kind"]
+            if plan_step is not None:
+                work["plan_step"] = dict(plan_step)
+            self.current_work = work
+        elif plan_step is not None:
+            content = plan_step.get("content") or plan_step.get("title") or "current plan step"
+            self.current_work = {
+                "source": "plan",
+                "status": plan_step.get("status") or "in_progress",
+                "summary": str(content),
+                "plan_step": dict(plan_step),
+            }
+        else:
+            self.current_work = None
 
     def snapshot_turns(self) -> list[dict]:
         """Completed turns since the last call: [{text, stop_reason}, ...]."""
@@ -481,6 +557,9 @@ class ReasonixAgent:
             raise ACPError(-1, "agent process has exited")
         with self._qlock:
             self._current_parts = []  # a fresh turn's text starts now
+            self._tool_calls.clear()
+            self._last_tool_call = None
+            self.current_work = {"source": "turn", "status": "starting", "summary": "starting turn"}
         rid = next(self._ids)
         self._turn_rid = rid  # set before writing so the reader never races
         self.active_turn = True
