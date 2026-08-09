@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Reasonix daemon runtime
+agentd.log
+.reasonix-mcp/
+
+# Local scratch / editor
+*.swp
+.DS_Store

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "reasonix": {
+      "type": "stdio",
+      "command": "/home/asmodeus/reasonix-mcp/.venv/bin/python",
+      "args": ["/home/asmodeus/reasonix-mcp/server.py"]
+    }
+  }
+}
