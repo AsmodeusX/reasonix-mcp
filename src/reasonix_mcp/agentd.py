@@ -25,12 +25,17 @@ import asyncio
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
 
 import acp_bridge
 import common
+
+
+SOURCE_WATCH_INTERVAL = 0.5
+AUTO_RESTART_IDLE_GRACE = 3.0
 
 
 class AgentdError(Exception):
@@ -47,6 +52,8 @@ class Agentd:
         self._client_owners: dict[asyncio.StreamWriter, str] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._idle_cleanup_tasks: dict[str, asyncio.Task] = {}
+        self._code_signature = common.agentd_code_signature()
+        self._auto_restart_requested = False
 
     # ------------------------------------------------------------- registry
 
@@ -306,7 +313,7 @@ class Agentd:
 
     def poll(self, params: dict) -> dict:
         agent = self._get(params["session_id"], str(params.get("owner_id") or ""))
-        return common.shape_poll(
+        result = common.shape_poll(
             agent,
             include_events=params.get("include_events"),
             exclude_events=params.get("exclude_events"),
@@ -314,6 +321,11 @@ class Agentd:
             include_full=params.get("include_full", common.DEFAULT_INCLUDE_FULL),
             max_events=params.get("max_events"),
         )
+        if result.get("status") != "running" and result.get("stop_reason"):
+            # Automatic code reload may close a completed idle process, but
+            # only after its orchestrator has collected the terminal result.
+            agent._terminal_observed = True
+        return result
 
     async def wait(self, params: dict) -> dict:
         session_ids = params.get("session_ids", [])
@@ -434,7 +446,60 @@ class Agentd:
                 if getattr(agent, "owner_id", "") == owner_id
             )
             owners = len({getattr(agent, "owner_id", "") for agent in self._registry.values()})
-        return {"sessions": sessions, "owners": owners, "owner_scoping": True}
+        return {
+            "sessions": sessions,
+            "owners": owners,
+            "owner_scoping": True,
+            "code_signature": self._code_signature,
+            "code_update_available": common.agentd_code_signature() != self._code_signature,
+        }
+
+    def _can_auto_restart(self) -> bool:
+        """Never interrupt active, decision-blocked, or keep-alive agents."""
+        with self._lock:
+            agents = list(self._registry.values())
+        return all(
+            common.agent_status(agent) == "exited"
+            or (
+                not agent.active_turn
+                and getattr(agent, "_pending_permission", None) is None
+                and not getattr(agent, "keep_alive", False)
+                and bool(agent.stop_reason)
+                and bool(getattr(agent, "_terminal_observed", False))
+            )
+            for agent in agents
+        )
+
+    async def _watch_source(self) -> None:
+        announced = False
+        safe_since: float | None = None
+        while True:
+            await asyncio.sleep(SOURCE_WATCH_INTERVAL)
+            current = common.agentd_code_signature()
+            if current == self._code_signature:
+                announced = False
+                safe_since = None
+                continue
+            if not announced:
+                print(
+                    "reasonix agentd: updated source detected; restart queued until agents are safe",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                announced = True
+            if not self._can_auto_restart():
+                safe_since = None
+                continue
+            now = time.monotonic()
+            if safe_since is None:
+                safe_since = now
+                continue
+            if now - safe_since < AUTO_RESTART_IDLE_GRACE:
+                continue
+            print("reasonix agentd: restarting to load updated source", file=sys.stderr, flush=True)
+            self._auto_restart_requested = True
+            self._shutdown_agents()
+            return
 
     def shutdown(self, params: dict | None = None) -> dict:
         """Close every agent and stop the daemon (used by tests; the real
@@ -567,11 +632,17 @@ class Agentd:
         except FileNotFoundError:
             pass
         server = await asyncio.start_unix_server(self.client_loop, path=sock_path)
+        source_watcher = asyncio.create_task(self._watch_source())
         async with server:
             print(f"agentd listening on {sock_path}", flush=True)
             await self._serve_stop.wait()
             server.close()
             await server.wait_closed()
+        source_watcher.cancel()
+        try:
+            await source_watcher
+        except asyncio.CancelledError:
+            pass
 
 
 def main() -> None:
@@ -585,6 +656,15 @@ def main() -> None:
         asyncio.run(agentd.serve(args.sock))
     except KeyboardInterrupt:
         pass
+    if agentd._auto_restart_requested:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--sock", args.sock],
+            stdin=subprocess.DEVNULL,
+            stdout=None,
+            stderr=None,
+            start_new_session=True,
+            env=dict(os.environ),
+        )
 
 
 if __name__ == "__main__":

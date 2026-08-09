@@ -72,6 +72,28 @@ ALLOW_ANY_CWD = os.environ.get("REASONIX_MCP_ALLOW_ANY_CWD", "").strip().lower()
 _TRANSCRIPT_WRITE_TOOLS = {"write_file", "edit_file", "multi_edit", "move_file"}
 _TRANSCRIPT_READ_TOOLS = {"read_file"}
 
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+_AGENTD_RUNTIME_FILES = ("agentd.py", "acp_bridge.py", "common.py")
+
+
+def agentd_code_signature() -> str:
+    """Fingerprint the source files loaded by the detached daemon.
+
+    Content hashing also catches deployments that preserve timestamps or
+    replace a file with same-sized code.
+    """
+    parts: list[str] = []
+    for name in _AGENTD_RUNTIME_FILES:
+        path = os.path.join(_PACKAGE_DIR, name)
+        try:
+            with open(path, "rb") as source:
+                digest = hashlib.sha256(source.read()).hexdigest()
+        except OSError:
+            parts.append(f"{name}:missing")
+        else:
+            parts.append(f"{name}:{digest}")
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:24]
+
 
 def reasonix_home() -> str:
     return os.environ.get("REASONIX_HOME") or os.path.expanduser("~/.reasonix")
@@ -200,6 +222,11 @@ def build_agent_event(agent: acp_bridge.ReasonixAgent, kind: str, payload: dict)
     elif kind == acp_bridge.EV_PERMISSION:
         event["note"] = "agent is waiting on a decision (tool approval or a question)"
         tool_call = (payload.get("params") or {}).get("toolCall") or {}
+        event["permission_request"] = {
+            "request_id": payload.get("id"),
+            "tool_call": tool_call,
+            "options": list((payload.get("params") or {}).get("options") or []),
+        }
         if tool_call.get("title"):
             event["title"] = tool_call["title"]
             if tool_call.get("kind") == "other":

@@ -39,18 +39,23 @@ whose process died. For multiple children call reasonix_wait with all ids, then
 reasonix_poll only for the ids in `woke`; poll is the authoritative way to
 collect text, events, completion, and permission requests. If a poll contains
 permission_request, inspect the tool_call and answer with
-reasonix_respond_permission before waiting again. Use reasonix_send with
+reasonix_respond_permission before waiting again. tool_approval=ask gates only
+commands Reasonix classifies as
+permission-requiring; it does not pause every shell command. Explicit agent
+questions always require a response. Use reasonix_send with
 expect=steer to redirect an active turn, expect=new_turn to start work only
 when idle. reasonix_transcript summarizes what an agent actually did (tool
-calls, files touched) for rebasing decisions. Each child pushes a
-reasonix/agent_event notification (best-effort) when it finishes a turn, needs
-a permission decision, reports a plan change, or exits; terminal errors
-include error_text. Progress events include the current plan and current_work.
-The custom notification may be dropped by the client, so reasonix_wait/poll are the
-guaranteed control path. Lifecycle controls:
-Notifications are always enabled. The daemon and MCP server log each event's
-emit/relay result to stderr, which distinguishes host-side dropping from a
-server-side emission failure.
+calls, files touched) for rebasing decisions. reasonix_wait is the primary
+wake-up mechanism: keep it in flight while children run, then poll every id in
+`woke`. Custom reasonix/agent_event notifications are diagnostic decoration;
+clients may silently drop unknown notifications, and MCP notifications are not
+injected into an orchestrator model's conversation. Clients that advertise MCP
+elicitation receive a standard elicitation/create request for permission gates
+and agent questions; the selected option is returned to the child
+automatically. Poll remains authoritative when elicitation is unavailable.
+Terminal errors include error_text; poll exposes plan and current_work. The
+daemon and MCP server log event emission/relay results to stderr.
+Lifecycle controls:
 - reasonix_restart_mcp_server() reloads only this orchestrator's MCP stdio
   front-end through launcher.py; it preserves agentd and all agent sessions and
   does not interrupt other orchestrators.
@@ -58,8 +63,12 @@ server-side emission failure.
   its live agents are stopped; force=true terminates live agents and affects
   every orchestrator connected to that daemon. Use it after agentd or
   acp_bridge changes. Use reasonix_restart_mcp_server after server.py changes.
-If both layers changed, restart agentd first when safe, then restart this MCP
-server. Keep orchestration state in the parent agent. Completed agents can be
+When launcher.py is configured, Python source changes restart this MCP
+front-end automatically and replay its MCP handshake. agentd watches its own
+runtime sources and restarts after active, keep-alive, and decision-blocked
+agents are clear and terminal output has been polled. Manual restart tools
+remain available for explicit control.
+Keep orchestration state in the parent agent. Completed agents can be
 cleaned up after a configured idle grace period (disabled by default) unless
 spawned with keep_alive=true;
 session ownership is scoped to this orchestrator, so never expect to see
@@ -78,6 +87,7 @@ _agentd_writer: asyncio.StreamWriter | None = None
 _pending: dict[int, asyncio.Future] = {}
 _next_id = itertools.count(1)
 _mcp_session = None  # captured on first tool call, used to relay daemon pushes
+_elicitation_tasks: dict[str, asyncio.Task] = {}
 _rpc_default_timeout = 600.0
 _owner_id = common.orchestrator_owner_id()
 _owner_explicit = bool(os.environ.get("REASONIX_MCP_ORCHESTRATOR_ID", "").strip())
@@ -192,6 +202,8 @@ async def _relay_agent_event(event: dict) -> None:
         f"session={event.get('session_id')}",
         file=sys.stderr, flush=True,
     )
+    if event.get("event") == "permission_request":
+        _schedule_elicitation(event)
     if _mcp_session is None:
         print("reasonix-mcp notification drop: MCP session unavailable", file=sys.stderr, flush=True)
         return
@@ -226,6 +238,81 @@ async def _relay_agent_event(event: dict) -> None:
             file=sys.stderr, flush=True,
         )
         pass  # best-effort push; wait/poll remain authoritative
+
+
+def _schedule_elicitation(event: dict) -> None:
+    session_id = str(event.get("session_id") or "")
+    if not session_id or _mcp_session is None:
+        return
+    current = _elicitation_tasks.get(session_id)
+    if current is not None and not current.done():
+        return
+    task = asyncio.create_task(_elicit_agent_decision(event))
+    _elicitation_tasks[session_id] = task
+    task.add_done_callback(lambda _done, sid=session_id: _elicitation_tasks.pop(sid, None))
+
+
+async def _elicit_agent_decision(event: dict) -> None:
+    """Bridge an ACP permission/question request to standard MCP elicitation."""
+    session = _mcp_session
+    if session is None:
+        return
+    params = getattr(session, "client_params", None)
+    capabilities = getattr(params, "capabilities", None)
+    if getattr(capabilities, "elicitation", None) is None:
+        print(
+            f"reasonix-mcp elicitation unavailable: session={event.get('session_id')}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    permission = event.get("permission_request") or {}
+    options = [option for option in permission.get("options", []) if option.get("optionId")]
+    option_ids = [str(option["optionId"]) for option in options]
+    if not option_ids:
+        return
+    tool_call = permission.get("tool_call") or {}
+    title = str(tool_call.get("title") or event.get("question") or "Agent decision required")
+    choices = ", ".join(
+        f"{option['optionId']} ({option.get('name') or option['optionId']})"
+        for option in options
+    )
+    message = f"Reasonix agent {event.get('session_id')} asks: {title}\nChoices: {choices}"
+    schema = {
+        "type": "object",
+        "properties": {
+            "option_id": {
+                "type": "string",
+                "title": "Decision",
+                "description": "Choose one of the agent-provided option IDs.",
+                "enum": option_ids,
+            }
+        },
+        "required": ["option_id"],
+    }
+    try:
+        result = await session.elicit_form(message, schema)
+        action = getattr(result, "action", "cancel")
+        content = getattr(result, "content", None) or {}
+        option_id = str(content.get("option_id") or "") if action == "accept" else "cancel"
+        if option_id not in option_ids and option_id != "cancel":
+            raise ValueError(f"client returned unknown elicitation option {option_id!r}")
+        await _rpc(
+            "respond_permission",
+            {"session_id": str(event.get("session_id")), "option_id": option_id or "cancel"},
+        )
+        print(
+            f"reasonix-mcp elicitation answered: session={event.get('session_id')} "
+            f"option={option_id or 'cancel'}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"reasonix-mcp elicitation failed: session={event.get('session_id')} error={exc}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _capture_relay_ctx(ctx: Context | None) -> None:
@@ -377,8 +464,8 @@ async def reasonix_wait(
 ) -> dict:
     """Block until any watched session produces output, finishes a turn, or
     raises a permission request (or `timeout` seconds pass). Returns woke ids,
-    per-session status + stop_reason. The authoritative callback — use it as
-    the loop's source of truth; the push notification is best-effort.
+    per-session status + stop_reason. The authoritative wake-up path — use it as
+    the loop's source of truth; wire notifications are diagnostic only.
     """
     _capture_relay_ctx(ctx)
     for session_id in session_ids:

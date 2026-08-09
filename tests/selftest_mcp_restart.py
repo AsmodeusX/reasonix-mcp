@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,9 +17,9 @@ from util import LAUNCHER, PY, shutdown_agentd, scratch_env  # noqa: E402
 
 
 class RawMCP:
-    def __init__(self, env: dict):
+    def __init__(self, env: dict, launcher: str = LAUNCHER):
         self.proc = subprocess.Popen(
-            [PY, LAUNCHER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            [PY, launcher], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True,
             env=env,
         )
@@ -78,11 +79,14 @@ class RawMCP:
 
 def main() -> None:
     scratch = tempfile.mkdtemp(prefix="rxmcp-restart-")
+    package_copy = os.path.join(scratch, "reasonix_mcp")
+    shutil.copytree(os.path.dirname(LAUNCHER), package_copy)
+    copied_launcher = os.path.join(package_copy, "launcher.py")
     env = scratch_env(scratch)
     sock = env["REASONIX_MCP_AGENTD_SOCK"]
     env_a = dict(env, REASONIX_MCP_ORCHESTRATOR_ID="restart-test-a")
     env_b = dict(env, REASONIX_MCP_ORCHESTRATOR_ID="restart-test-b")
-    client = RawMCP(env_a)
+    client = RawMCP(env_a, copied_launcher)
     other = RawMCP(env_b)
     try:
         client.initialize(1)
@@ -97,13 +101,30 @@ def main() -> None:
         time.sleep(1.0)
         assert client.proc.poll() is None, "launcher did not keep the MCP service alive"
 
-        # A new server requires a new MCP handshake on the same pipes.
-        client.initialize(2)
+        # The launcher replays the MCP handshake into the replacement; the
+        # already-running host does not need to initialize again.
         listing = client.tool("reasonix_list", {})
         assert listing["sessions"] == []
         # Restarting one stdio server must not interrupt another orchestrator.
         assert other.proc.poll() is None
         assert other.tool("reasonix_list", {})["sessions"] == []
+
+        # A source edit automatically replaces the copied server. The launcher
+        # replays initialization internally, so the host sends no new handshake.
+        copied_server = os.path.join(package_copy, "server.py")
+        with open(copied_server, "a", encoding="utf-8") as source:
+            source.write("\n# selftest server reload probe\n")
+        time.sleep(2.0)
+        assert client.proc.poll() is None
+        assert client.tool("reasonix_list", {})["sessions"] == []
+
+        # The supervisor can replace its own code while preserving the same
+        # host pipes and cached handshake too.
+        with open(copied_launcher, "a", encoding="utf-8") as source:
+            source.write("\n# selftest launcher reload probe\n")
+        time.sleep(2.0)
+        assert client.proc.poll() is None
+        assert client.tool("reasonix_list", {})["sessions"] == []
         print("MCP RESTART SELFTEST PASS")
     finally:
         client.close()

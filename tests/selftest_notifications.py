@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Agent-done callback selftest — NO model calls (dummy 401 provider).
+"""Agent-event wire diagnostic selftest — NO model calls (dummy 401 provider).
 
 Raw NDJSON JSON-RPC client over the server's stdio, so it can observe the
 server-initiated `reasonix/agent_event` notification (the standard SDK client
 validates server notifications against known types and may drop custom ones,
 so we read the wire directly).
 
-Flow: initialize -> spawn (turn fails fast on the 401 provider) -> expect an
-agent_event turn_end callback -> stop -> expect a further agent_event
+Flow: initialize -> spawn (turn fails fast on the 401 provider) -> observe an
+agent_event turn_end frame -> stop -> observe a further agent_event
 (turn_end cancelled / process_exit).
 """
 
@@ -99,7 +99,7 @@ def main() -> None:
         wait_response(1)
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
-        # spawn: the 401 turn fails fast -> turn_end callback
+        # spawn: the 401 turn fails fast -> turn_end diagnostic frame
         send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
             "name": "reasonix_spawn", "arguments": {"task": "One."},
         }})
@@ -109,7 +109,7 @@ def main() -> None:
         print("spawned:", sid)
 
         ev = wait_notification("reasonix/agent_event", timeout=90)
-        print("callback #1:", json.dumps(ev)[:300])
+        print("wire event #1:", json.dumps(ev)[:300])
         assert ev.get("session_id") == sid and ev.get("event") == "turn_end", ev
         assert ev.get("stop_reason") == "error", ev
 
@@ -119,10 +119,10 @@ def main() -> None:
         }})
         wait_response(3)
         ev2 = wait_notification("reasonix/agent_event", timeout=30)
-        print("callback #2:", json.dumps(ev2)[:300])
+        print("wire event #2:", json.dumps(ev2)[:300])
         assert ev2.get("session_id") == sid and ev2.get("event") in ("turn_end", "process_exited"), ev2
 
-        print("AGENT-EVENT CALLBACK SELFTEST PASS")
+        print("AGENT-EVENT WIRE SELFTEST PASS")
     finally:
         try:
             proc.stdin.close()  # EOF -> server exits cleanly -> atexit kills agents

@@ -3,7 +3,8 @@
 An MCP server that bridges any MCP host (Claude Code, Codex, …) to live,
 interactive **Reasonix** agents. Your MCP client is the front-end; this project
 adds the server it talks to, plus a detached daemon that owns the agents.
-Each spawned agent runs `reasonix acp` (Agent Client Protocol v1, NDJSON
+Each spawned agent runs [`reasonix acp`](https://github.com/esengine/DeepSeek-Reasonix/blob/main-v2/docs/ACP.md)
+(Agent Client Protocol v1, NDJSON
 JSON-RPC over stdio) in a subprocess, rooted in your project, under your own
 Reasonix config and provider credentials.
 
@@ -12,7 +13,7 @@ Reasonix config and provider credentials.
 ```
 MCP host (Claude Code, Codex, …) ──(MCP stdio)──▶ launcher.py ──▶ server.py ──(Unix socket JSON-RPC)──▶ agentd ──(ACP stdio)──▶ reasonix acp ──▶ agents
                                    │  spawn/send/poll/wait/list/…        ▲ owns the subprocesses
-                                   └─ relays agent_event pushes ─────────┘
+                                   └─ wait + optional elicitation ───────┘
 ```
 
 `launcher.py` is the per-orchestrator MCP supervisor; `server.py` is a thin
@@ -33,8 +34,8 @@ shut down (killing the daemon kills its agents — they carry PDEATHSIG).
   disabled by default. Use `keep_alive=true` for interactive follow-up turns.
 - **Resume** revives a stopped/crashed session from its persisted transcript.
 - **Stop** cancels + closes + kills; the session stays listed and resumable.
-- **Callbacks**: the daemon pushes `reasonix/agent_event` (best-effort);
-  `reasonix_wait` is the guaranteed callback.
+- **Wake-up**: keep `reasonix_wait` in flight; it is the primary, model-visible
+  completion and decision path. Wire notifications are diagnostics only.
 
 ## Setup
 
@@ -78,15 +79,17 @@ your MCP client and verify the server is listed.
 | `reasonix_list(include_task?)` | All live sessions: id, status, cwd, compact task preview, transcript_path. Set `include_task=true` for full prompts. |
 | `reasonix_respond_permission(session_id, option_id)` | Answer a tool-approval request (`option_id` from poll's `permission_request.options`, or `"cancel"`). |
 | `reasonix_stop(session_id)` | Cancel + close + kill the agent (tombstone: poll keeps reporting `exited`). |
-| `reasonix_restart_agentd(force?)` | Reload the detached daemon from updated code. Refuses while live agents exist unless `force=true`; the next tool call starts the fresh daemon. |
-| `reasonix_restart_mcp_server()` | Restart this orchestrator's MCP server through `launcher.py`; the shared daemon and all agent sessions remain running. |
+| `reasonix_restart_agentd(force?)` | Explicitly reload the detached daemon. Source changes already queue a safe automatic reload; `force=true` may terminate live agents. |
+| `reasonix_restart_mcp_server()` | Explicitly restart this orchestrator's MCP server through `launcher.py`; source changes are watched automatically. |
 
-### Agent-done callbacks (push)
+### Completion and decision delivery
 
-When a spawned agent **finishes its turn** (done, stopped, or errored), **needs
-a tool-approval decision**, or **its process exits**, the server pushes a
-custom MCP notification on the wire — the orchestrator is called back instead
-of having to poll:
+Keep `reasonix_wait(session_ids, timeout)` in flight while agents work. It
+returns when a child emits output, finishes, exits, or needs a decision; call
+`reasonix_poll` for every id in `woke`. This long-poll loop is the primary MCP
+mechanism and does not depend on a host surfacing unsolicited notifications.
+
+For diagnostics, the server also emits this custom notification on the wire:
 
 ```json
 {"method": "reasonix/agent_event", "params": {
@@ -97,28 +100,24 @@ of having to poll:
 - Events: `status` (plan/current-work update), `turn_end` (done/stopped/errored, with `stop_reason`),
   `permission_request` (a tool-approval **or an agent question** — see
   below), `process_exited`.
-- Best-effort: MCP custom notifications are never fatal, and a client that
-does not know the method simply ignores it — **`reasonix_wait` /
-`reasonix_poll` remain the guaranteed channel**. The server also emits a
-standard `notifications/message` (info level, same payload) on the legacy
-handshake era, so clients with standard log handling see it too.
-Whether/how the MCP host surfaces either to the model is client-version
-dependent.
+- Diagnostic only: JSON-RPC clients silently ignore unknown notifications,
+  and even a standard MCP notification is delivered to the client application,
+  not injected into the model's conversation. Do not build orchestration loops
+  around either `reasonix/agent_event` or `notifications/message`.
 
-> **Orchestrator loop**: treat the push as an accelerator, never the source of
-> truth. The authoritative callback is `reasonix_wait(session_ids, timeout)`:
+> **Orchestrator loop**: the authoritative blocking wake-up is
+> `reasonix_wait(session_ids, timeout)`:
 > it wakes on any terminal state or new output and returns each session's
 > `status` **and `stop_reason`** — so an errored or interrupted agent is
 > visible immediately without a follow-up poll. Pattern: `wait` → for each
 > woke session, `poll` → act on `stop_reason` (e.g. `"error"` → stop/retry,
 > `"end_turn"` → collect result).
-- Notifications are always enabled. The daemon and MCP server log each event's
-  emit/relay result to stderr so a host that does not surface callbacks can be
-  distinguished from a server that never emitted them.
+- Diagnostic notifications are always emitted. The daemon and MCP server log
+  each emit/relay result so host-side dropping is distinguishable from a
+  server-side omission.
 
 The Reasonix `[notifications].enabled` setting controls Reasonix CLI/desktop
-system notifications; it is separate from MCP transport callbacks. MCP
-callbacks from this server are always emitted.
+system notifications; it is separate from this MCP transport.
 
 Errored turns and unexpected process exits include `error_text` in the push
 payload. `reasonix_poll` and `reasonix_wait` expose the same detail, so an
@@ -143,10 +142,12 @@ identically:
   "options": [{"optionId": "q1:1", "name": "A"}, {"optionId": "q1:2", "name": "B"}, …]}}
 ```
 
-Answer with `reasonix_respond_permission(session_id, "q1:1")` — the chosen
-label is returned to the agent as the `ask` tool result and it continues.
-The `agent_event` push also fires (`event: "permission_request"`, with the
-question in `title`). Verified live by `selftest_question.py`.
+Clients that advertise MCP elicitation receive a standard
+`elicitation/create` form and the selected option is returned to Reasonix
+automatically. Otherwise, poll and answer with
+`reasonix_respond_permission(session_id, "q1:1")`; the chosen label becomes
+the `ask` tool result and the agent continues. A diagnostic `agent_event` is
+also emitted. Verified live by `selftest_question.py`.
 
 ### Spawn defaults
 
@@ -261,12 +262,21 @@ change that agent; inspect the spawn response for its effective posture. Under
 `permission_request` in poll — answer with `reasonix_respond_permission`;
 approving blind is not required: the request's `tool_call` carries the tool
 name (`title`/`kind`) and `rawInput` (the JSON arguments).
+Ask mode does not pause every shell command: Reasonix requests permission only
+for commands its policy classifies as gated. Its explicit `ask` tool always
+creates a user-decision request, including in YOLO mode.
 
 ### Updating the daemon
 
-After changing `agentd.py` or `acp_bridge.py`, call
-`reasonix_restart_agentd()` from the MCP client. It safely reloads the shared
-daemon when no live agents remain. If live agents can be discarded, use
+`agentd` watches `agentd.py`, `acp_bridge.py`, and `common.py`. A source change
+queues an automatic restart; active turns, pending decisions, and
+`keep_alive=true` sessions are never interrupted. Once agents are safely idle
+and their terminal output has been polled, the daemon waits a short grace
+period, closes resumable idle processes, and starts a fresh daemon from current
+code. No MCP reinstallation is needed.
+
+For explicit control, call `reasonix_restart_agentd()`. It safely reloads the
+shared daemon when no live agents remain. If live agents can be discarded, use
 `reasonix_restart_agentd(force=true)`; their persisted transcripts can be
 resumed after the fresh daemon starts. The next tool call automatically starts
 the new daemon, so no shell command or socket cleanup is needed. The daemon is
@@ -275,14 +285,15 @@ reconnect automatically on their next tool call.
 
 ### Restarting the MCP server
 
-Call `reasonix_restart_mcp_server()` from the orchestrator CLI after updating
-the MCP server code. `launcher.py` receives the restart request, starts a fresh
-stdio server, and leaves the shared `agentd` plus all agent sessions untouched.
-Only that orchestrator's MCP connection is restarted; other orchestrators keep
-running. MCP registrations that still point directly to `server.py` should be
-changed to `launcher.py` once so the in-band restart can be supervised.
-If both the daemon and MCP front-end changed, restart `agentd` first when safe,
-then call `reasonix_restart_mcp_server()`.
+`launcher.py` watches the package's Python sources and replaces its MCP server
+automatically after a change. It proxies stdio, replays the negotiated MCP
+handshake into the new child, and leaves shared `agentd` sessions untouched,
+so an already-running orchestrator can continue without being restarted.
+Every orchestrator has its own launcher and refreshes independently.
+
+`reasonix_restart_mcp_server()` remains available for an explicit reload.
+Registrations that point directly to `server.py` must be changed to
+`launcher.py` once; after that, source updates need no MCP reinstall.
 
 ### Orchestrator isolation
 
@@ -367,7 +378,10 @@ revived with `reasonix_resume`.
 .venv/bin/python tests/selftest_question.py     # agent asks a question via `ask` (real provider)
 .venv/bin/python tests/selftest_transcript.py   # transcript + plan fields (real provider)
 .venv/bin/python tests/selftest_orchestrator.py # list/wait/filtering/posture (no model calls)
-.venv/bin/python tests/selftest_notifications.py # agent-done push callback (no model calls)
+.venv/bin/python tests/selftest_notifications.py # diagnostic event frames (no model calls)
+.venv/bin/python tests/selftest_elicitation.py    # ACP decision → MCP elicitation bridge (no model calls)
+.venv/bin/python tests/selftest_mcp_restart.py   # manual + source-change hot reload (no model calls)
+.venv/bin/python tests/selftest_auto_reload.py   # agentd source watcher + self-replace (no model calls)
 .venv/bin/python tests/selftest_chaos.py       # cwd allowlist + dual notify + PDEATHSIG (no model calls)
 .venv/bin/python tests/selftest_allow_write.py  # cross-cwd write via allow_write (real provider)
 ```
