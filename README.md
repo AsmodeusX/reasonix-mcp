@@ -112,7 +112,8 @@ dependent.
 > visible immediately without a follow-up poll. Pattern: `wait` → for each
 > woke session, `poll` → act on `stop_reason` (e.g. `"error"` → stop/retry,
 > `"end_turn"` → collect result).
-- Disable with `REASONIX_MCP_NOTIFY=0`.
+- Master switch: notifications are enabled by default (`REASONIX_MCP_NOTIFY=1`);
+  set `REASONIX_MCP_NOTIFY=0` only to disable them.
 
 Errored turns and unexpected process exits include `error_text` in the push
 payload. `reasonix_poll` and `reasonix_wait` expose the same detail, so an

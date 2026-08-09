@@ -48,6 +48,8 @@ a permission decision, reports a plan change, or exits; terminal errors
 include error_text. Progress events include the current plan and current_work.
 The custom notification may be dropped by the client, so reasonix_wait/poll are the
 guaranteed control path. Lifecycle controls:
+Notifications are controlled by the master switch REASONIX_MCP_NOTIFY=1 (enabled
+by default); do not set it to 0 when callback delivery is required.
 - reasonix_restart_mcp_server() reloads only this orchestrator's MCP stdio
   front-end through launcher.py; it preserves agentd and all agent sessions and
   does not interrupt other orchestrators.
