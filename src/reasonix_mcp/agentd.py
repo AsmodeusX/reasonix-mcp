@@ -93,7 +93,9 @@ class Agentd:
         if getattr(agent, "keep_alive", False):
             return
         self._cancel_idle_cleanup(agent.session_id)
-        timeout = max(0.0, float(getattr(agent, "idle_timeout", common.DEFAULT_IDLE_TIMEOUT)))
+        timeout = float(getattr(agent, "idle_timeout", common.DEFAULT_IDLE_TIMEOUT))
+        if timeout < 0:
+            return
         self._idle_cleanup_tasks[agent.session_id] = asyncio.create_task(
             self._auto_stop_idle(agent, agent.event_seq, timeout)
         )
@@ -158,9 +160,9 @@ class Agentd:
         try:
             idle_timeout = float(params.get("idle_timeout", common.DEFAULT_IDLE_TIMEOUT))
         except (TypeError, ValueError):
-            raise AgentdError("idle_timeout must be a non-negative number") from None
-        if idle_timeout < 0 or idle_timeout > 86400:
-            raise AgentdError("idle_timeout must be between 0 and 86400 seconds")
+            raise AgentdError("idle_timeout must be -1 (disabled) or between 0 and 86400 seconds") from None
+        if idle_timeout < -1 or idle_timeout > 86400:
+            raise AgentdError("idle_timeout must be -1 (disabled) or between 0 and 86400 seconds")
 
         agent = acp_bridge.ReasonixAgent(
             cwd=cwd,
@@ -222,9 +224,9 @@ class Agentd:
         try:
             idle_timeout = float(params.get("idle_timeout", common.DEFAULT_IDLE_TIMEOUT))
         except (TypeError, ValueError):
-            raise AgentdError("idle_timeout must be a non-negative number") from None
-        if idle_timeout < 0 or idle_timeout > 86400:
-            raise AgentdError("idle_timeout must be between 0 and 86400 seconds")
+            raise AgentdError("idle_timeout must be -1 (disabled) or between 0 and 86400 seconds") from None
+        if idle_timeout < -1 or idle_timeout > 86400:
+            raise AgentdError("idle_timeout must be -1 (disabled) or between 0 and 86400 seconds")
         agent.keep_alive = keep_alive
         agent.idle_timeout = idle_timeout
         self._register(agent)

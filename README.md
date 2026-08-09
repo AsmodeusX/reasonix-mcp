@@ -262,13 +262,14 @@ clients too; they reconnect automatically on their next tool call.
 ### Agent cleanup
 
 After a terminal turn (including an errored turn), an agent remains available
-for the idle grace period
-(`REASONIX_MCP_IDLE_TIMEOUT`, 300 seconds by default, or `idle_timeout` per
-spawn) so the orchestrator can
-poll its final output or send a quick follow-up. It is then stopped and remains
-as an exited, resumable tombstone. Set `keep_alive=true` on `reasonix_spawn`
-for an agent that needs ongoing interactive turns; call `reasonix_stop` when it
-is no longer needed.
+for the idle grace period (`REASONIX_MCP_IDLE_TIMEOUT`, disabled by default, or
+`idle_timeout` per spawn) so the orchestrator can poll its final output or send
+a quick follow-up. It is then stopped and remains as an exited, resumable
+tombstone. Set `keep_alive=true` on `reasonix_spawn` for an agent that needs
+ongoing interactive turns; call `reasonix_stop` when it is no longer needed.
+
+Use `idle_timeout=-1` to disable cleanup, `0` for immediate cleanup after a
+terminal turn, or a positive number of seconds for a grace period.
 
 ## Safety
 

@@ -40,10 +40,10 @@ DEFAULT_MODEL = os.environ.get("REASONIX_MCP_DEFAULT_MODEL", "opencode-go/deepse
 DEFAULT_EFFORT = os.environ.get("REASONIX_MCP_DEFAULT_EFFORT", "max")
 DEFAULT_WORK_MODE = os.environ.get("REASONIX_MCP_DEFAULT_WORK_MODE", "")  # "" = follow config (balanced)
 DEFAULT_TOOL_APPROVAL = os.environ.get("REASONIX_MCP_DEFAULT_TOOL_APPROVAL", "yolo")
-# Completed agents are retained briefly so an orchestrator can poll the final
-# turn or send a quick follow-up. Set keep_alive=true per spawn to disable this
-# cleanup for interactive sessions.
-DEFAULT_IDLE_TIMEOUT = float(os.environ.get("REASONIX_MCP_IDLE_TIMEOUT", "300"))
+# Completed agents can be retained briefly so an orchestrator can poll the
+# final turn or send a quick follow-up. -1 disables cleanup; keep_alive=true
+# also disables it per spawn for interactive sessions.
+DEFAULT_IDLE_TIMEOUT = float(os.environ.get("REASONIX_MCP_IDLE_TIMEOUT", "-1"))
 
 # Spawn cwd confinement: agents may only root at the caller's project dir (and
 # subdirs) plus the [sandbox] allow_write dirs. Escapes with
