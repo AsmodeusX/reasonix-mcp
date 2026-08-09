@@ -258,13 +258,14 @@ name (`title`/`kind`) and `rawInput` (the JSON arguments).
 
 ### Updating the daemon
 
-After updating this repository, call `reasonix_restart_agentd()` from the MCP
-client. It safely reloads `agentd` when no live agents remain. If live agents
-can be discarded, use `reasonix_restart_agentd(force=true)`; their persisted
-transcripts can be resumed after the fresh daemon starts. The next tool call
-automatically starts the new daemon, so no shell command or socket cleanup is
-needed. The daemon is shared by MCP clients, so a restart disconnects other
-clients too; they reconnect automatically on their next tool call.
+After changing `agentd.py` or `acp_bridge.py`, call
+`reasonix_restart_agentd()` from the MCP client. It safely reloads the shared
+daemon when no live agents remain. If live agents can be discarded, use
+`reasonix_restart_agentd(force=true)`; their persisted transcripts can be
+resumed after the fresh daemon starts. The next tool call automatically starts
+the new daemon, so no shell command or socket cleanup is needed. The daemon is
+shared by MCP clients, so a restart disconnects other clients too; they
+reconnect automatically on their next tool call.
 
 ### Restarting the MCP server
 
@@ -274,6 +275,8 @@ stdio server, and leaves the shared `agentd` plus all agent sessions untouched.
 Only that orchestrator's MCP connection is restarted; other orchestrators keep
 running. MCP registrations that still point directly to `server.py` should be
 changed to `launcher.py` once so the in-band restart can be supervised.
+If both the daemon and MCP front-end changed, restart `agentd` first when safe,
+then call `reasonix_restart_mcp_server()`.
 
 ### Orchestrator isolation
 

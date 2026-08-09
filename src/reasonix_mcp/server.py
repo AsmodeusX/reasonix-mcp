@@ -47,13 +47,18 @@ reasonix/agent_event notification (best-effort) when it finishes a turn, needs
 a permission decision, reports a plan change, or exits; terminal errors
 include error_text. Progress events include the current plan and current_work.
 The custom notification may be dropped by the client, so reasonix_wait/poll are the
-guaranteed control path. Use reasonix_restart_agentd after updating this
-server; it reloads the daemon once no live agents remain. Keep
-orchestration state in the parent agent. Completed agents can be cleaned up
-after a configured idle grace period (disabled by default) unless spawned with
-keep_alive=true;
-use reasonix_restart_mcp_server after updating this MCP server; it replaces
-only this orchestrator's stdio server through launcher.py and preserves agentd;
+guaranteed control path. Lifecycle controls:
+- reasonix_restart_mcp_server() reloads only this orchestrator's MCP stdio
+  front-end through launcher.py; it preserves agentd and all agent sessions and
+  does not interrupt other orchestrators.
+- reasonix_restart_agentd(force=false) reloads the shared agent daemon after
+  its live agents are stopped; force=true terminates live agents and affects
+  every orchestrator connected to that daemon. Use it after agentd or
+  acp_bridge changes. Use reasonix_restart_mcp_server after server.py changes.
+If both layers changed, restart agentd first when safe, then restart this MCP
+server. Keep orchestration state in the parent agent. Completed agents can be
+cleaned up after a configured idle grace period (disabled by default) unless
+spawned with keep_alive=true;
 session ownership is scoped to this orchestrator, so never expect to see
 another MCP client's sessions;
 do not claim a child is complete
