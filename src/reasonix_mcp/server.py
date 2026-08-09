@@ -48,8 +48,9 @@ a permission decision, reports a plan change, or exits; terminal errors
 include error_text. Progress events include the current plan and current_work.
 The custom notification may be dropped by the client, so reasonix_wait/poll are the
 guaranteed control path. Lifecycle controls:
-Notifications are controlled by the master switch REASONIX_MCP_NOTIFY=1 (enabled
-by default); do not set it to 0 when callback delivery is required.
+Notifications are always enabled. The daemon and MCP server log each event's
+emit/relay result to stderr, which distinguishes host-side dropping from a
+server-side emission failure.
 - reasonix_restart_mcp_server() reloads only this orchestrator's MCP stdio
   front-end through launcher.py; it preserves agentd and all agent sessions and
   does not interrupt other orchestrators.
@@ -68,7 +69,6 @@ until its poll reports idle/exited status and a stop reason."""
 
 mcp = MCPServer("reasonix", instructions=MCP_INSTRUCTIONS)
 
-NOTIFY_ENABLED = os.environ.get("REASONIX_MCP_NOTIFY", "1").strip().lower() not in ("0", "false", "no", "off")
 AGENT_EVENT_METHOD = "reasonix/agent_event"
 AGENTD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agentd.py")
 MCP_RESTART_EXIT_CODE = 75
@@ -182,22 +182,49 @@ async def _relay_agent_event(event: dict) -> None:
         event = {key: value for key, value in event.items() if key != "_owner_id"}
     elif event.get("session_id") not in _owned_sessions:
         # Compatibility with daemons started before owner metadata existed.
+        print(
+            f"reasonix-mcp notification drop: unowned session={event.get('session_id')}",
+            file=sys.stderr, flush=True,
+        )
         return
-    if not NOTIFY_ENABLED or _mcp_session is None:
+    print(
+        f"reasonix-mcp notification relay: event={event.get('event')} "
+        f"session={event.get('session_id')}",
+        file=sys.stderr, flush=True,
+    )
+    if _mcp_session is None:
+        print("reasonix-mcp notification drop: MCP session unavailable", file=sys.stderr, flush=True)
         return
     try:
         outbound = getattr(getattr(_mcp_session, "_connection", None), "outbound", None)
         if outbound is None:
+            print("reasonix-mcp notification drop: MCP outbound unavailable", file=sys.stderr, flush=True)
             return
+        delivered: list[str] = []
         for method, params in (
             (AGENT_EVENT_METHOD, event),
             ("notifications/message", {"level": "info", "logger": "reasonix-mcp", "data": event}),
         ):
             try:
                 await outbound.notify(method, params)
+                delivered.append(method)
             except Exception:
+                print(
+                    f"reasonix-mcp notification send failed: method={method} "
+                    f"session={event.get('session_id')}",
+                    file=sys.stderr, flush=True,
+                )
                 continue
+        print(
+            f"reasonix-mcp notification delivered: methods={','.join(delivered) or 'none'} "
+            f"session={event.get('session_id')}",
+            file=sys.stderr, flush=True,
+        )
     except Exception:
+        print(
+            f"reasonix-mcp notification relay failed: session={event.get('session_id')}",
+            file=sys.stderr, flush=True,
+        )
         pass  # best-effort push; wait/poll remain authoritative
 
 

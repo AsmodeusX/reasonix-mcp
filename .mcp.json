@@ -3,8 +3,7 @@
     "reasonix": {
       "type": "stdio",
       "command": "/home/asmodeus/reasonix-mcp/.venv/bin/python",
-      "args": ["/home/asmodeus/reasonix-mcp/src/reasonix_mcp/launcher.py"],
-      "env": {"REASONIX_MCP_NOTIFY": "1"}
+      "args": ["/home/asmodeus/reasonix-mcp/src/reasonix_mcp/launcher.py"]
     }
   }
 }

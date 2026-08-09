@@ -112,8 +112,13 @@ dependent.
 > visible immediately without a follow-up poll. Pattern: `wait` → for each
 > woke session, `poll` → act on `stop_reason` (e.g. `"error"` → stop/retry,
 > `"end_turn"` → collect result).
-- Master switch: notifications are enabled by default (`REASONIX_MCP_NOTIFY=1`);
-  set `REASONIX_MCP_NOTIFY=0` only to disable them.
+- Notifications are always enabled. The daemon and MCP server log each event's
+  emit/relay result to stderr so a host that does not surface callbacks can be
+  distinguished from a server that never emitted them.
+
+The Reasonix `[notifications].enabled` setting controls Reasonix CLI/desktop
+system notifications; it is separate from MCP transport callbacks. MCP
+callbacks from this server are always emitted.
 
 Errored turns and unexpected process exits include `error_text` in the push
 payload. `reasonix_poll` and `reasonix_wait` expose the same detail, so an

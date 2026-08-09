@@ -66,6 +66,11 @@ class Agentd:
                         self._loop.call_soon_threadsafe(self._schedule_idle_cleanup, agent)
                     elif kind == acp_bridge.EV_PROCESS_EXIT:
                         self._loop.call_soon_threadsafe(self._cancel_idle_cleanup, agent.session_id)
+                    print(
+                        f"reasonix agent_event emit: event={event.get('event')} "
+                        f"session={agent.session_id} owner={getattr(agent, 'owner_id', '')}",
+                        file=sys.stderr, flush=True,
+                    )
                     asyncio.run_coroutine_threadsafe(
                         self._broadcast(event, getattr(agent, "owner_id", "")), self._loop
                     )
