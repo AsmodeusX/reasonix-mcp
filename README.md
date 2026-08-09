@@ -67,7 +67,7 @@ your MCP client and verify the server is listed.
 
 | Tool | Purpose |
 | --- | --- |
-| `reasonix_spawn(task, cwd?, model?, work_mode?, tool_approval?, effort?, keep_alive?, idle_timeout?)` | Start an agent in the daemon on `task`; returns `session_id` + sandbox posture. Completed agents are cleaned up after the idle grace period unless `keep_alive=true`. |
+| `reasonix_spawn(task, cwd?, model?, work_mode?, tool_approval?, effort?, keep_alive?, idle_timeout?)` | Start an agent in the daemon on `task`; returns `session_id` + sandbox posture. Completed agents can be cleaned up after the idle grace period when cleanup is enabled, unless `keep_alive=true`. |
 | `reasonix_resume(session_id, cwd?, keep_alive?, idle_timeout?)` | Revive a stopped/crashed session from its persisted transcript. |
 | `reasonix_models()` | List selectable models: `provider/model` refs, default, per-model `supported_efforts`, and `price` hints where configured. |
 | `reasonix_send(session_id, message, expect?)` | Forced steer: queue as mid-turn guidance, or start a new turn if idle. Never dropped. `expect="steer"` refuses to start a new turn. |

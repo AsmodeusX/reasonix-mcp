@@ -163,7 +163,13 @@ async def _rpc(method: str, params: dict, timeout: float = _rpc_default_timeout)
 
 
 async def _relay_agent_event(event: dict) -> None:
-    if event.get("session_id") not in _owned_sessions:
+    event_owner = event.get("_owner_id")
+    if event_owner is not None:
+        if event_owner != _owner_id:
+            return
+        event = {key: value for key, value in event.items() if key != "_owner_id"}
+    elif event.get("session_id") not in _owned_sessions:
+        # Compatibility with daemons started before owner metadata existed.
         return
     if not NOTIFY_ENABLED or _mcp_session is None:
         return

@@ -157,6 +157,9 @@ def build_agent_event(agent: acp_bridge.ReasonixAgent, kind: str, payload: dict)
         "session_id": agent.session_id,
         "event": kind,
         "status": agent_status(agent),
+        # Internal routing metadata. The MCP server consumes and removes this
+        # before forwarding notifications to the orchestrator.
+        "_owner_id": getattr(agent, "owner_id", ""),
     }
     if kind == acp_bridge.EV_TURN_END:
         event["stop_reason"] = payload.get("stopReason")
