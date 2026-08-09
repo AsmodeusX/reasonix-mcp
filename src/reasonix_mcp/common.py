@@ -566,6 +566,15 @@ def shape_poll(
         events = events[-event_limit:] if event_limit else []
     text, text_truncated = _cap("".join(text_parts), MAX_DELTA_TEXT)
 
+    # Keep an answered request in event history, but do not advertise it as
+    # still pending. An elicitation or notification response may arrive before
+    # the orchestrator drains the original ACP event.
+    pending_permission = getattr(agent, "_pending_permission", None)
+    if permission is not None and (
+        pending_permission is None or pending_permission[0] != permission["request_id"]
+    ):
+        permission = None
+
     status = agent_status(agent)
     result: dict = {
         "session_id": agent.session_id,

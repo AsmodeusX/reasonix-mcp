@@ -52,7 +52,8 @@ clients may silently drop unknown notifications, and MCP notifications are not
 injected into an orchestrator model's conversation. Clients that advertise MCP
 elicitation receive a standard elicitation/create request for permission gates
 and agent questions; the selected option is returned to the child
-automatically. Poll remains authoritative when elicitation is unavailable.
+automatically. Poll remains authoritative when elicitation is unavailable,
+declined, or canceled.
 Terminal errors include error_text; poll exposes plan and current_work. The
 daemon and MCP server log event emission/relay results to stderr.
 Lifecycle controls:
@@ -296,7 +297,19 @@ async def _elicit_agent_decision(event: dict) -> None:
         result = await session.elicit_form(message, schema)
         action = getattr(result, "action", "cancel")
         content = getattr(result, "content", None) or {}
-        option_id = str(content.get("option_id") or "") if action == "accept" else "cancel"
+        if action != "accept":
+            # Clients may advertise elicitation yet dismiss unsupported or
+            # non-interactive requests automatically. Declining the form is
+            # not the same as selecting the child request's reject option.
+            # Preserve ACP so reasonix_wait/poll + respond still work.
+            print(
+                f"reasonix-mcp elicitation {action}; poll fallback retained: "
+                f"session={event.get('session_id')}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        option_id = str(content.get("option_id") or "")
         if option_id not in option_ids and option_id != "cancel":
             raise ValueError(f"client returned unknown elicitation option {option_id!r}")
         await _rpc(
@@ -492,9 +505,10 @@ async def reasonix_list(include_task: bool = False, ctx: Context | None = None) 
 
 
 @mcp.tool()
-async def reasonix_models() -> dict:
+async def reasonix_models(ctx: Context | None = None) -> dict:
     """List selectable models: provider/model refs, default, per-model
     supported_efforts, and price hints where the config declares them."""
+    _capture_relay_ctx(ctx)
     return await _rpc("models", {})
 
 

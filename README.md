@@ -144,8 +144,9 @@ identically:
 
 Clients that advertise MCP elicitation receive a standard
 `elicitation/create` form and the selected option is returned to Reasonix
-automatically. Otherwise, poll and answer with
-`reasonix_respond_permission(session_id, "q1:1")`; the chosen label becomes
+automatically. If the client declines or cancels that form, Reasonix leaves
+the ACP request pending; dismissal is not treated as rejection. Poll and
+answer with `reasonix_respond_permission(session_id, "q1:1")`; the chosen label becomes
 the `ask` tool result and the agent continues. A diagnostic `agent_event` is
 also emitted. Verified live by `selftest_question.py`.
 

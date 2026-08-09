@@ -69,6 +69,14 @@ async def main() -> None:
             async with ClientSession(read, write) as session:
                 await session.initialize()
 
+                # Every daemon-backed tool must capture the same owner before
+                # opening the shared socket, including concurrent startup calls.
+                models, empty = await asyncio.gather(
+                    call(session, "reasonix_models", {}),
+                    call(session, "reasonix_list", {}),
+                )
+                assert models.get("models") and empty.get("sessions") == []
+
                 # spawn 2 agents; posture must be present
                 r = await call(session, "reasonix_spawn", {"task": "One."})
                 sid1, sandbox = r["session_id"], r.get("sandbox")
