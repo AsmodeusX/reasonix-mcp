@@ -236,6 +236,7 @@ def available_models() -> dict:
                 "model_overrides": dict(prov.get("model_overrides") or {}),
                 "price": dict(prov.get("price") or {}),
                 "prices": dict(prov.get("prices") or {}),
+                "context_window": prov.get("context_window"),
             }
         for model_ref, meta in (cfg.get("model_overrides") or {}).items():
             if isinstance(meta, dict):
@@ -265,6 +266,8 @@ def available_models() -> dict:
                 entry["default_effort"] = str(meta["default_effort"])
             if meta.get("context_window"):
                 entry["context_window"] = int(meta["context_window"])
+            elif prov.get("context_window"):
+                entry["context_window"] = int(prov["context_window"])
             price = price_for(prov, m)
             if price:
                 entry["price"] = price
