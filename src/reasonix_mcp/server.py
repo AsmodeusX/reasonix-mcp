@@ -43,7 +43,7 @@ expect=steer to redirect an active turn, expect=new_turn to start work only
 when idle. reasonix_transcript summarizes what an agent actually did (tool
 calls, files touched) for rebasing decisions. Each child pushes a
 reasonix/agent_event notification (best-effort) when it finishes a turn, needs
-a permission decision, or exits; the custom notification may be dropped by the
+a permission decision, or exits; terminal errors include error_text. The custom notification may be dropped by the
 client, so reasonix_wait/poll are the guaranteed control path. Keep
 orchestration state in the parent agent, and do not claim a child is complete
 until its poll reports idle/exited status and a stop reason."""
@@ -231,18 +231,21 @@ async def reasonix_poll(
     exclude_events: list[str] | None = None,
     include_thought: bool = common.DEFAULT_INCLUDE_THOUGHT,
     include_full: bool = common.DEFAULT_INCLUDE_FULL,
+    max_events: int | None = None,
 ) -> dict:
-    """Read everything the agent produced since the last poll.
+    """Read recent output the agent produced since the last poll.
 
     Always returns text (delta), turns (completed, with stop_reason), plan,
-    events, status, permission_request. Static setup events are filtered by
-    default (include_events/exclude_events change that). thought/full_* are
-    opt-in (include_thought / include_full).
+    events, status, permission_request. Ordinary polls return a small recent
+    event tail; include_events opts event types back in (and gets the larger
+    event cap). Static setup events are filtered by default. thought/full_* are
+    opt-in (include_thought / include_full). Errors include error_text.
     """
     return await _rpc("poll", {
         "session_id": session_id,
         "include_events": include_events, "exclude_events": exclude_events,
         "include_thought": include_thought, "include_full": include_full,
+        "max_events": max_events,
     })
 
 
@@ -257,11 +260,13 @@ async def reasonix_wait(session_ids: list[str], timeout: float = 30.0) -> dict:
 
 
 @mcp.tool()
-async def reasonix_list() -> dict:
-    """List all live agent sessions: id, status, cwd, task, stop_reason,
-    transcript_path, resumable. Regain control after losing session ids or
-    after an MCP server restart — the daemon kept the fleet running."""
-    return await _rpc("list", {})
+async def reasonix_list(include_task: bool = False) -> dict:
+    """List sessions with a compact task preview by default.
+
+    Set include_task=true only when the full original orchestration prompt is
+    needed; it can be thousands of words.
+    """
+    return await _rpc("list", {"include_task": include_task})
 
 
 @mcp.tool()

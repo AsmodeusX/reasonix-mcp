@@ -70,6 +70,18 @@ EV_PROCESS_EXIT = "process_exited"  # payload: {"stderr": "...", "code": ...}
 MAX_QUEUED_EVENTS = 4000
 
 
+def _error_text(error: object) -> str:
+    """Extract a useful message without importing the MCP-side helpers."""
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        if error.get("message"):
+            return str(error["message"])
+        if error.get("data") is not None:
+            return str(error["data"])
+    return str(error) if error is not None else ""
+
+
 class ACPError(Exception):
     """A JSON-RPC error reply from the agent."""
 
@@ -151,6 +163,10 @@ class ReasonixAgent:
         self.status = "starting"  # starting | idle | running | exited
         self.active_turn = False
         self.stop_reason: str | None = None
+        # Last terminal error, retained independently of the event queue so a
+        # wait/list response can explain an errored turn after poll consumes it.
+        self.last_error: object | None = None
+        self.last_error_text = ""
 
         self._events: queue.Queue = queue.Queue()
         self._qlock = threading.Lock()  # guards _events + full-text snapshots
@@ -250,7 +266,10 @@ class ReasonixAgent:
         except Exception:
             self._terminate()
             raise
-        self.status = "idle"
+        # A process may die during the handshake; do not resurrect that
+        # session as idle or suppress the daemon's terminal notification.
+        if self.status != "exited":
+            self.status = "idle"
 
     # ------------------------------------------------------------------ wire
 
@@ -299,11 +318,29 @@ class ReasonixAgent:
                         params = msg.get("params") or {}
                         self._enqueue(EV_UPDATE, params.get("update", {}))
         finally:
-            self._enqueue(EV_PROCESS_EXIT, {
+            # EOF without a completed prompt is an abnormal turn termination.
+            # Keep it actionable: callers need the stderr/exit detail in the
+            # notification and in the next poll/wait, not just "exited".
+            was_active = self.active_turn
+            stderr = "\n".join(self._stderr_tail[-50:])[-8000:]
+            unexpected = was_active or not self._closed
+            exit_text = stderr or (
+                f"agent process exited with code {self._exit_code}"
+                if self._exit_code is not None else "agent process exited unexpectedly"
+            )
+            process_payload: dict = {
                 "code": self._exit_code,
-                "stderr": "\n".join(self._stderr_tail[-50:])[-8000:],
-            })
+                "stderr": stderr,
+            }
+            if unexpected:
+                process_payload["error_text"] = exit_text
+                self.stop_reason = "error"
+                process_payload["error"] = {
+                    "code": self._exit_code if self._exit_code is not None else -1,
+                    "message": exit_text,
+                }
             self.status = "exited"
+            self._enqueue(EV_PROCESS_EXIT, process_payload)
             self.active_turn = False
             for waiter in self._pending.values():
                 waiter.put({"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": "agent process exited"}})
@@ -381,14 +418,27 @@ class ReasonixAgent:
             elif kind == EV_TURN_END:
                 # A turn finished: record it with its complete text so poll can
                 # report turn boundaries (full_text alone concatenates turns).
-                self.turns.append({
+                turn = {
                     "text": "".join(self._current_parts),
                     "stop_reason": payload.get("stopReason"),
-                })
+                }
+                if payload.get("error") is not None:
+                    turn["error"] = payload["error"]
+                    turn["error_text"] = _error_text(payload["error"])
+                    self.last_error = payload["error"]
+                    self.last_error_text = turn["error_text"]
+                self.turns.append(turn)
                 self._current_parts = []
                 self.stop_reason = payload.get("stopReason") or self.stop_reason
                 if payload.get("transcriptPath"):
                     self.transcript_path = payload["transcriptPath"]
+            elif kind == EV_PROCESS_EXIT:
+                if payload.get("error") is not None:
+                    self.last_error = payload["error"]
+                if payload.get("error_text"):
+                    self.last_error_text = payload["error_text"]
+                if payload.get("error") is not None and not self.stop_reason:
+                    self.stop_reason = "error"
             self._events.put((kind, payload))
             self.event_seq += 1
             # Orchestrator callback (best-effort, from the reader thread):

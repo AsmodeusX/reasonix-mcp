@@ -19,7 +19,8 @@ MAX_WATCH_SESSIONS = 64
 
 # Long-running turns: caps for what reasonix_poll hands back to the caller,
 # so hours-long agents cannot blow up its context. Env-overridable.
-MAX_EVENTS_PER_POLL = int(os.environ.get("REASONIX_MCP_MAX_EVENTS_PER_POLL", "200"))  # structured events per poll (tail kept)
+MAX_EVENTS_PER_POLL = int(os.environ.get("REASONIX_MCP_MAX_EVENTS_PER_POLL", "200"))  # explicit event polls (tail kept)
+DEFAULT_MAX_EVENTS_PER_POLL = int(os.environ.get("REASONIX_MCP_DEFAULT_MAX_EVENTS_PER_POLL", "50"))  # ordinary poll tail
 MAX_DELTA_TEXT = int(os.environ.get("REASONIX_MCP_MAX_DELTA_TEXT", "100000"))  # chars of new text/thought per poll (tail kept)
 MAX_FULL_TEXT = int(os.environ.get("REASONIX_MCP_MAX_FULL_TEXT", "200000"))  # chars of full_text/full_thought (tail kept)
 
@@ -70,6 +71,14 @@ def _cap(s: str, limit: int) -> tuple[str, bool]:
     return s[-limit:], True
 
 
+def task_preview(task: object, limit: int = 120) -> str:
+    """Keep fleet listings useful without replaying orchestration prompts."""
+    value = str(task or "").replace("\r", " ").replace("\n", " ").strip()
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 1)].rstrip() + "…"
+
+
 def agent_status(agent: acp_bridge.ReasonixAgent) -> str:
     if agent.status == "exited":
         return "exited"
@@ -91,6 +100,12 @@ def build_agent_event(agent: acp_bridge.ReasonixAgent, kind: str, payload: dict)
     if kind == acp_bridge.EV_TURN_END:
         event["stop_reason"] = payload.get("stopReason")
         event["transcript_path"] = payload.get("transcriptPath")
+        if payload.get("error") is not None:
+            event["error"] = payload["error"]
+            event["error_text"] = error_text(payload["error"])
+        elif payload.get("stopReason") == "error" and getattr(agent, "last_error", None) is not None:
+            event["error"] = agent.last_error
+            event["error_text"] = getattr(agent, "last_error_text", "") or error_text(agent.last_error)
         event["note"] = "agent finished its turn (done, stopped, or errored)"
     elif kind == acp_bridge.EV_PERMISSION:
         event["note"] = "agent is waiting on a decision (tool approval or a question)"
@@ -101,15 +116,36 @@ def build_agent_event(agent: acp_bridge.ReasonixAgent, kind: str, payload: dict)
                 event["question"] = tool_call["title"]
     elif kind == acp_bridge.EV_PROCESS_EXIT:
         event["note"] = "agent process exited"
+        if payload.get("error") is not None:
+            event["error"] = payload["error"]
+        if payload.get("error_text"):
+            event["error_text"] = payload["error_text"]
     return event
+
+
+def error_text(error: object) -> str:
+    """Extract useful human-readable text from an ACP/JSON-RPC error."""
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        message = error.get("message")
+        if message:
+            return str(message)
+        data = error.get("data")
+        if isinstance(data, str):
+            return data
+        if data is not None:
+            return str(data)
+    return str(error) if error is not None else ""
 
 
 def sandbox_posture() -> dict:
     """Effective [sandbox] posture from the config the agent will load.
 
-    Reads <Reasonix home>/config.toml (REASONIX_HOME, else ~/.reasonix).
-    Project-level reasonix.toml may further override — this is the user-global
-    baseline. bash defaults to "enforce" per Reasonix when unset.
+    Reads <Reasonix home>/config.toml (REASONIX_HOME, else ~/.reasonix) when a
+    spawn is made. Project-level reasonix.toml may further override in the
+    Reasonix process. `bash` is retained for compatibility; `sandbox` exposes
+    the unambiguous posture (`bwrap` or `none`).
     """
     path = os.path.join(reasonix_home(), "config.toml")
     posture: dict = {
@@ -117,6 +153,7 @@ def sandbox_posture() -> dict:
         "allow_write": [],
         "forbid_read": [],
         "bash": "enforce",
+        "sandbox": None,
         "network": False,
         "config_file": path if os.path.isfile(path) else None,
     }
@@ -124,11 +161,23 @@ def sandbox_posture() -> dict:
         try:
             with open(path, "rb") as fh:
                 cfg = tomllib.load(fh)
-            for key in ("workspace_root", "allow_write", "forbid_read", "bash", "network"):
+            for key in ("workspace_root", "allow_write", "forbid_read", "bash", "sandbox", "network"):
                 if key in cfg.get("sandbox", {}):
                     posture[key] = cfg["sandbox"][key]
         except Exception:
             pass
+    # Reasonix's historical `bash` spelling is still accepted.  Expose the
+    # clearer posture name as well: `off` means no bwrap and therefore no
+    # enforceable allow_write boundary.
+    if posture.get("sandbox") not in ("bwrap", "none"):
+        posture["sandbox"] = "bwrap" if posture.get("bash") == "enforce" else "none"
+    warnings: list[str] = []
+    if posture.get("allow_write") and posture.get("sandbox") == "none":
+        warnings.append(
+            "allow_write is configured but bash/sandbox is unconfined; "
+            "the allow_write restriction cannot be enforced for bash commands"
+        )
+    posture["warnings"] = warnings
     return posture
 
 
@@ -306,11 +355,14 @@ def shape_poll(
     exclude_events: list[str] | None = None,
     include_thought: bool = DEFAULT_INCLUDE_THOUGHT,
     include_full: bool = DEFAULT_INCLUDE_FULL,
+    max_events: int | None = None,
 ) -> dict:
     """Drain one agent's event queue into the poll result shape. Shared by the
     daemon (authoritative) — identical semantics to the original server tool."""
+    # Explicit include_events opts a type back in, including the static setup
+    # events that are omitted from ordinary polls.
     include = set(include_events or [])
-    exclude = set(STATIC_UPDATE_TYPES) | set(exclude_events or [])
+    exclude = (set(STATIC_UPDATE_TYPES) - include) | set(exclude_events or [])
     text_parts: list[str] = []
     thought_parts: list[str] = []
     events: list[dict] = []
@@ -348,10 +400,16 @@ def shape_poll(
         elif kind == acp_bridge.EV_PROCESS_EXIT:
             process_exit = payload
 
+    event_limit = max_events
+    if event_limit is None:
+        # A caller that explicitly selects event types is asking to inspect
+        # the event stream; ordinary polls only need a small recent tail.
+        event_limit = MAX_EVENTS_PER_POLL if include else DEFAULT_MAX_EVENTS_PER_POLL
+    event_limit = max(0, min(int(event_limit), MAX_EVENTS_PER_POLL))
     dropped_events = 0
-    if len(events) > MAX_EVENTS_PER_POLL:
-        dropped_events = len(events) - MAX_EVENTS_PER_POLL
-        events = events[-MAX_EVENTS_PER_POLL:]
+    if len(events) > event_limit:
+        dropped_events = len(events) - event_limit
+        events = events[-event_limit:] if event_limit else []
     text, text_truncated = _cap("".join(text_parts), MAX_DELTA_TEXT)
 
     status = agent_status(agent)
@@ -382,8 +440,17 @@ def shape_poll(
         agent.stop_reason = turn_end.get("stopReason")
         result["stop_reason"] = turn_end.get("stopReason")
         result["transcript_path"] = turn_end.get("transcriptPath")
-    if status == "idle" and agent.stop_reason:
+    if agent.stop_reason and "stop_reason" not in result:
         result["stop_reason"] = agent.stop_reason
     if process_exit is not None:
         result["process_exit"] = process_exit
+    if turn_end is not None and turn_end.get("error") is not None:
+        result["error"] = turn_end["error"]
+        result["error_text"] = error_text(turn_end["error"])
+    elif process_exit is not None and process_exit.get("error_text"):
+        result["error"] = process_exit.get("error") or process_exit["error_text"]
+        result["error_text"] = process_exit["error_text"]
+    elif getattr(agent, "last_error", None) is not None:
+        result["error"] = agent.last_error
+        result["error_text"] = getattr(agent, "last_error_text", "") or error_text(agent.last_error)
     return result

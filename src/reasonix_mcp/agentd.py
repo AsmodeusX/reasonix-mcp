@@ -66,6 +66,18 @@ class Agentd:
             agent.on_event = _broadcast
         with self._lock:
             self._registry[agent.session_id] = agent
+        # The ACP reader can observe an immediate process death during the
+        # constructor, before the daemon has attached its callback. Replay one
+        # terminal notification so a fast crash is not silent.
+        if agent.status == "exited" and agent.on_event is not None:
+            payload: dict = {
+                "code": getattr(agent, "_exit_code", None),
+                "stderr": "\n".join(getattr(agent, "_stderr_tail", [])[-50:])[-8000:],
+            }
+            if getattr(agent, "last_error", None) is not None:
+                payload["error"] = agent.last_error
+                payload["error_text"] = agent.last_error_text
+            agent.on_event(acp_bridge.EV_PROCESS_EXIT, payload)
 
     async def _broadcast(self, event: dict) -> None:
         line = json.dumps({"method": "agent_event", "params": event}) + "\n"
@@ -111,11 +123,14 @@ class Agentd:
         agent.cwd = cwd
         self._register(agent)
         agent.start_turn(task)
+        posture = common.sandbox_posture()
+        for warning in posture.get("warnings", []):
+            print(f"warning: {warning}", file=sys.stderr, flush=True)
         result: dict = {
             "session_id": agent.session_id,
             "status": "running",
             "cwd": cwd,
-            "sandbox": common.sandbox_posture(),
+            "sandbox": posture,
             "note": ("Agent runs detached in agentd and survives MCP server restarts. "
                      "It will push a reasonix/agent_event notification when done "
                      "(turn end / permission needed / exit); reasonix_wait is the "
@@ -204,6 +219,7 @@ class Agentd:
             exclude_events=params.get("exclude_events"),
             include_thought=params.get("include_thought", common.DEFAULT_INCLUDE_THOUGHT),
             include_full=params.get("include_full", common.DEFAULT_INCLUDE_FULL),
+            max_events=params.get("max_events"),
         )
 
     async def wait(self, params: dict) -> dict:
@@ -231,6 +247,9 @@ class Agentd:
                     "permission_request": pending,
                     "stop_reason": a.stop_reason if status != "running" else None,
                 }
+                if getattr(a, "last_error", None) is not None:
+                    states[sid]["error"] = a.last_error
+                    states[sid]["error_text"] = a.last_error_text
                 if has_new or pending or status != "running":
                     woke.append(sid)
             if woke or time.monotonic() >= deadline:
@@ -238,22 +257,31 @@ class Agentd:
             await asyncio.sleep(0.2)
 
     def list(self, params: dict | None = None) -> dict:
+        params = params or {}
+        include_task = bool(params.get("include_task", False))
         with self._lock:
             items = list(self._registry.items())
         sessions = []
         for sid, a in items:
             status = common.agent_status(a)
             persisted = os.path.join(common.reasonix_home(), "sessions", f"{sid}.jsonl")
-            sessions.append({
+            session = {
                 "session_id": sid,
                 "status": status,
                 "cwd": getattr(a, "cwd", None),
-                "task": getattr(a, "task", None),
+                "task": (
+                    getattr(a, "task", None)
+                    if include_task else common.task_preview(getattr(a, "task", None))
+                ),
                 "stop_reason": a.stop_reason,
                 "transcript_path": getattr(a, "transcript_path", None),
                 "permission_request": a._pending_permission is not None,
                 "resumable": status in ("idle", "exited") and os.path.isfile(persisted),
-            })
+            }
+            if getattr(a, "last_error", None) is not None:
+                session["error"] = a.last_error
+                session["error_text"] = a.last_error_text
+            sessions.append(session)
         return {"sessions": sessions}
 
     def models(self, params: dict | None = None) -> dict:

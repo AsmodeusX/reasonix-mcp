@@ -26,8 +26,8 @@ shut down (killing the daemon kills its agents — they carry PDEATHSIG).
 - **Spawn** returns a `session_id` immediately; the agent works in the daemon.
 - **Send** steers a running agent *mid-turn* via `_reasonix.io/session/steer`;
   if idle it starts a new turn.
-- **Poll** returns what changed since last poll: text, turns, plan, events,
-  permission requests, stop reason.
+- **Poll** returns recent output since last poll: text, turns, plan, events,
+  permission requests, stop reason, and terminal error text when applicable.
 - **Resume** revives a stopped/crashed session from its persisted transcript.
 - **Stop** cancels + closes + kills; the session stays listed and resumable.
 - **Callbacks**: the daemon pushes `reasonix/agent_event` (best-effort);
@@ -69,10 +69,10 @@ your MCP client and verify the server is listed.
 | `reasonix_resume(session_id, cwd?)` | Revive a stopped/crashed session from its persisted transcript. |
 | `reasonix_models()` | List selectable models: `provider/model` refs, default, per-model `supported_efforts`, and `price` hints where configured. |
 | `reasonix_send(session_id, message, expect?)` | Forced steer: queue as mid-turn guidance, or start a new turn if idle. Never dropped. `expect="steer"` refuses to start a new turn. |
-| `reasonix_poll(session_id, include_events?, exclude_events?, include_thought?, include_full?)` | New output / status / completed turns / current `plan` / pending permission request. Static boilerplate events filtered by default. |
+| `reasonix_poll(session_id, include_events?, exclude_events?, include_thought?, include_full?, max_events?)` | New output / status / completed turns / current `plan` / pending permission request. Static boilerplate is filtered and events are a recent tail by default. |
 | `reasonix_transcript(session_id, max_tool_calls?)` | What the agent actually did: tool calls with args, files touched (write/read/bash), roles, work duration, last text — powers rebase decisions. (Reasonix does not persist token/cost usage; these are activity metrics.) |
 | `reasonix_wait(session_ids, timeout?)` | Block until any watched session produces output, finishes a turn, or raises a permission request. |
-| `reasonix_list()` | All live sessions: id, status, cwd, task, transcript_path — regain control after losing ids. |
+| `reasonix_list(include_task?)` | All live sessions: id, status, cwd, compact task preview, transcript_path. Set `include_task=true` for full prompts. |
 | `reasonix_respond_permission(session_id, option_id)` | Answer a tool-approval request (`option_id` from poll's `permission_request.options`, or `"cancel"`). |
 | `reasonix_stop(session_id)` | Cancel + close + kill the agent (tombstone: poll keeps reporting `exited`). |
 
@@ -108,6 +108,11 @@ dependent.
 > woke session, `poll` → act on `stop_reason` (e.g. `"error"` → stop/retry,
 > `"end_turn"` → collect result).
 - Disable with `REASONIX_MCP_NOTIFY=0`.
+
+Errored turns and unexpected process exits include `error_text` in the push
+payload. `reasonix_poll` and `reasonix_wait` expose the same detail, so an
+orchestrator can decide whether to resume or retry without inspecting the
+session JSONL by hand.
 - Verified at the wire level by `selftest_notifications.py` (raw JSON-RPC
 client — the SDK client validates server notifications against known types
 and may drop custom ones).
@@ -174,6 +179,9 @@ from `events` (they are implied by spawn and available via `transcript_path`);
 
 - `include_events=["tool_call","tool_call_update","plan"]` — only these
   sessionUpdate types (permission requests are always included);
+- Ordinary polls return a small recent event tail (50 by default; set
+  `max_events` to choose another value). `include_events` opts named types
+  back in, including static setup types when explicitly named.
 - `exclude_events=[...]` — drop additional types;
 - the orchestrator-relevant set is `tool_call`, `tool_call_update`, `plan`,
   `permission_request`.
@@ -212,7 +220,7 @@ the cuts are reported, never silent:
 
 | Field | Limit (env override) |
 | --- | --- |
-| `events` | last `MAX_EVENTS_PER_POLL` (200) — `events_dropped` counts the cut |
+| `events` | recent tail (50 by default; explicit cap 200) — `events_dropped` counts the cut |
 | `text` | last `MAX_DELTA_TEXT` (100k) chars — `text_truncated` |
 | `thought` / `full_thought` (only with `include_thought`) | last `MAX_FULL_TEXT` (200k) chars — `*_truncated` |
 | `full_text` (only with `include_full`) | last `MAX_FULL_TEXT` (200k) chars — `full_text_truncated` |
@@ -224,12 +232,16 @@ dropped.
 
 ### Sandbox posture
 
-`reasonix_spawn` returns the effective `[sandbox]` posture
-(`bash`, `allow_write`, `network`, `workspace_root`, `config_file`) so an
-orchestrator knows up front whether agents can execute commands and write
-outside cwd. Note Reasonix semantics: `bash = "off"` means **unconfined**
-(execution allowed), `bash = "enforce"` jails commands in bubblewrap when
-available. Under `tool_approval = "ask"`, gated commands raise a
+`reasonix_spawn` reads and returns the effective `[sandbox]` posture at spawn
+time (`sandbox`, legacy `bash`, `allow_write`, `network`, `workspace_root`,
+`config_file`) so an orchestrator knows up front whether agents can execute
+commands and write outside cwd. Note Reasonix semantics: `bash = "off"` means
+**unconfined** (execution allowed), while `bash = "enforce"` jails commands in
+bubblewrap when available. The clearer posture names are `sandbox = "bwrap"`
+or `sandbox = "none"`; with `none`, `allow_write` cannot be enforced for bash
+and a warning is returned/logged. Changing config while an agent runs does not
+change that agent; inspect the spawn response for its effective posture. Under
+`tool_approval = "ask"`, gated commands raise a
 `permission_request` in poll — answer with `reasonix_respond_permission`;
 approving blind is not required: the request's `tool_call` carries the tool
 name (`title`/`kind`) and `rawInput` (the JSON arguments).
@@ -238,7 +250,8 @@ name (`title`/`kind`) and `rawInput` (the JSON arguments).
 
 - Agents run under **your** Reasonix permissions and workspace sandbox
   (writes confined to `cwd` + `allow_write`; bash jailed where the OS sandbox
-  is enabled and available).
+  is enabled and available). With `sandbox = "none"`/`bash = "off"`, bash is
+  unjailed and `allow_write` is not enforceable.
 - **Spawn cwd is confined**: `reasonix_spawn(cwd=…)` is rejected unless the
   target is the MCP host's project dir (or a subdir) or one of the
   `[sandbox] allow_write` dirs — a prompt-injected orchestrator can't spawn
