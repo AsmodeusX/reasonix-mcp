@@ -1,7 +1,8 @@
-# reasonix-mcp — spawn and steer Reasonix agents from Claude Code
+# reasonix-mcp — spawn and steer Reasonix agents from any MCP client
 
-An MCP server that bridges Claude Code to live, interactive **Reasonix** agents.
-Claude Code is the MCP client; this project adds the server Claude Code talks to.
+An MCP server that bridges any MCP host (Claude Code, Codex, …) to live,
+interactive **Reasonix** agents. Your MCP client is the front-end; this project
+adds the server it talks to, plus a detached daemon that owns the agents.
 Each spawned agent runs `reasonix acp` (Agent Client Protocol v1, NDJSON
 JSON-RPC over stdio) in a subprocess, rooted in your project, under your own
 Reasonix config and provider credentials.
@@ -9,13 +10,13 @@ Reasonix config and provider credentials.
 ## How it works
 
 ```
-Claude Code ──(MCP stdio)──▶ server.py ──(Unix socket JSON-RPC)──▶ agentd ──(ACP stdio)──▶ reasonix acp ──▶ agents
+MCP host (Claude Code, Codex, …) ──(MCP stdio)──▶ server.py ──(Unix socket JSON-RPC)──▶ agentd ──(ACP stdio)──▶ reasonix acp ──▶ agents
                                    │  spawn/send/poll/wait/list/…        ▲ owns the subprocesses
                                    └─ relays agent_event pushes ─────────┘
 ```
 
 `server.py` is a thin MCP front-end; **`agentd.py` is a detached daemon that
-owns the agents**. This split is what makes agents survive: close Claude Code
+owns the agents**. This split is what makes agents survive: close the MCP host
 (or kill the MCP server) and the fleet keeps running in the daemon — a new
 server reconnects to the same socket and `reasonix_list` shows everything
 still there. `agentd` is auto-started by the server on first use
@@ -43,12 +44,12 @@ python3 -m venv .venv
 Requires `reasonix` on PATH (verified: v1.17.20) and a configured provider
 (`reasonix setup`).
 
-## Register with Claude Code
+## Register with your MCP client
 
 Project scope (this directory): the included `.mcp.json` is picked up
-automatically when Claude Code runs in `~/reasonix-mcp`.
+automatically when the MCP host runs in `~/reasonix-mcp`.
 
-User scope (available in every project):
+User scope (available in every project) — example with Claude Code:
 
 ```sh
 claude mcp add reasonix --scope user -- \
@@ -56,7 +57,9 @@ claude mcp add reasonix --scope user -- \
   /home/asmodeus/reasonix-mcp/server.py
 ```
 
-Then restart Claude Code. Verify with `claude mcp list`.
+Other MCP hosts (Codex, etc.) register stdio servers through their own
+`mcp add` equivalents — same command + args, different client. Then restart
+your MCP client and verify the server is listed.
 
 ## Tools
 
@@ -94,7 +97,7 @@ does not know the method simply ignores it — **`reasonix_wait` /
 `reasonix_poll` remain the guaranteed channel**. The server also emits a
 standard `notifications/message` (info level, same payload) on the legacy
 handshake era, so clients with standard log handling see it too.
-Whether/how Claude Code surfaces either to the model is client-version
+Whether/how the MCP host surfaces either to the model is client-version
 dependent.
 
 > **Orchestrator loop**: treat the push as an accelerator, never the source of
@@ -204,7 +207,7 @@ reasonix_list() whenever you lose track of session_ids
 
 ### Caps & truncation
 
-Poll output is capped so long gaps can't blow up Claude Code's context;
+Poll output is capped so long gaps can't blow up the MCP host's context;
 the cuts are reported, never silent:
 
 | Field | Limit (env override) |
@@ -237,7 +240,7 @@ name (`title`/`kind`) and `rawInput` (the JSON arguments).
   (writes confined to `cwd` + `allow_write`; bash jailed where the OS sandbox
   is enabled and available).
 - **Spawn cwd is confined**: `reasonix_spawn(cwd=…)` is rejected unless the
-  target is the Claude Code project dir (or a subdir) or one of the
+  target is the MCP host's project dir (or a subdir) or one of the
   `[sandbox] allow_write` dirs — a prompt-injected orchestrator can't spawn
   agents that write anywhere (the server runs with your full permissions and
   `yolo` default). Escape hatch: `REASONIX_MCP_ALLOW_ANY_CWD=1`.
@@ -248,7 +251,7 @@ name (`title`/`kind`) and `rawInput` (the JSON arguments).
   every approval through `reasonix_respond_permission`).
 - `reasonix_spawn` returns the effective sandbox posture — check it before
   assigning tasks that require running commands.
-- `cwd` defaults to the Claude Code project root; pass an explicit `cwd` to
+- `cwd` defaults to the MCP host's project root; pass an explicit `cwd` to
   scope an agent elsewhere.
 
 ## Long-running agents
@@ -257,7 +260,7 @@ A spawned agent may legitimately run **for hours** — long thinking, tool
 loops, implementing across many files. The bridge is built for that:
 
 - **Nothing blocks.** `reasonix_spawn` / `reasonix_send` / `reasonix_poll`
-  return immediately; the agent works in its own subprocess. Claude Code stays
+  return immediately; the agent works in its own subprocess. The MCP host stays
   fully responsive while the agent grinds.
 - **No default timeout.** A turn runs until it finishes or you call
   `reasonix_stop` (cancels the turn, closes the session, kills the process).
@@ -267,10 +270,10 @@ loops, implementing across many files. The bridge is built for that:
 - **Memory is bounded.** Unpolled chunk events are capped in the server; poll
   results cap `text`/`thought`/`full_text` and the structured `events` list
   (tails kept, `*_truncated` / `events_dropped` flags report the cut) so a
-  long gap can't blow up Claude Code's context.
+  long gap can't blow up the MCP host's context.
 
 One constraint, now mostly lifted: agents live in the **daemon**, not the MCP
-server — Claude Code can close and come back and the fleet is still running
+server — the MCP host can close and come back and the fleet is still running
 (`reasonix_list`). The daemon itself is the survival boundary: kill it and its
 agents die (PDEATHSIG); a crashed session's work survives on disk and can be
 revived with `reasonix_resume`.

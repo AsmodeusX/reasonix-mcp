@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """MCP server (stdio): front-end for the reasonix-mcp agent daemon.
 
-Claude Code (or any MCP client) launches this script. It proxies every tool
+Any MCP host (Claude Code, Codex, …) launches this script. It proxies every tool
 call to `agentd.py` — the detached daemon that actually owns the `reasonix acp`
 subprocesses — over a Unix socket, and relays the daemon's agent_event pushes
 as MCP notifications.
 
 Because the agents live in the daemon, not in this process, they **survive MCP
-server restarts**: close Claude Code, come back, and reasonix_list still shows
+server restarts**: close the MCP host, come back, and reasonix_list still shows
 the fleet running; reasonix_resume revives sessions whose process died.
 
 Tools:
@@ -32,8 +32,8 @@ import common
 
 MCP_INSTRUCTIONS = """Reasonix is an agent-orchestration MCP server backed by a
 detached agent daemon. Use reasonix_spawn once per child task and retain each
-session_id. Agents keep running even if this MCP server (or Claude Code)
-restarts — reasonix_list shows the fleet, reasonix_resume revives a session
+session_id. Agents keep running even if this MCP server (or the MCP host —
+Claude Code, Codex, …) restarts — reasonix_list shows the fleet, reasonix_resume revives a session
 whose process died. For multiple children call reasonix_wait with all ids, then
 reasonix_poll only for the ids in `woke`; poll is the authoritative way to
 collect text, events, completion, and permission requests. If a poll contains
@@ -186,7 +186,7 @@ async def reasonix_spawn(
     """Spawn a Reasonix coding agent and immediately start it on `task`.
 
     Returns a session_id immediately (non-blocking). The agent runs in the
-    detached daemon and SURVIVES this MCP server / Claude Code restarts —
+    detached daemon and SURVIVES this MCP server / MCP-host restarts —
     reasonix_list shows it afterwards. Call reasonix_poll for output,
     reasonix_send to steer mid-turn, reasonix_stop when done.
 

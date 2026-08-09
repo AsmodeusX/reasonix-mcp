@@ -1,18 +1,19 @@
-# Design: reasonix-mcp — Claude Code ↔ Reasonix agent bridge
+# Design: reasonix-mcp — MCP-client ↔ Reasonix agent bridge
 
 Date: 2026-08-09
 Status: validated (wire protocol verified empirically against `reasonix v1.17.20`)
 
 ## Goal
 
-Let Claude Code spawn live, steerable Reasonix coding agents and communicate
-with them back and forth. Claude Code is the MCP client; this project is the
+Let any MCP client (Claude Code, Codex, …) spawn live, steerable Reasonix
+coding agents and communicate with them back and forth. The MCP host is the
+client; this project is the server that bridges to Reasonix.
 MCP server that bridges to Reasonix.
 
 ## Architecture
 
 ```
-Claude Code (MCP client)
+Claude Code / Codex / any MCP client (MCP host)
    │  stdio JSON-RPC (MCP)
    ▼
 reasonix-mcp/server.py   (FastMCP server, stdio transport)
@@ -24,9 +25,9 @@ reasonix acp  (ACP v1: NDJSON JSON-RPC 2.0 over stdio)
 Reasonix agent (Go engine, workspace-rooted, provider from user config)
 ```
 
-- **MCP transport**: stdio. Claude Code launches `server.py` via `.mcp.json` or
-  `claude mcp add` (same pattern as the existing `codegraph` stdio server in
-  `~/.claude.json`).
+- **MCP transport**: stdio. The MCP host launches `server.py` via its `.mcp.json`
+  or `mcp add` mechanism (e.g. `claude mcp add`, the same pattern as the
+  existing `codegraph` stdio server in `~/.claude.json`).
 - **ACP transport**: one `reasonix acp` subprocess per spawned agent. Each ACP
   session owns an independent controller/cwd/model/history (no state leaks).
   stderr is diagnostics only — never merged into the JSON-RPC stdout channel.
@@ -84,8 +85,8 @@ Reasonix agent (Go engine, workspace-rooted, provider from user config)
   turn-end / process-exit are never dropped), text is accumulated
   incrementally (amortized O(1)/chunk, not a per-poll join), and poll results
   cap `text`/`thought`/`full_text`/`events` (tail kept, `*_truncated` /
-  `events_dropped` flags) so a long gap cannot blow up Claude Code's context.
-  Agents live as long as the MCP server process (the Claude Code session).
+  `events_dropped` flags) so a long gap cannot blow up the MCP host's context.
+  Agents live as long as the agent daemon (agentd).
 
 ## Safety
 
@@ -94,7 +95,7 @@ Reasonix agent (Go engine, workspace-rooted, provider from user config)
   `ask` relays permission requests, `auto` follows configured rules).
 - `reasonix_send` is forced-steer: messages are always delivered — steered into
   the running turn, or submitted as a new turn when idle (never dropped).
-- `cwd` defaults to the MCP server's cwd (= Claude Code project root).
+- `cwd` defaults to the MCP server's cwd (= the MCP host's project root).
 
 ## Testing
 

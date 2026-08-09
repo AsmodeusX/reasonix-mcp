@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """agentd — detached Reasonix agent daemon.
 
-Owns the `reasonix acp` subprocesses so agents **survive MCP server restarts**:
-Claude Code (and its stdio MCP server) can die and come back; the daemon keeps
-the agents running, and a new server reconnects and sees them via reasonix_list.
+Owns the `reasonix acp` subprocesses so agents **survive MCP host restarts**:
+the host (Claude Code, Codex, or any other MCP client) and its stdio server can
+die and come back; the daemon keeps the agents running, and a new server
+reconnects and sees them via reasonix_list.
 
 Wire protocol over a Unix socket: NDJSON JSON-RPC 2.0, one frame per line.
   server -> daemon:  {"jsonrpc":"2.0","id":N,"method":"spawn","params":{...}}
