@@ -44,15 +44,16 @@ class Agentd:
         self._registry: dict[str, acp_bridge.ReasonixAgent] = {}
         self._lock = threading.Lock()
         self._clients: set[asyncio.StreamWriter] = set()
+        self._client_owners: dict[asyncio.StreamWriter, str] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._idle_cleanup_tasks: dict[str, asyncio.Task] = {}
 
     # ------------------------------------------------------------- registry
 
-    def _get(self, session_id: str) -> acp_bridge.ReasonixAgent:
+    def _get(self, session_id: str, owner_id: str = "") -> acp_bridge.ReasonixAgent:
         with self._lock:
             agent = self._registry.get(session_id)
-        if agent is None:
+        if agent is None or getattr(agent, "owner_id", "") != owner_id:
             raise AgentdError(f"unknown session_id {session_id!r} — did you call reasonix_spawn first?")
         return agent
 
@@ -65,7 +66,9 @@ class Agentd:
                         self._loop.call_soon_threadsafe(self._schedule_idle_cleanup, agent)
                     elif kind == acp_bridge.EV_PROCESS_EXIT:
                         self._loop.call_soon_threadsafe(self._cancel_idle_cleanup, agent.session_id)
-                    asyncio.run_coroutine_threadsafe(self._broadcast(event), self._loop)
+                    asyncio.run_coroutine_threadsafe(
+                        self._broadcast(event, getattr(agent, "owner_id", "")), self._loop
+                    )
                 except Exception:
                     pass
             agent.on_event = _broadcast
@@ -122,10 +125,12 @@ class Agentd:
             if self._idle_cleanup_tasks.get(agent.session_id) is task:
                 self._idle_cleanup_tasks.pop(agent.session_id, None)
 
-    async def _broadcast(self, event: dict) -> None:
+    async def _broadcast(self, event: dict, owner_id: str) -> None:
         line = json.dumps({"method": "agent_event", "params": event}) + "\n"
         dead = []
         for w in self._clients:
+            if self._client_owners.get(w, "") != owner_id:
+                continue
             try:
                 w.write(line.encode())
                 await w.drain()
@@ -141,6 +146,7 @@ class Agentd:
         cwd = params.get("cwd") or os.getcwd()
         if not task.strip():
             raise AgentdError("task must not be empty")
+        owner_id = str(params.get("owner_id") or "")
         if not os.path.isdir(cwd):
             raise AgentdError(f"cwd is not a directory: {cwd!r}")
         if not common.cwd_allowed(cwd):
@@ -173,6 +179,8 @@ class Agentd:
         )
         agent.task = task
         agent.cwd = cwd
+        agent.owner_id = owner_id
+        common.write_session_owner(agent.session_id, owner_id)
         agent.keep_alive = keep_alive
         agent.idle_timeout = idle_timeout
         self._register(agent)
@@ -206,18 +214,28 @@ class Agentd:
 
     def resume(self, params: dict) -> dict:
         session_id = params.get("session_id", "")
+        owner_id = str(params.get("owner_id") or "")
         cwd = params.get("cwd") or ""
         with self._lock:
             existing = self._registry.get(session_id)
+        if existing is not None and getattr(existing, "owner_id", "") != owner_id:
+            raise AgentdError(f"unknown session_id {session_id!r} — it belongs to another orchestrator")
         if existing is None:
             persisted = os.path.join(common.reasonix_home(), "sessions", f"{session_id}.jsonl")
             if not os.path.isfile(persisted):
                 raise AgentdError(f"no live or persisted session {session_id!r} to resume")
+            stored_owner = common.read_session_owner(session_id)
+            if stored_owner != owner_id:
+                raise AgentdError(
+                    f"session {session_id!r} is owned by another orchestrator or predates ownership tracking"
+                )
         if not cwd:
             cwd = getattr(existing, "cwd", None) or os.getcwd()
         agent = acp_bridge.ReasonixAgent(cwd=cwd, resume_session_id=session_id)
         agent.task = getattr(existing, "task", None) or f"resumed {session_id}"
         agent.cwd = cwd
+        agent.owner_id = owner_id
+        common.write_session_owner(session_id, owner_id)
         keep_alive = params.get("keep_alive", False)
         if not isinstance(keep_alive, bool):
             raise AgentdError("keep_alive must be a boolean")
@@ -245,7 +263,7 @@ class Agentd:
             raise AgentdError("message must not be empty")
         if expect not in ("any", "steer", "new_turn"):
             raise AgentdError("expect must be one of: any, steer, new_turn")
-        agent = self._get(session_id)
+        agent = self._get(session_id, str(params.get("owner_id") or ""))
         self._cancel_idle_cleanup(session_id)
         if getattr(agent, "_auto_closing", False):
             raise AgentdError(f"agent {session_id} is being cleaned up")
@@ -282,7 +300,7 @@ class Agentd:
         return {"session_id": session_id, "delivered": delivered, "note": note}
 
     def poll(self, params: dict) -> dict:
-        agent = self._get(params["session_id"])
+        agent = self._get(params["session_id"], str(params.get("owner_id") or ""))
         return common.shape_poll(
             agent,
             include_events=params.get("include_events"),
@@ -300,7 +318,8 @@ class Agentd:
         if len(session_ids) > common.MAX_WATCH_SESSIONS:
             raise AgentdError(f"too many sessions (max {common.MAX_WATCH_SESSIONS})")
         timeout = max(0.0, min(timeout, 3600.0))
-        agents = {sid: self._get(sid) for sid in dict.fromkeys(session_ids)}
+        owner_id = str(params.get("owner_id") or "")
+        agents = {sid: self._get(sid, owner_id) for sid in dict.fromkeys(session_ids)}
         baselines = {sid: a.event_seq for sid, a in agents.items()}
         deadline = time.monotonic() + timeout
 
@@ -329,8 +348,12 @@ class Agentd:
     def list(self, params: dict | None = None) -> dict:
         params = params or {}
         include_task = bool(params.get("include_task", False))
+        owner_id = str(params.get("owner_id") or "")
         with self._lock:
-            items = list(self._registry.items())
+            items = [
+                item for item in self._registry.items()
+                if getattr(item[1], "owner_id", "") == owner_id
+            ]
         sessions = []
         for sid, a in items:
             status = common.agent_status(a)
@@ -358,7 +381,7 @@ class Agentd:
         return common.available_models()
 
     def transcript(self, params: dict) -> dict:
-        agent = self._get(params["session_id"])
+        agent = self._get(params["session_id"], str(params.get("owner_id") or ""))
         max_tool_calls = int(params.get("max_tool_calls", 200))
         path = getattr(agent, "transcript_path", None)
         if not path:
@@ -374,7 +397,7 @@ class Agentd:
         return {"session_id": agent.session_id, "exists": True, "transcript_path": path, **summary}
 
     def respond_permission(self, params: dict) -> dict:
-        agent = self._get(params["session_id"])
+        agent = self._get(params["session_id"], str(params.get("owner_id") or ""))
         option = None if params.get("option_id") == "cancel" else params.get("option_id")
         answered = agent.answer_permission(option)
         if not answered:
@@ -382,15 +405,21 @@ class Agentd:
         return {"session_id": params["session_id"], "answered": params.get("option_id")}
 
     def stop(self, params: dict) -> dict:
-        agent = self._get(params["session_id"])
+        agent = self._get(params["session_id"], str(params.get("owner_id") or ""))
         self._cancel_idle_cleanup(params["session_id"])
         agent.cancel_turn()
         agent.close()
         return {"session_id": params["session_id"], "stopped": True}
 
     def ping(self, params: dict | None = None) -> dict:
+        owner_id = str((params or {}).get("owner_id") or "")
         with self._lock:
-            return {"sessions": len(self._registry)}
+            sessions = sum(
+                1 for agent in self._registry.values()
+                if getattr(agent, "owner_id", "") == owner_id
+            )
+            owners = len({getattr(agent, "owner_id", "") for agent in self._registry.values()})
+        return {"sessions": sessions, "owners": owners, "owner_scoping": True}
 
     def shutdown(self, params: dict | None = None) -> dict:
         """Close every agent and stop the daemon (used by tests; the real
@@ -407,10 +436,23 @@ class Agentd:
         force=true.
         """
         force = bool((params or {}).get("force", False))
+        owner_id = str((params or {}).get("owner_id") or "")
         with self._lock:
             agents = list(self._registry.items())
+        foreign_live = [
+            agent for _, agent in agents
+            if getattr(agent, "owner_id", "") != owner_id
+            and common.agent_status(agent) != "exited"
+            and (agent.active_turn or getattr(agent, "keep_alive", False) or not agent.stop_reason)
+        ]
+        if foreign_live and not force:
+            raise AgentdError(
+                "cannot restart shared agentd while another orchestrator has live agents; "
+                "retry with force=true only if a global restart is intended"
+            )
         live = [
             sid for sid, agent in agents
+            if getattr(agent, "owner_id", "") == owner_id
             if common.agent_status(agent) != "exited"
             and (
                 agent.active_turn
@@ -472,6 +514,7 @@ class Agentd:
 
     async def client_loop(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._clients.add(writer)
+        self._client_owners[writer] = ""
         try:
             while True:
                 line = await reader.readline()
@@ -482,9 +525,19 @@ class Agentd:
                 except json.JSONDecodeError:
                     continue
                 if msg.get("method") and "id" in msg:
+                    owner_id = str((msg.get("params") or {}).get("owner_id") or "")
+                    known_owner = self._client_owners.get(writer, "")
+                    if known_owner and owner_id != known_owner:
+                        self._send(writer, {
+                            "jsonrpc": "2.0", "id": msg.get("id"),
+                            "error": {"code": -32000, "message": "connection owner cannot change"},
+                        })
+                        continue
+                    self._client_owners[writer] = owner_id
                     asyncio.create_task(self.dispatch(msg, writer))
         finally:
             self._clients.discard(writer)
+            self._client_owners.pop(writer, None)
             try:
                 writer.close()
             except Exception:

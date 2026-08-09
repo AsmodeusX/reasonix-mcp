@@ -47,8 +47,11 @@ a permission decision, or exits; terminal errors include error_text. The
 custom notification may be dropped by the client, so reasonix_wait/poll are the
 guaranteed control path. Use reasonix_restart_agentd after updating this
 server; it reloads the daemon once no live agents remain. Keep
-orchestration state in the parent agent. Completed agents are automatically
-cleaned up after their idle grace period unless spawned with keep_alive=true;
+orchestration state in the parent agent. Completed agents can be cleaned up
+after a configured idle grace period (disabled by default) unless spawned with
+keep_alive=true;
+session ownership is scoped to this orchestrator, so never expect to see
+another MCP client's sessions;
 do not claim a child is complete
 until its poll reports idle/exited status and a stop reason."""
 
@@ -64,6 +67,9 @@ _pending: dict[int, asyncio.Future] = {}
 _next_id = itertools.count(1)
 _mcp_session = None  # captured on first tool call, used to relay daemon pushes
 _rpc_default_timeout = 600.0
+_owner_id = common.orchestrator_owner_id()
+_owner_explicit = bool(os.environ.get("REASONIX_MCP_ORCHESTRATOR_ID", "").strip())
+_owned_sessions = common.load_owner_sessions(_owner_id)
 
 
 async def _start_agentd(sock: str) -> None:
@@ -132,6 +138,8 @@ async def _read_agentd(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
 
 async def _rpc(method: str, params: dict, timeout: float = _rpc_default_timeout) -> dict:
+    params = dict(params)
+    params.setdefault("owner_id", _owner_id)
     await _ensure_agentd()
     rid = next(_next_id)
     fut = asyncio.get_running_loop().create_future()
@@ -155,6 +163,8 @@ async def _rpc(method: str, params: dict, timeout: float = _rpc_default_timeout)
 
 
 async def _relay_agent_event(event: dict) -> None:
+    if event.get("session_id") not in _owned_sessions:
+        return
     if not NOTIFY_ENABLED or _mcp_session is None:
         return
     try:
@@ -174,12 +184,43 @@ async def _relay_agent_event(event: dict) -> None:
 
 
 def _capture_relay_ctx(ctx: Context | None) -> None:
-    global _mcp_session
-    if ctx is not None and _mcp_session is None:
+    global _mcp_session, _owner_id, _owned_sessions
+    if ctx is not None:
         try:
-            _mcp_session = ctx.session
+            if _mcp_session is None:
+                _mcp_session = ctx.session
+            if not _owner_explicit:
+                params = getattr(ctx.session, "client_params", None)
+                info = getattr(params, "client_info", None)
+                client_name = str(getattr(info, "name", "") or "")
+                owner_id = common.orchestrator_owner_id(client_name)
+                if owner_id != _owner_id:
+                    _owner_id = owner_id
+                    _owned_sessions = common.load_owner_sessions(_owner_id)
         except Exception:
             pass
+
+
+def _remember_session(session_id: str) -> None:
+    global _owned_sessions
+    if session_id:
+        _owned_sessions = common.load_owner_sessions(_owner_id) | _owned_sessions | {session_id}
+        try:
+            common.write_session_owner(session_id, _owner_id)
+            common.save_owner_sessions(_owner_id, _owned_sessions)
+        except OSError:
+            # A persistence failure must not turn a successful spawn/resume
+            # into a tool error; the daemon remains authoritative for the
+            # current connection and will report the issue on reconnect.
+            pass
+
+
+def _require_owned(session_id: str) -> None:
+    if session_id not in _owned_sessions:
+        raise ValueError(
+            f"session {session_id!r} is not owned by this orchestrator; "
+            "use the MCP client that spawned it"
+        )
 
 
 @mcp.tool()
@@ -212,11 +253,13 @@ async def reasonix_spawn(
     e.g. an effort option.
     """
     _capture_relay_ctx(ctx)
-    return await _rpc("spawn", {
+    result = await _rpc("spawn", {
         "task": task, "cwd": cwd, "model": model,
         "work_mode": work_mode, "tool_approval": tool_approval, "effort": effort,
         "keep_alive": keep_alive, "idle_timeout": idle_timeout,
     })
+    _remember_session(result.get("session_id", ""))
+    return result
 
 
 @mcp.tool()
@@ -225,24 +268,33 @@ async def reasonix_resume(
     cwd: str = "",
     keep_alive: bool = False,
     idle_timeout: float = common.DEFAULT_IDLE_TIMEOUT,
+    ctx: Context | None = None,
 ) -> dict:
     """Revive a session whose process died (after a daemon restart, a crash,
     or reasonix_stop — history is persisted on disk). Opens a fresh ACP
     process and session/resume's the stored session; poll/send work as before.
     """
-    return await _rpc("resume", {
+    _capture_relay_ctx(ctx)
+    _require_owned(session_id)
+    result = await _rpc("resume", {
         "session_id": session_id, "cwd": cwd,
         "keep_alive": keep_alive, "idle_timeout": idle_timeout,
     })
+    _remember_session(session_id)
+    return result
 
 
 @mcp.tool()
-async def reasonix_send(session_id: str, message: str, expect: str = "any") -> dict:
+async def reasonix_send(
+    session_id: str, message: str, expect: str = "any", ctx: Context | None = None
+) -> dict:
     """Send a message to a running agent — always delivered (forced steer).
 
     Steer into the active turn (`_reasonix.io/session/steer`), or start a new
     turn if idle. expect: any|steer|new_turn; a refused call has no side effect.
     """
+    _capture_relay_ctx(ctx)
+    _require_owned(session_id)
     return await _rpc("send", {"session_id": session_id, "message": message, "expect": expect})
 
 
@@ -254,6 +306,7 @@ async def reasonix_poll(
     include_thought: bool = common.DEFAULT_INCLUDE_THOUGHT,
     include_full: bool = common.DEFAULT_INCLUDE_FULL,
     max_events: int | None = None,
+    ctx: Context | None = None,
 ) -> dict:
     """Read recent output the agent produced since the last poll.
 
@@ -263,6 +316,8 @@ async def reasonix_poll(
     event cap). Static setup events are filtered by default. thought/full_* are
     opt-in (include_thought / include_full). Errors include error_text.
     """
+    _capture_relay_ctx(ctx)
+    _require_owned(session_id)
     return await _rpc("poll", {
         "session_id": session_id,
         "include_events": include_events, "exclude_events": exclude_events,
@@ -272,23 +327,34 @@ async def reasonix_poll(
 
 
 @mcp.tool()
-async def reasonix_wait(session_ids: list[str], timeout: float = 30.0) -> dict:
+async def reasonix_wait(
+    session_ids: list[str], timeout: float = 30.0, ctx: Context | None = None
+) -> dict:
     """Block until any watched session produces output, finishes a turn, or
     raises a permission request (or `timeout` seconds pass). Returns woke ids,
     per-session status + stop_reason. The authoritative callback — use it as
     the loop's source of truth; the push notification is best-effort.
     """
+    _capture_relay_ctx(ctx)
+    for session_id in session_ids:
+        _require_owned(session_id)
     return await _rpc("wait", {"session_ids": session_ids, "timeout": timeout}, timeout=timeout + 60)
 
 
 @mcp.tool()
-async def reasonix_list(include_task: bool = False) -> dict:
+async def reasonix_list(include_task: bool = False, ctx: Context | None = None) -> dict:
     """List sessions with a compact task preview by default.
 
     Set include_task=true only when the full original orchestration prompt is
     needed; it can be thousands of words.
     """
-    return await _rpc("list", {"include_task": include_task})
+    _capture_relay_ctx(ctx)
+    result = await _rpc("list", {"include_task": include_task})
+    result["sessions"] = [
+        session for session in result.get("sessions", [])
+        if session.get("session_id") in _owned_sessions
+    ]
+    return result
 
 
 @mcp.tool()
@@ -299,30 +365,40 @@ async def reasonix_models() -> dict:
 
 
 @mcp.tool()
-async def reasonix_transcript(session_id: str, max_tool_calls: int = 200) -> dict:
+async def reasonix_transcript(
+    session_id: str, max_tool_calls: int = 200, ctx: Context | None = None
+) -> dict:
     """What the agent actually did: tool calls with args, files touched,
     roles, work duration, last text. NB: Reasonix does not persist token/cost
     usage — these are activity metrics."""
+    _capture_relay_ctx(ctx)
+    _require_owned(session_id)
     return await _rpc("transcript", {"session_id": session_id, "max_tool_calls": max_tool_calls})
 
 
 @mcp.tool()
-async def reasonix_respond_permission(session_id: str, option_id: str) -> dict:
+async def reasonix_respond_permission(
+    session_id: str, option_id: str, ctx: Context | None = None
+) -> dict:
     """Answer the agent's pending tool-approval or question request. option_id
     is one of poll's permission_request.options[].optionId, or "cancel"."""
+    _capture_relay_ctx(ctx)
+    _require_owned(session_id)
     return await _rpc("respond_permission", {"session_id": session_id, "option_id": option_id})
 
 
 @mcp.tool()
-async def reasonix_stop(session_id: str) -> dict:
+async def reasonix_stop(session_id: str, ctx: Context | None = None) -> dict:
     """Cancel the active turn, close the ACP session, kill the agent process.
     The session stays listed as a tombstone and is resumable via
     reasonix_resume (its transcript is persisted)."""
+    _capture_relay_ctx(ctx)
+    _require_owned(session_id)
     return await _rpc("stop", {"session_id": session_id})
 
 
 @mcp.tool()
-async def reasonix_restart_agentd(force: bool = False) -> dict:
+async def reasonix_restart_agentd(force: bool = False, ctx: Context | None = None) -> dict:
     """Restart the detached agent daemon so it loads updated code.
 
     By default this refuses while live agents exist. Set force=true only when
@@ -331,6 +407,7 @@ async def reasonix_restart_agentd(force: bool = False) -> dict:
     daemon.
     """
     global _agentd_reader, _agentd_writer
+    _capture_relay_ctx(ctx)
     try:
         result = await _rpc("restart", {"force": force})
     except ValueError as exc:
@@ -357,8 +434,8 @@ async def reasonix_restart_agentd(force: bool = False) -> dict:
                 sessions = len(live)
         if sessions and not force:
             raise ValueError(
-                "the running agentd predates restart support and has "
-                f"{sessions} session(s); stop them first or retry with force=true"
+                "the running agentd predates restart support and has live "
+                "sessions; stop them first or retry with force=true"
             )
         result = await _rpc("shutdown", {})
         result["compatibility_fallback"] = "shutdown"

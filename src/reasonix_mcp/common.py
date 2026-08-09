@@ -9,6 +9,7 @@ summaries, and poll shaping.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import time
 import tomllib
@@ -66,6 +67,62 @@ def agentd_sock_path() -> str:
         return env
     parent = os.path.dirname(reasonix_home().rstrip("/")) or "/"
     return os.path.join(parent, ".reasonix-mcp", "agentd.sock")
+
+
+def orchestrator_owner_id(client_name: str = "") -> str:
+    """Stable, non-secret owner key used to isolate MCP orchestrators."""
+    explicit = os.environ.get("REASONIX_MCP_ORCHESTRATOR_ID", "").strip()
+    scope = os.path.realpath(os.getcwd())
+    seed = explicit or f"{client_name.strip()}\0{scope}"
+    return "owner-" + hashlib.sha256(seed.encode()).hexdigest()[:24]
+
+
+def owner_state_path(owner_id: str) -> str:
+    return os.path.join(reasonix_home(), "orchestrators", f"{owner_id}.json")
+
+
+def load_owner_sessions(owner_id: str) -> set[str]:
+    path = owner_state_path(owner_id)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return {str(sid) for sid in data.get("session_ids", [])}
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def save_owner_sessions(owner_id: str, session_ids: set[str]) -> None:
+    path = owner_state_path(owner_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"owner_id": owner_id, "session_ids": sorted(session_ids)}, fh)
+    os.replace(tmp, path)
+
+
+def session_owner_path(session_id: str) -> str:
+    return os.path.join(reasonix_home(), "sessions", f"{session_id}.owner.json")
+
+
+def write_session_owner(session_id: str, owner_id: str) -> None:
+    if not session_id or not owner_id:
+        return
+    path = session_owner_path(session_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"session_id": session_id, "owner_id": owner_id}, fh)
+    os.replace(tmp, path)
+
+
+def read_session_owner(session_id: str) -> str | None:
+    try:
+        with open(session_owner_path(session_id), encoding="utf-8") as fh:
+            data = json.load(fh)
+        owner_id = data.get("owner_id")
+        return str(owner_id) if owner_id else None
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def _cap(s: str, limit: int) -> tuple[str, bool]:

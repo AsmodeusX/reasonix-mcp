@@ -28,8 +28,8 @@ shut down (killing the daemon kills its agents — they carry PDEATHSIG).
   if idle it starts a new turn.
 - **Poll** returns recent output since last poll: text, turns, plan, events,
   permission requests, stop reason, and terminal error text when applicable.
-- **Cleanup** stops completed agents after an idle grace period; use
-  `keep_alive=true` for interactive follow-up turns.
+- **Cleanup** can stop completed agents after an idle grace period; it is
+  disabled by default. Use `keep_alive=true` for interactive follow-up turns.
 - **Resume** revives a stopped/crashed session from its persisted transcript.
 - **Stop** cancels + closes + kills; the session stays listed and resumable.
 - **Callbacks**: the daemon pushes `reasonix/agent_event` (best-effort);
@@ -258,6 +258,23 @@ transcripts can be resumed after the fresh daemon starts. The next tool call
 automatically starts the new daemon, so no shell command or socket cleanup is
 needed. The daemon is shared by MCP clients, so a restart disconnects other
 clients too; they reconnect automatically on their next tool call.
+
+### Orchestrator isolation
+
+Sessions are scoped to the MCP orchestrator that created them. `reasonix_list`
+and all session operations only expose that orchestrator's sessions. The scope
+is stable across MCP server restarts and is derived from the MCP client's name
+and workspace. If multiple instances of the same CLI run in the same workspace,
+set a distinct stable value in each environment:
+
+```sh
+REASONIX_MCP_ORCHESTRATOR_ID=project-a-cli-1
+```
+
+The daemon is shared, but ownership is enforced by the daemon and persisted
+with each session. `reasonix_restart_agentd` remains a global operation because
+restarting the shared daemon affects every orchestrator; it refuses while
+another orchestrator has live agents unless `force=true`.
 
 ### Agent cleanup
 
