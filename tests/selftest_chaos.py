@@ -16,10 +16,11 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from selftest_util import shutdown_agentd  # noqa: E402
+from util import shutdown_agentd  # noqa: E402
 
-SERVER = "/home/asmodeus/reasonix-mcp/server.py"
-PY = "/home/asmodeus/reasonix-mcp/.venv/bin/python"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from util import SERVER, PY, shutdown_agentd, scratch_env
+
 SCRATCH = tempfile.mkdtemp(prefix="rxmcp-verify-")
 PROJECT = "/home/asmodeus/reasonix-mcp"
 

@@ -16,15 +16,16 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from selftest_util import shutdown_agentd
+from util import shutdown_agentd
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 
-SERVER = "/home/asmodeus/reasonix-mcp/server.py"
-PY = "/home/asmodeus/reasonix-mcp/.venv/bin/python"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from util import SERVER, PY, shutdown_agentd, scratch_env
+
 REAL_HOME = os.path.expanduser("~/.reasonix")
 SCRATCH_HOME = tempfile.mkdtemp(prefix="rxmcp-question-")
 

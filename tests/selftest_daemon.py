@@ -19,10 +19,11 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from selftest_util import scratch_env, shutdown_agentd  # noqa: E402
+from util import scratch_env, shutdown_agentd  # noqa: E402
 
-SERVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")
-PY = "/home/asmodeus/reasonix-mcp/.venv/bin/python"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from util import SERVER, PY, shutdown_agentd, scratch_env
+
 SCRATCH = tempfile.mkdtemp(prefix="rxmcp-daemon-")
 
 

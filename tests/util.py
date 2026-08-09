@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared helpers for the reasonix-mcp selftests.
+"""Shared helpers for the reasonix-mcp selftests (tests/).
 
 Every test spawns the MCP server against a scratch REASONIX_HOME; with the
 detached-daemon architecture the server auto-starts an agentd, so tests must
@@ -9,6 +9,11 @@ daemon down when done (no lingering processes).
 import json
 import os
 import socket
+
+# Project layout: tests/ -> root -> src/reasonix_mcp
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SERVER = os.path.join(ROOT, "src", "reasonix_mcp", "server.py")
+PY = os.path.join(ROOT, ".venv", "bin", "python")
 
 
 def scratch_env(scratch: str, real_home: str | None = None) -> dict:

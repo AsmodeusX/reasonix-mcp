@@ -17,7 +17,7 @@ import http.server
 import json
 import os
 import shutil
-from selftest_util import shutdown_agentd
+from util import shutdown_agentd
 import signal
 import subprocess
 import sys
@@ -25,8 +25,9 @@ import tempfile
 import threading
 import time
 
-SERVER = "/home/asmodeus/reasonix-mcp/server.py"
-PY = "/home/asmodeus/reasonix-mcp/.venv/bin/python"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from util import SERVER, PY, shutdown_agentd, scratch_env
+
 SCRATCH_HOME = tempfile.mkdtemp(prefix="rxmcp-notif-")
 
 

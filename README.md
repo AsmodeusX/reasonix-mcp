@@ -54,7 +54,7 @@ User scope (available in every project) — example with Claude Code:
 ```sh
 claude mcp add reasonix --scope user -- \
   /home/asmodeus/reasonix-mcp/.venv/bin/python \
-  /home/asmodeus/reasonix-mcp/server.py
+  /home/asmodeus/reasonix-mcp/src/reasonix_mcp/server.py
 ```
 
 Other MCP hosts (Codex, etc.) register stdio servers through their own
@@ -281,15 +281,15 @@ revived with `reasonix_resume`.
 ## Testing
 
 ```sh
-.venv/bin/python selftest.py              # spawn → poll → steer → stop (real provider)
-.venv/bin/python selftest_daemon.py       # survival across server kill + resume + 6-way concurrency (real provider)
-.venv/bin/python selftest_permission.py   # ask-mode permission round-trip (real provider)
-.venv/bin/python selftest_question.py     # agent asks a question via `ask` (real provider)
-.venv/bin/python selftest_transcript.py   # transcript + plan fields (real provider)
-.venv/bin/python selftest_orchestrator.py # list/wait/filtering/posture (no model calls)
-.venv/bin/python selftest_notifications.py # agent-done push callback (no model calls)
-.venv/bin/python selftest_chaos.py       # cwd allowlist + dual notify + PDEATHSIG (no model calls)
-.venv/bin/python selftest_allow_write.py  # cross-cwd write via allow_write (real provider)
+.venv/bin/python tests/selftest.py              # spawn → poll → steer → stop (real provider)
+.venv/bin/python tests/selftest_daemon.py       # survival across server kill + resume + 6-way concurrency (real provider)
+.venv/bin/python tests/selftest_permission.py   # ask-mode permission round-trip (real provider)
+.venv/bin/python tests/selftest_question.py     # agent asks a question via `ask` (real provider)
+.venv/bin/python tests/selftest_transcript.py   # transcript + plan fields (real provider)
+.venv/bin/python tests/selftest_orchestrator.py # list/wait/filtering/posture (no model calls)
+.venv/bin/python tests/selftest_notifications.py # agent-done push callback (no model calls)
+.venv/bin/python tests/selftest_chaos.py       # cwd allowlist + dual notify + PDEATHSIG (no model calls)
+.venv/bin/python tests/selftest_allow_write.py  # cross-cwd write via allow_write (real provider)
 ```
 
 The selftest runs fully isolated: it copies `config.toml` + `.env` into a

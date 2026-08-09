@@ -13,7 +13,7 @@ import asyncio
 import json
 import os
 import shutil
-from selftest_util import shutdown_agentd
+from util import shutdown_agentd
 import sys
 import tempfile
 import time
@@ -21,7 +21,9 @@ import time
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-SERVER = "/home/asmodeus/reasonix-mcp/server.py"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from util import SERVER, PY, shutdown_agentd, scratch_env
+
 REAL_HOME = os.path.expanduser("~/.reasonix")
 SCRATCH_HOME = tempfile.mkdtemp(prefix="rxmcp-allowwrite-")
 PROBE = "/home/asmodeus/qemu-tricore/allow_write_probe.txt"
