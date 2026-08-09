@@ -92,6 +92,8 @@ a child finishes, exits, or needs a decision, with each compact result in
 stop reason, one capped message, permission details, plan/current work, errors,
 and transcript path. Its timeout is disabled by default and it does
 not wake for ordinary text chunks, so no timer loop or follow-up poll is needed.
+Omit `timeout` for normal orchestration. Values such as `timeout=240` in the
+self-tests are test-runner safety guards, not production defaults.
 Use one non-overlapping watch per orchestrator fleet. If another child finishes
 while a result is being handled, its terminal state remains pending and the
 next watch returns it immediately. Overlapping watches on the same session are

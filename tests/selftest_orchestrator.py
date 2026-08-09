@@ -3,7 +3,7 @@
 
 Exercises the orchestration surface added for the integration feedback:
 poll event filtering (static boilerplate dropped), events_filtered,
-reasonix_list, reasonix_watch (full no-poll result), reasonix_wait (legacy
+reasonix_list, reasonix_watch (compact no-poll result), reasonix_wait (legacy
 wake on turn end / exited), spawn sandbox
 posture, turns with stop_reason, and send expect="steer" semantics.
 """

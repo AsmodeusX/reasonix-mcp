@@ -57,6 +57,9 @@ and agent questions; the selected option is returned to the child
 automatically. Watch remains authoritative when elicitation is unavailable,
 declined, or canceled. reasonix_poll is for explicit snapshots and
 reasonix_wait is the legacy output-sensitive long poll.
+Omit watch timeout for normal orchestration; its default is indefinite. Never
+copy explicit test safety timeouts (such as 240 seconds) into production watch
+calls unless the user specifically requests a bounded wait.
 Set watch detail=true, poll, or read the transcript only when deeper output is
 needed. Terminal errors include error_text; watch exposes plan and current_work. The
 daemon and MCP server log event emission/relay results to stderr.
@@ -507,8 +510,9 @@ async def reasonix_watch(
     """Wait for completion, permission/question, or process death and return
     compact results for every woken agent. The default omits event history,
     thought, duplicate turn text, and full history; set detail=true for the
-    poll-shaped result. The timeout is disabled by default. Wire notifications
-    are diagnostic only.
+    poll-shaped result. Omit timeout for normal orchestration: the default is
+    indefinite. Explicit timeouts are only for deliberately bounded waits.
+    Wire notifications are diagnostic only.
     """
     _capture_relay_ctx(ctx)
     for session_id in session_ids:

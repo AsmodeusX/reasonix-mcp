@@ -7,7 +7,7 @@ survive MCP-server death. Flow:
   2. server B (same socket) reconnects: reasonix_list shows the agent,
      poll returns its output (queued in the daemon), send steers it.
   3. reasonix_resume revives a stopped (tombstoned) session.
-  4. 6 agents in parallel: reasonix_watch returns full terminal results, no polls.
+  4. 6 agents in parallel: reasonix_watch returns compact terminal results, no polls.
 """
 import json
 import os
