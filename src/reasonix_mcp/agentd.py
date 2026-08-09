@@ -45,6 +45,7 @@ class Agentd:
         self._lock = threading.Lock()
         self._clients: set[asyncio.StreamWriter] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._idle_cleanup_tasks: dict[str, asyncio.Task] = {}
 
     # ------------------------------------------------------------- registry
 
@@ -60,6 +61,10 @@ class Agentd:
             def _broadcast(kind, payload, agent=agent):
                 try:
                     event = common.build_agent_event(agent, kind, payload)
+                    if kind == acp_bridge.EV_TURN_END:
+                        self._loop.call_soon_threadsafe(self._schedule_idle_cleanup, agent)
+                    elif kind == acp_bridge.EV_PROCESS_EXIT:
+                        self._loop.call_soon_threadsafe(self._cancel_idle_cleanup, agent.session_id)
                     asyncio.run_coroutine_threadsafe(self._broadcast(event), self._loop)
                 except Exception:
                     pass
@@ -78,6 +83,42 @@ class Agentd:
                 payload["error"] = agent.last_error
                 payload["error_text"] = agent.last_error_text
             agent.on_event(acp_bridge.EV_PROCESS_EXIT, payload)
+
+    def _cancel_idle_cleanup(self, session_id: str) -> None:
+        task = self._idle_cleanup_tasks.pop(session_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _schedule_idle_cleanup(self, agent: acp_bridge.ReasonixAgent) -> None:
+        if getattr(agent, "keep_alive", False):
+            return
+        self._cancel_idle_cleanup(agent.session_id)
+        timeout = max(0.0, float(getattr(agent, "idle_timeout", common.DEFAULT_IDLE_TIMEOUT)))
+        self._idle_cleanup_tasks[agent.session_id] = asyncio.create_task(
+            self._auto_stop_idle(agent, agent.event_seq, timeout)
+        )
+
+    async def _auto_stop_idle(
+        self, agent: acp_bridge.ReasonixAgent, event_seq: int, timeout: float
+    ) -> None:
+        task = asyncio.current_task()
+        try:
+            await asyncio.sleep(timeout)
+            if (
+                agent.status == "idle"
+                and not agent.active_turn
+                and agent.event_seq == event_seq
+            ):
+                # Mark before moving the blocking close operation to a worker;
+                # a concurrent send then gets a clear lifecycle error instead
+                # of racing the process teardown.
+                agent._auto_closing = True
+                await asyncio.to_thread(agent.close)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if self._idle_cleanup_tasks.get(agent.session_id) is task:
+                self._idle_cleanup_tasks.pop(agent.session_id, None)
 
     async def _broadcast(self, event: dict) -> None:
         line = json.dumps({"method": "agent_event", "params": event}) + "\n"
@@ -111,6 +152,15 @@ class Agentd:
         work_mode = params.get("work_mode", common.DEFAULT_WORK_MODE)
         if work_mode and work_mode not in ("economy", "balanced", "delivery"):
             raise AgentdError("work_mode must be one of: economy, balanced, delivery")
+        keep_alive = params.get("keep_alive", False)
+        if not isinstance(keep_alive, bool):
+            raise AgentdError("keep_alive must be a boolean")
+        try:
+            idle_timeout = float(params.get("idle_timeout", common.DEFAULT_IDLE_TIMEOUT))
+        except (TypeError, ValueError):
+            raise AgentdError("idle_timeout must be a non-negative number") from None
+        if idle_timeout < 0 or idle_timeout > 86400:
+            raise AgentdError("idle_timeout must be between 0 and 86400 seconds")
 
         agent = acp_bridge.ReasonixAgent(
             cwd=cwd,
@@ -121,6 +171,8 @@ class Agentd:
         )
         agent.task = task
         agent.cwd = cwd
+        agent.keep_alive = keep_alive
+        agent.idle_timeout = idle_timeout
         self._register(agent)
         agent.start_turn(task)
         posture = common.sandbox_posture()
@@ -137,6 +189,8 @@ class Agentd:
                      "guaranteed callback. reasonix_poll for output, "
                      "reasonix_send to steer mid-turn, reasonix_resume to revive "
                      "a stopped session."),
+            "keep_alive": keep_alive,
+            "idle_timeout": idle_timeout,
         }
         notes = getattr(agent, "spawn_notes", None) or {}
         if notes.get("skipped_options"):
@@ -162,6 +216,17 @@ class Agentd:
         agent = acp_bridge.ReasonixAgent(cwd=cwd, resume_session_id=session_id)
         agent.task = getattr(existing, "task", None) or f"resumed {session_id}"
         agent.cwd = cwd
+        keep_alive = params.get("keep_alive", False)
+        if not isinstance(keep_alive, bool):
+            raise AgentdError("keep_alive must be a boolean")
+        try:
+            idle_timeout = float(params.get("idle_timeout", common.DEFAULT_IDLE_TIMEOUT))
+        except (TypeError, ValueError):
+            raise AgentdError("idle_timeout must be a non-negative number") from None
+        if idle_timeout < 0 or idle_timeout > 86400:
+            raise AgentdError("idle_timeout must be between 0 and 86400 seconds")
+        agent.keep_alive = keep_alive
+        agent.idle_timeout = idle_timeout
         self._register(agent)
         return {
             "session_id": session_id,
@@ -179,6 +244,9 @@ class Agentd:
         if expect not in ("any", "steer", "new_turn"):
             raise AgentdError("expect must be one of: any, steer, new_turn")
         agent = self._get(session_id)
+        self._cancel_idle_cleanup(session_id)
+        if getattr(agent, "_auto_closing", False):
+            raise AgentdError(f"agent {session_id} is being cleaned up")
         if agent.status == "exited":
             raise AgentdError(f"agent {session_id} has exited — it can no longer accept messages")
         if expect == "steer" and not agent.active_turn:
@@ -313,6 +381,7 @@ class Agentd:
 
     def stop(self, params: dict) -> dict:
         agent = self._get(params["session_id"])
+        self._cancel_idle_cleanup(params["session_id"])
         agent.cancel_turn()
         agent.close()
         return {"session_id": params["session_id"], "stopped": True}
@@ -330,14 +399,23 @@ class Agentd:
         """Stop this daemon so the MCP server can start a fresh copy.
 
         Refuse by default when live agents exist: restarting the daemon kills
-        them because they are deliberately tied to its lifetime. Exited
-        tombstones are safe to discard. A caller must explicitly opt into
-        disrupting live agents with force=true.
+        them because they are deliberately tied to its lifetime. Terminal
+        idle sessions and exited tombstones are safe to discard. A caller must
+        explicitly opt into disrupting active or keep-alive agents with
+        force=true.
         """
         force = bool((params or {}).get("force", False))
         with self._lock:
             agents = list(self._registry.items())
-        live = [sid for sid, agent in agents if common.agent_status(agent) != "exited"]
+        live = [
+            sid for sid, agent in agents
+            if common.agent_status(agent) != "exited"
+            and (
+                agent.active_turn
+                or getattr(agent, "keep_alive", False)
+                or not agent.stop_reason
+            )
+        ]
         if live and not force:
             raise AgentdError(
                 "cannot restart agentd while live agents exist; stop them first "
@@ -346,6 +424,8 @@ class Agentd:
         return self._shutdown_agents()
 
     def _shutdown_agents(self) -> dict:
+        for session_id in list(self._idle_cleanup_tasks):
+            self._cancel_idle_cleanup(session_id)
         with self._lock:
             agents = list(self._registry.values())
             self._registry.clear()

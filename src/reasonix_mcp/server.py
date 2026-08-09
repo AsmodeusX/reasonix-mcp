@@ -47,7 +47,9 @@ a permission decision, or exits; terminal errors include error_text. The
 custom notification may be dropped by the client, so reasonix_wait/poll are the
 guaranteed control path. Use reasonix_restart_agentd after updating this
 server; it reloads the daemon once no live agents remain. Keep
-orchestration state in the parent agent, and do not claim a child is complete
+orchestration state in the parent agent. Completed agents are automatically
+cleaned up after their idle grace period unless spawned with keep_alive=true;
+do not claim a child is complete
 until its poll reports idle/exited status and a stop reason."""
 
 mcp = MCPServer("reasonix", instructions=MCP_INSTRUCTIONS)
@@ -188,6 +190,8 @@ async def reasonix_spawn(
     work_mode: str = common.DEFAULT_WORK_MODE,
     tool_approval: str = common.DEFAULT_TOOL_APPROVAL,
     effort: str = common.DEFAULT_EFFORT,
+    keep_alive: bool = False,
+    idle_timeout: float = common.DEFAULT_IDLE_TIMEOUT,
     ctx: Context | None = None,
 ) -> dict:
     """Spawn a Reasonix coding agent and immediately start it on `task`.
@@ -198,7 +202,9 @@ async def reasonix_spawn(
     reasonix_send to steer mid-turn, reasonix_stop when done.
 
     Defaults: model=opencode-go/deepseek-v4-flash, effort=max,
-    tool_approval=yolo (env-overridable REASONIX_MCP_DEFAULT_*). work_mode:
+    tool_approval=yolo (env-overridable REASONIX_MCP_DEFAULT_*). Completed
+    agents are cleaned up after an idle grace period; set keep_alive=true for
+    an interactive session that needs follow-up turns. work_mode:
     economy|balanced|delivery; effort: auto|disabled|high|max; tool_approval:
     ask|auto|yolo. `cwd` is confined to the project dir + [sandbox] allow_write
     (escape: REASONIX_MCP_ALLOW_ANY_CWD=1). Returns the effective sandbox
@@ -209,16 +215,25 @@ async def reasonix_spawn(
     return await _rpc("spawn", {
         "task": task, "cwd": cwd, "model": model,
         "work_mode": work_mode, "tool_approval": tool_approval, "effort": effort,
+        "keep_alive": keep_alive, "idle_timeout": idle_timeout,
     })
 
 
 @mcp.tool()
-async def reasonix_resume(session_id: str, cwd: str = "") -> dict:
+async def reasonix_resume(
+    session_id: str,
+    cwd: str = "",
+    keep_alive: bool = False,
+    idle_timeout: float = common.DEFAULT_IDLE_TIMEOUT,
+) -> dict:
     """Revive a session whose process died (after a daemon restart, a crash,
     or reasonix_stop — history is persisted on disk). Opens a fresh ACP
     process and session/resume's the stored session; poll/send work as before.
     """
-    return await _rpc("resume", {"session_id": session_id, "cwd": cwd})
+    return await _rpc("resume", {
+        "session_id": session_id, "cwd": cwd,
+        "keep_alive": keep_alive, "idle_timeout": idle_timeout,
+    })
 
 
 @mcp.tool()
@@ -326,6 +341,20 @@ async def reasonix_restart_agentd(force: bool = False) -> dict:
             raise
         state = await _rpc("ping", {})
         sessions = int(state.get("sessions", 0))
+        if sessions and not force:
+            # Older daemons expose list but not restart. Terminal idle
+            # sessions are safe to discard; running/unfinished ones are not.
+            try:
+                listing = await _rpc("list", {})
+                live = [
+                    item for item in listing.get("sessions", [])
+                    if item.get("status") == "running"
+                    or (item.get("status") == "idle" and not item.get("stop_reason"))
+                ]
+            except Exception:
+                live = listing = None
+            if live is not None:
+                sessions = len(live)
         if sessions and not force:
             raise ValueError(
                 "the running agentd predates restart support and has "
