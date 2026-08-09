@@ -153,6 +153,14 @@ class Agentd:
 
     # ---------------------------------------------------------------- methods
 
+    @staticmethod
+    def _start_agent_turn(agent: acp_bridge.ReasonixAgent, message: str) -> None:
+        """Start a turn, injecting the progress contract once per ACP session."""
+        inject = not bool(getattr(agent, "status_protocol_injected", False))
+        agent.start_turn(common.task_with_status_protocol(message) if inject else message)
+        if inject:
+            agent.status_protocol_injected = True
+
     def spawn(self, params: dict) -> dict:
         task = params.get("task", "")
         cwd = params.get("cwd") or os.getcwd()
@@ -196,7 +204,7 @@ class Agentd:
         agent.keep_alive = keep_alive
         agent.idle_timeout = idle_timeout
         self._register(agent)
-        agent.start_turn(common.task_with_status_protocol(task))
+        self._start_agent_turn(agent, task)
         posture = common.sandbox_posture()
         for warning in posture.get("warnings", []):
             print(f"warning: {warning}", file=sys.stderr, flush=True)
@@ -244,6 +252,7 @@ class Agentd:
         if not cwd:
             cwd = getattr(existing, "cwd", None) or os.getcwd()
         agent = acp_bridge.ReasonixAgent(cwd=cwd, resume_session_id=session_id)
+        agent.status_protocol_injected = common.transcript_has_status_protocol(session_id)
         agent.task = getattr(existing, "task", None) or f"resumed {session_id}"
         agent.cwd = cwd
         agent.owner_id = owner_id
@@ -296,7 +305,7 @@ class Agentd:
                 if e.code != acp_bridge.ERR_INVALID_REQUEST:
                     raise AgentdError(e.message, e.code) from e
             try:
-                agent.start_turn(common.task_with_status_protocol(message))
+                self._start_agent_turn(agent, message)
                 delivered = "new_turn"
                 note = "no active turn; started a new turn with the message"
                 break

@@ -202,6 +202,9 @@ class ReasonixAgent:
         self._tool_calls: dict[str, dict] = {}
         self._last_tool_call: dict | None = None
         self.current_work: dict | None = None
+        # Owned by agentd: the orchestration progress contract belongs in the
+        # logical session history once, not at the start of every turn.
+        self.status_protocol_injected = False
 
         binary = resolve_reasonix_binary(reasonix_bin)
         env = dict(os.environ)

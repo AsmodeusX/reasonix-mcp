@@ -182,9 +182,38 @@ def task_preview(task: object, limit: int = 120) -> str:
 
 def task_with_status_protocol(task: str) -> str:
     """Add the progress contract without overriding explicit task constraints."""
-    if STATUS_PROMPT_MARKER in task:
+    if STATUS_PROMPT in task:
         return task
     return f"{task.rstrip()}\n\n{STATUS_PROMPT}"
+
+
+def transcript_has_status_protocol(session_id: str) -> bool:
+    """Whether a persisted session already received the progress contract."""
+
+    def contains(value: object) -> bool:
+        if isinstance(value, str):
+            return STATUS_PROMPT in value
+        if isinstance(value, dict):
+            return any(contains(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains(item) for item in value)
+        return False
+
+    session_dir = os.path.join(reasonix_home(), "sessions")
+    for suffix in (".jsonl", ".events.jsonl"):
+        path = os.path.join(session_dir, f"{session_id}{suffix}")
+        try:
+            with open(path, encoding="utf-8") as transcript:
+                for line in transcript:
+                    try:
+                        record = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if contains(record):
+                        return True
+        except OSError:
+            continue
+    return False
 
 
 def agent_status(agent: acp_bridge.ReasonixAgent) -> str:

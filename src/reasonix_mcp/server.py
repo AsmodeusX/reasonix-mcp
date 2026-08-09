@@ -68,6 +68,8 @@ front-end automatically and replay its MCP handshake. agentd watches its own
 runtime sources and restarts after active, keep-alive, and decision-blocked
 agents are clear and terminal output has been polled. Manual restart tools
 remain available for explicit control.
+The orchestrator status protocol is injected once per persisted child session;
+follow-up and resumed turns do not duplicate it.
 Keep orchestration state in the parent agent. Completed agents can be
 cleaned up after a configured idle grace period (disabled by default) unless
 spawned with keep_alive=true;

@@ -200,8 +200,10 @@ from `events` (they are implied by spawn and available via `transcript_path`);
 
 Every poll also includes `current_work`: the active native tool call when one
 is running, or the plan step marked `in_progress`. Agents spawned through this
-server receive a small status contract asking them to keep that plan current;
-explicit task restrictions on tools take precedence.
+server receive a small status contract asking them to keep that plan current.
+It is injected exactly once per persisted session: follow-up turns do not
+repeat it, and resume detects it in session history. Explicit task restrictions
+on tools take precedence.
 
 `turns` in poll results gives completed turns as `[{text, stop_reason}]` —
 clean turn boundaries (full_text alone concatenates turns).
@@ -382,6 +384,7 @@ revived with `reasonix_resume`.
 .venv/bin/python tests/selftest_elicitation.py    # ACP decision → MCP elicitation bridge (no model calls)
 .venv/bin/python tests/selftest_mcp_restart.py   # manual + source-change hot reload (no model calls)
 .venv/bin/python tests/selftest_auto_reload.py   # agentd source watcher + self-replace (no model calls)
+.venv/bin/python tests/selftest_prompt_injection.py # one status contract per session (no model calls)
 .venv/bin/python tests/selftest_chaos.py       # cwd allowlist + dual notify + PDEATHSIG (no model calls)
 .venv/bin/python tests/selftest_allow_write.py  # cross-cwd write via allow_write (real provider)
 ```
