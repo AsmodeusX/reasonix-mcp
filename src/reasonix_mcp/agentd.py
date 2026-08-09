@@ -12,7 +12,7 @@ Wire protocol over a Unix socket: NDJSON JSON-RPC 2.0, one frame per line.
   daemon -> server:  {"method":"agent_event","params":{...}}   (push; best-effort)
 
 Methods mirror the MCP tools (spawn/send/poll/wait/list/models/transcript/
-respond_permission/stop/resume). The daemon holds the authoritative session
+watch/respond_permission/stop/resume). The daemon holds the authoritative session
 registry; agents carry PDEATHSIG so they die with the daemon, never orphan.
 
 Started detached by server.py (or manually: `python agentd.py --sock PATH`).
@@ -51,6 +51,8 @@ class Agentd:
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_owners: dict[asyncio.StreamWriter, str] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._watch_waiters: set[asyncio.Future] = set()
+        self._active_watch_sessions: dict[str, asyncio.Task] = {}
         self._idle_cleanup_tasks: dict[str, asyncio.Task] = {}
         self._code_signature = common.agentd_code_signature()
         self._auto_restart_requested = False
@@ -69,6 +71,7 @@ class Agentd:
             def _broadcast(kind, payload, agent=agent):
                 try:
                     event = common.build_agent_event(agent, kind, payload)
+                    self._loop.call_soon_threadsafe(self._wake_watchers)
                     if kind == acp_bridge.EV_TURN_END:
                         self._loop.call_soon_threadsafe(self._schedule_idle_cleanup, agent)
                     elif kind == acp_bridge.EV_PROCESS_EXIT:
@@ -103,6 +106,14 @@ class Agentd:
         task = self._idle_cleanup_tasks.pop(session_id, None)
         if task is not None and not task.done():
             task.cancel()
+
+    def _wake_watchers(self) -> None:
+        """Wake in-flight watch calls after an actionable ACP callback."""
+        waiters = list(self._watch_waiters)
+        self._watch_waiters.clear()
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
 
     def _schedule_idle_cleanup(self, agent: acp_bridge.ReasonixAgent) -> None:
         if getattr(agent, "keep_alive", False):
@@ -214,9 +225,9 @@ class Agentd:
             "cwd": cwd,
             "sandbox": posture,
             "note": ("Agent runs detached in agentd and survives MCP server restarts. "
-                     "It will push a reasonix/agent_event notification when done "
-                     "(turn end / permission needed / exit); reasonix_wait is the "
-                     "guaranteed callback. reasonix_poll for output, "
+                     "Keep reasonix_watch in flight for completion, permission, "
+                     "and process-exit delivery. Wire notifications are diagnostic. "
+                     "Use reasonix_poll for an explicit snapshot, "
                      "reasonix_send to steer mid-turn, reasonix_resume to revive "
                      "a stopped session."),
             "keep_alive": keep_alive,
@@ -375,6 +386,102 @@ class Agentd:
             if woke or time.monotonic() >= deadline:
                 return {"woke": woke, "timed_out": not bool(woke), "sessions": states}
             await asyncio.sleep(0.2)
+
+    async def watch(self, params: dict) -> dict:
+        """Block for an actionable event and return its complete poll result.
+
+        Unlike wait, this does not wake for text chunks or plan updates and it
+        consumes the result itself, so the orchestrator needs no follow-up
+        poll. With no timeout it is a durable in-flight MCP callback.
+        """
+        session_ids = params.get("session_ids", [])
+        if not session_ids:
+            raise AgentdError("session_ids must not be empty")
+        if len(session_ids) > common.MAX_WATCH_SESSIONS:
+            raise AgentdError(f"too many sessions (max {common.MAX_WATCH_SESSIONS})")
+        timeout_raw = params.get("timeout")
+        if timeout_raw is None:
+            deadline = None
+        else:
+            try:
+                timeout = max(0.0, min(float(timeout_raw), 86400.0))
+            except (TypeError, ValueError):
+                raise AgentdError("timeout must be null or between 0 and 86400 seconds") from None
+            deadline = time.monotonic() + timeout
+        owner_id = str(params.get("owner_id") or "")
+        agents = {sid: self._get(sid, owner_id) for sid in dict.fromkeys(session_ids)}
+        watch_task = asyncio.current_task()
+        overlap = [sid for sid in agents if sid in self._active_watch_sessions]
+        if overlap:
+            raise AgentdError(
+                "sessions already have an in-flight watch; use one watch per fleet: "
+                f"{overlap}"
+            )
+        if watch_task is not None:
+            for sid in agents:
+                self._active_watch_sessions[sid] = watch_task
+        try:
+            return await self._watch_actionable(params, agents, owner_id, deadline)
+        finally:
+            for sid in agents:
+                if self._active_watch_sessions.get(sid) is watch_task:
+                    self._active_watch_sessions.pop(sid, None)
+
+    async def _watch_actionable(
+        self,
+        params: dict,
+        agents: dict[str, acp_bridge.ReasonixAgent],
+        owner_id: str,
+        deadline: float | None,
+    ) -> dict:
+        def actionable(agent: acp_bridge.ReasonixAgent) -> bool:
+            if agent._pending_permission is not None:
+                return True
+            status = common.agent_status(agent)
+            terminal = status == "exited" or (status != "running" and bool(agent.stop_reason))
+            return terminal and not bool(getattr(agent, "_terminal_observed", False))
+
+        while True:
+            woke = [sid for sid, agent in agents.items() if actionable(agent)]
+            if woke:
+                results = {
+                    sid: self.poll({
+                        "session_id": sid,
+                        "owner_id": owner_id,
+                        "include_events": params.get("include_events"),
+                        "exclude_events": params.get("exclude_events"),
+                        "include_thought": params.get("include_thought", common.DEFAULT_INCLUDE_THOUGHT),
+                        "include_full": params.get("include_full", common.DEFAULT_INCLUDE_FULL),
+                        "max_events": params.get("max_events"),
+                    })
+                    for sid in woke
+                }
+                return {"woke": woke, "timed_out": False, "results": results}
+            waiter = asyncio.get_running_loop().create_future()
+            self._watch_waiters.add(waiter)
+            # Close the check/register race: an event before registration left
+            # durable state; one after registration resolves this waiter.
+            if any(actionable(agent) for agent in agents.values()):
+                self._watch_waiters.discard(waiter)
+                waiter.cancel()
+                continue
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._watch_waiters.discard(waiter)
+                    waiter.cancel()
+                    return {"woke": [], "timed_out": True, "results": {}}
+                try:
+                    await asyncio.wait_for(waiter, timeout=remaining)
+                except asyncio.TimeoutError:
+                    return {"woke": [], "timed_out": True, "results": {}}
+                finally:
+                    self._watch_waiters.discard(waiter)
+            else:
+                try:
+                    await waiter
+                finally:
+                    self._watch_waiters.discard(waiter)
 
     def list(self, params: dict | None = None) -> dict:
         params = params or {}
@@ -577,8 +684,8 @@ class Agentd:
         method = msg.get("method", "")
         params = msg.get("params") or {}
         try:
-            if method == "wait":
-                result = await self.wait(params)
+            if method in ("wait", "watch"):
+                result = await getattr(self, method)(params)
             else:
                 handler = getattr(self, method, None)
                 if handler is None or not callable(handler):
@@ -604,6 +711,7 @@ class Agentd:
     async def client_loop(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._clients.add(writer)
         self._client_owners[writer] = ""
+        requests: set[asyncio.Task] = set()
         try:
             while True:
                 line = await reader.readline()
@@ -623,8 +731,15 @@ class Agentd:
                         })
                         continue
                     self._client_owners[writer] = owner_id
-                    asyncio.create_task(self.dispatch(msg, writer))
+                    task = asyncio.create_task(self.dispatch(msg, writer))
+                    requests.add(task)
+                    task.add_done_callback(requests.discard)
         finally:
+            pending_requests = list(requests)
+            for task in pending_requests:
+                task.cancel()
+            if pending_requests:
+                await asyncio.gather(*pending_requests, return_exceptions=True)
             self._clients.discard(writer)
             self._client_owners.pop(writer, None)
             try:

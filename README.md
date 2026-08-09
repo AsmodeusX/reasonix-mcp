@@ -12,8 +12,8 @@ Reasonix config and provider credentials.
 
 ```
 MCP host (Claude Code, Codex, …) ──(MCP stdio)──▶ launcher.py ──▶ server.py ──(Unix socket JSON-RPC)──▶ agentd ──(ACP stdio)──▶ reasonix acp ──▶ agents
-                                   │  spawn/send/poll/wait/list/…        ▲ owns the subprocesses
-                                   └─ wait + optional elicitation ───────┘
+                                   │  spawn/send/watch/poll/list/…       ▲ owns the subprocesses
+                                   └─ blocking watch + elicitation ──────┘
 ```
 
 `launcher.py` is the per-orchestrator MCP supervisor; `server.py` is a thin
@@ -34,8 +34,9 @@ shut down (killing the daemon kills its agents — they carry PDEATHSIG).
   disabled by default. Use `keep_alive=true` for interactive follow-up turns.
 - **Resume** revives a stopped/crashed session from its persisted transcript.
 - **Stop** cancels + closes + kills; the session stays listed and resumable.
-- **Wake-up**: keep `reasonix_wait` in flight; it is the primary, model-visible
-  completion and decision path. Wire notifications are diagnostics only.
+- **Wake-up**: keep `reasonix_watch` in flight. It returns complete terminal or
+  permission results directly, with no timeout and no follow-up poll by default.
+  Wire notifications are diagnostics only.
 
 ## Setup
 
@@ -75,19 +76,27 @@ your MCP client and verify the server is listed.
 | `reasonix_send(session_id, message, expect?)` | Forced steer: queue as mid-turn guidance, or start a new turn if idle. Never dropped. `expect="steer"` refuses to start a new turn. |
 | `reasonix_poll(session_id, include_events?, exclude_events?, include_thought?, include_full?, max_events?)` | New output / status / completed turns / current `plan` / pending permission request. Static boilerplate is filtered and events are a recent tail by default. |
 | `reasonix_transcript(session_id, max_tool_calls?)` | What the agent actually did: tool calls with args, files touched (write/read/bash), roles, work duration, last text — powers rebase decisions. (Reasonix does not persist token/cost usage; these are activity metrics.) |
+| `reasonix_watch(session_ids, timeout?, …poll options)` | Primary callback: block indefinitely by default until completion, permission/question, or process death, then return complete poll-shaped results. |
 | `reasonix_wait(session_ids, timeout?)` | Block until any watched session produces output, finishes a turn, or raises a permission request. |
 | `reasonix_list(include_task?)` | All live sessions: id, status, cwd, compact task preview, transcript_path. Set `include_task=true` for full prompts. |
-| `reasonix_respond_permission(session_id, option_id)` | Answer a tool-approval request (`option_id` from poll's `permission_request.options`, or `"cancel"`). |
+| `reasonix_respond_permission(session_id, option_id)` | Answer a tool-approval request (`option_id` from watch/poll's `permission_request.options`, or `"cancel"`). |
 | `reasonix_stop(session_id)` | Cancel + close + kill the agent (tombstone: poll keeps reporting `exited`). |
 | `reasonix_restart_agentd(force?)` | Explicitly reload the detached daemon. Source changes already queue a safe automatic reload; `force=true` may terminate live agents. |
 | `reasonix_restart_mcp_server()` | Explicitly restart this orchestrator's MCP server through `launcher.py`; source changes are watched automatically. |
 
 ### Completion and decision delivery
 
-Keep `reasonix_wait(session_ids, timeout)` in flight while agents work. It
-returns when a child emits output, finishes, exits, or needs a decision; call
-`reasonix_poll` for every id in `woke`. This long-poll loop is the primary MCP
-mechanism and does not depend on a host surfacing unsolicited notifications.
+Keep `reasonix_watch(session_ids)` in flight while agents work. It returns when
+a child finishes, exits, or needs a decision, with each complete poll-shaped
+result in `results[session_id]`. Its timeout is disabled by default and it does
+not wake for ordinary text chunks, so no timer loop or follow-up poll is needed.
+Use one non-overlapping watch per orchestrator fleet. If another child finishes
+while a result is being handled, its terminal state remains pending and the
+next watch returns it immediately. Overlapping watches on the same session are
+rejected to prevent duplicate permission delivery. If the MCP host or server
+restarts during a watch, reconnect, recover the owned fleet with
+`reasonix_list`, and watch it again; undelivered terminal state remains pending
+in agentd.
 
 For diagnostics, the server also emits this custom notification on the wire:
 
@@ -105,13 +114,10 @@ For diagnostics, the server also emits this custom notification on the wire:
   not injected into the model's conversation. Do not build orchestration loops
   around either `reasonix/agent_event` or `notifications/message`.
 
-> **Orchestrator loop**: the authoritative blocking wake-up is
-> `reasonix_wait(session_ids, timeout)`:
-> it wakes on any terminal state or new output and returns each session's
-> `status` **and `stop_reason`** — so an errored or interrupted agent is
-> visible immediately without a follow-up poll. Pattern: `wait` → for each
-> woke session, `poll` → act on `stop_reason` (e.g. `"error"` → stop/retry,
-> `"end_turn"` → collect result).
+> **Orchestrator loop**: `reasonix_watch(session_ids)` → handle each result →
+> answer a permission or remove a terminal id → watch the remaining ids again.
+> `reasonix_wait` remains available as a legacy output-sensitive long poll;
+> unlike watch, it requires a follow-up `reasonix_poll`.
 - Diagnostic notifications are always emitted. The daemon and MCP server log
   each emit/relay result so host-side dropping is distinguishable from a
   server-side omission.
@@ -120,7 +126,7 @@ The Reasonix `[notifications].enabled` setting controls Reasonix CLI/desktop
 system notifications; it is separate from this MCP transport.
 
 Errored turns and unexpected process exits include `error_text` in the push
-payload. `reasonix_poll` and `reasonix_wait` expose the same detail, so an
+payload. `reasonix_watch` returns the same detail directly, so an
 orchestrator can decide whether to resume or retry without inspecting the
 session JSONL by hand.
 - Verified at the wire level by `selftest_notifications.py` (raw JSON-RPC
@@ -145,7 +151,7 @@ identically:
 Clients that advertise MCP elicitation receive a standard
 `elicitation/create` form and the selected option is returned to Reasonix
 automatically. If the client declines or cancels that form, Reasonix leaves
-the ACP request pending; dismissal is not treated as rejection. Poll and
+the ACP request pending; dismissal is not treated as rejection. Watch and
 answer with `reasonix_respond_permission(session_id, "q1:1")`; the chosen label becomes
 the `ask` tool result and the agent continues. A diagnostic `agent_event` is
 also emitted. Verified live by `selftest_question.py`.
@@ -226,8 +232,8 @@ env-overridable: `REASONIX_MCP_INCLUDE_THOUGHT=1`, `REASONIX_MCP_INCLUDE_FULL=1`
 ```
 spawn 6–8 agents (note session_ids, each spawn reports its sandbox posture)
 loop:
-  reasonix_wait(all ids, timeout=30)   # one call, wakes on any output/idle/permission
-  for sid in woke: reasonix_poll(sid)  # lean; only the sid that woke
+  event = reasonix_watch(all ids)      # no timeout; full terminal/permission results
+  handle event.results                 # no follow-up poll
   reasonix_send(sid, msg, expect="steer") when a discovery invalidates a round
   drop finished ids from the watch list; reasonix_stop() the rest when done
 reasonix_list() whenever you lose track of session_ids
@@ -262,7 +268,7 @@ or `sandbox = "none"`; with `none`, `allow_write` cannot be enforced for bash
 and a warning is returned/logged. Changing config while an agent runs does not
 change that agent; inspect the spawn response for its effective posture. Under
 `tool_approval = "ask"`, gated commands raise a
-`permission_request` in poll — answer with `reasonix_respond_permission`;
+`permission_request` in watch/poll — answer with `reasonix_respond_permission`;
 approving blind is not required: the request's `tool_call` carries the tool
 name (`title`/`kind`) and `rawInput` (the JSON arguments).
 Ask mode does not pause every shell command: Reasonix requests permission only
@@ -383,6 +389,7 @@ revived with `reasonix_resume`.
 .venv/bin/python tests/selftest_orchestrator.py # list/wait/filtering/posture (no model calls)
 .venv/bin/python tests/selftest_notifications.py # diagnostic event frames (no model calls)
 .venv/bin/python tests/selftest_elicitation.py    # ACP decision → MCP elicitation bridge (no model calls)
+.venv/bin/python tests/selftest_watch.py          # watch overlap/cancellation safety (no model calls)
 .venv/bin/python tests/selftest_mcp_restart.py   # manual + source-change hot reload (no model calls)
 .venv/bin/python tests/selftest_auto_reload.py   # agentd source watcher + self-replace (no model calls)
 .venv/bin/python tests/selftest_prompt_injection.py # one status contract per session (no model calls)

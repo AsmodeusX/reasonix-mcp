@@ -187,9 +187,12 @@ class ReasonixAgent:
         self._full_thought_snap_len = 0
         self.on_event = on_event
         # Orchestrator support: event_seq increments on every queued event (lets
-        # reasonix_wait detect "something new" without consuming); turns tracks
+        # reasonix_wait/watch detect "something new" without consuming); turns tracks
         # completed turns with their full text + stop_reason (turn boundaries).
         self.event_seq = 0
+        # Set by agentd after a terminal result has been delivered through
+        # poll/watch. A later turn or process exit makes it actionable again.
+        self._terminal_observed = False
         self.turns: list[dict] = []
         self._turns_served = 0
         self._current_parts: list[str] = []
@@ -457,10 +460,12 @@ class ReasonixAgent:
                 self.turns.append(turn)
                 self._current_parts = []
                 self.stop_reason = payload.get("stopReason") or self.stop_reason
+                self._terminal_observed = False
                 self.current_work = None
                 if payload.get("transcriptPath"):
                     self.transcript_path = payload["transcriptPath"]
             elif kind == EV_PROCESS_EXIT:
+                self._terminal_observed = False
                 if payload.get("error") is not None:
                     self.last_error = payload["error"]
                 if payload.get("error_text"):
@@ -567,6 +572,7 @@ class ReasonixAgent:
         self._turn_rid = rid  # set before writing so the reader never races
         self.active_turn = True
         self.stop_reason = None
+        self._terminal_observed = False
         # The turn's response resolves when the turn ends; the reader routes it
         # to the event stream as EV_TURN_END so poll() sees the stop reason.
         self._write({"jsonrpc": "2.0", "id": rid, "method": "session/prompt", "params": {

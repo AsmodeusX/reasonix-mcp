@@ -3,7 +3,8 @@
 
 Exercises the orchestration surface added for the integration feedback:
 poll event filtering (static boilerplate dropped), events_filtered,
-reasonix_list, reasonix_wait (wake on turn end / exited), spawn sandbox
+reasonix_list, reasonix_watch (full no-poll result), reasonix_wait (legacy
+wake on turn end / exited), spawn sandbox
 posture, turns with stop_reason, and send expect="steer" semantics.
 """
 
@@ -92,6 +93,22 @@ async def main() -> None:
                 assert sid1 in by_id and sid2 in by_id
                 assert by_id[sid1]["task"] == "One." and by_id[sid1]["status"] in ("running", "idle"), by_id[sid1]
                 print("reasonix_list OK:", [(s["session_id"][:8], s["status"], s["task"]) for s in lst["sessions"]])
+
+                # watch is the no-poll callback: it blocks for an actionable
+                # event and returns the complete result in the same tool call.
+                watched = await call(session, "reasonix_watch", {
+                    "session_ids": [sid2], "timeout": 60,
+                })
+                assert watched["woke"] == [sid2] and not watched["timed_out"], watched
+                watched_result = watched["results"][sid2]
+                assert watched_result["status"] in ("idle", "exited"), watched_result
+                assert watched_result["stop_reason"] == "error", watched_result
+                print("reasonix_watch returned terminal result without poll")
+                repeated = await call(session, "reasonix_watch", {
+                    "session_ids": [sid2], "timeout": 0,
+                })
+                assert repeated["timed_out"] and repeated["woke"] == [], repeated
+                print("reasonix_watch delivers each terminal turn once")
 
                 # first poll: static boilerplate must be filtered out; if the
                 # 401 turn already ended, turns carries it (consumed here);

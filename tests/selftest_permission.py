@@ -3,9 +3,9 @@
 integration feedback could not exercise.
 
 Spawns an agent with tool_approval="ask", asks it to run a bash command, and
-verifies the session/request_permission round-trip: poll surfaces the
-request (with tool name + args), respond_permission approves it, the agent
-completes and its output contains the command's result.
+verifies the session/request_permission round-trip: one blocking watch
+surfaces the request (with tool name + args), respond_permission approves it,
+and a second watch returns completion and the command's result. No polling.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import shutil
 from util import shutdown_agentd
 import sys
 import tempfile
-import time
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -62,17 +61,13 @@ async def main() -> None:
                 sid = r["session_id"]
                 print("spawned (ask mode):", sid)
 
-                deadline = time.monotonic() + 180
-                req = None
-                while time.monotonic() < deadline:
-                    d = await call(session, "reasonix_poll", {"session_id": sid})
-                    if d.get("permission_request"):
-                        req = d["permission_request"]
-                        break
-                    if d["status"] in ("idle", "exited"):
-                        break
-                    await asyncio.sleep(1)
-                assert req, f"no permission request surfaced; last status={d.get('status')} text={d.get('full_text','')[-200:]!r}"
+                watched = await call(session, "reasonix_watch", {
+                    "session_ids": [sid], "timeout": 180,
+                })
+                assert not watched["timed_out"] and watched["woke"] == [sid], watched
+                decision = watched["results"][sid]
+                req = decision.get("permission_request")
+                assert req, f"watch returned without a permission request: {decision}"
                 tc = req["tool_call"]
                 print("permission_request tool_call:", {k: tc.get(k) for k in ("title", "kind", "status", "toolCallId")}, "| rawInput:", str(tc.get("rawInput"))[:120])
                 # For gated bash the command/args live in `title` (rawInput is
@@ -84,21 +79,18 @@ async def main() -> None:
                 r = await call(session, "reasonix_respond_permission", {"session_id": sid, "option_id": "allow_once"})
                 print("responded:", r)
 
-                deadline = time.monotonic() + 180
-                final = None
-                while time.monotonic() < deadline:
-                    d = await call(session, "reasonix_poll", {"session_id": sid})
-                    if d["status"] in ("idle", "exited"):
-                        final = d
-                        break
-                    await asyncio.sleep(1)
-                assert final, "agent never finished after permission"
+                watched = await call(session, "reasonix_watch", {
+                    "session_ids": [sid], "timeout": 180, "include_full": True,
+                })
+                assert not watched["timed_out"] and watched["woke"] == [sid], watched
+                final = watched["results"][sid]
+                assert final["status"] in ("idle", "exited"), final
                 print("stop_reason:", final.get("stop_reason"), "| text:", final.get("full_text", "")[-200:])
                 wrote = os.path.isfile(PROBE) and open(PROBE).read() == "PERMISSION_OK"
                 print("probe file written after approval:", wrote)
                 assert wrote, "approved bash command did not produce the file"
                 await call(session, "reasonix_stop", {"session_id": sid})
-        print("PERMISSION SELFTEST PASS")
+        print("PERMISSION WATCH SELFTEST PASS")
     finally:
         shutdown_agentd(os.path.join(SCRATCH_HOME, "agentd.sock"))
         shutil.rmtree(SCRATCH_HOME, ignore_errors=True)

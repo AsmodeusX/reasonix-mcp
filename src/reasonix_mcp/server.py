@@ -12,7 +12,7 @@ the fleet running; reasonix_resume revives sessions whose process died.
 
 Tools:
   reasonix_spawn / reasonix_resume / reasonix_send / reasonix_poll
-  reasonix_wait / reasonix_list / reasonix_models / reasonix_transcript
+  reasonix_watch / reasonix_wait / reasonix_list / reasonix_models / reasonix_transcript
   reasonix_respond_permission / reasonix_stop / reasonix_restart_agentd /
   reasonix_restart_mcp_server
 """
@@ -35,25 +35,28 @@ MCP_INSTRUCTIONS = """Reasonix is an agent-orchestration MCP server backed by a
 detached agent daemon. Use reasonix_spawn once per child task and retain each
 session_id. Agents keep running even if this MCP server (or the MCP host —
 Claude Code, Codex, …) restarts — reasonix_list shows the fleet, reasonix_resume revives a session
-whose process died. For multiple children call reasonix_wait with all ids, then
-reasonix_poll only for the ids in `woke`; poll is the authoritative way to
-collect text, events, completion, and permission requests. If a poll contains
+whose process died. For multiple children keep one reasonix_watch call in
+flight with all ids; it returns complete results for completion, permission,
+or process death without a follow-up poll. Use one non-overlapping watch per
+orchestrator fleet; remove terminal ids and watch the remaining ids again. If
+a result contains
 permission_request, inspect the tool_call and answer with
-reasonix_respond_permission before waiting again. tool_approval=ask gates only
+reasonix_respond_permission before watching again. tool_approval=ask gates only
 commands Reasonix classifies as
 permission-requiring; it does not pause every shell command. Explicit agent
 questions always require a response. Use reasonix_send with
 expect=steer to redirect an active turn, expect=new_turn to start work only
 when idle. reasonix_transcript summarizes what an agent actually did (tool
-calls, files touched) for rebasing decisions. reasonix_wait is the primary
-wake-up mechanism: keep it in flight while children run, then poll every id in
-`woke`. Custom reasonix/agent_event notifications are diagnostic decoration;
+calls, files touched) for rebasing decisions. reasonix_watch is the primary
+model-visible wake-up mechanism. Custom reasonix/agent_event notifications are
+diagnostic decoration;
 clients may silently drop unknown notifications, and MCP notifications are not
 injected into an orchestrator model's conversation. Clients that advertise MCP
 elicitation receive a standard elicitation/create request for permission gates
 and agent questions; the selected option is returned to the child
-automatically. Poll remains authoritative when elicitation is unavailable,
-declined, or canceled.
+automatically. Watch remains authoritative when elicitation is unavailable,
+declined, or canceled. reasonix_poll is for explicit snapshots and
+reasonix_wait is the legacy output-sensitive long poll.
 Terminal errors include error_text; poll exposes plan and current_work. The
 daemon and MCP server log event emission/relay results to stderr.
 Lifecycle controls:
@@ -162,7 +165,7 @@ async def _read_agentd(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             _agentd_writer = None
 
 
-async def _rpc(method: str, params: dict, timeout: float = _rpc_default_timeout) -> dict:
+async def _rpc(method: str, params: dict, timeout: float | None = _rpc_default_timeout) -> dict:
     params = dict(params)
     params.setdefault("owner_id", _owner_id)
     await _ensure_agentd()
@@ -301,7 +304,7 @@ async def _elicit_agent_decision(event: dict) -> None:
             # Clients may advertise elicitation yet dismiss unsupported or
             # non-interactive requests automatically. Declining the form is
             # not the same as selecting the child request's reject option.
-            # Preserve ACP so reasonix_wait/poll + respond still work.
+            # Preserve ACP so reasonix_watch/poll + respond still work.
             print(
                 f"reasonix-mcp elicitation {action}; poll fallback retained: "
                 f"session={event.get('session_id')}",
@@ -489,6 +492,37 @@ async def reasonix_wait(
 
 
 @mcp.tool()
+async def reasonix_watch(
+    session_ids: list[str],
+    timeout: float | None = None,
+    include_events: list[str] | None = None,
+    exclude_events: list[str] | None = None,
+    include_thought: bool = common.DEFAULT_INCLUDE_THOUGHT,
+    include_full: bool = common.DEFAULT_INCLUDE_FULL,
+    max_events: int | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Wait for completion, permission/question, or process death and return
+    complete poll-shaped results for every woken agent. No follow-up poll is
+    needed. The default timeout is disabled: keep one call in flight as the
+    reliable model-visible callback. Wire notifications are diagnostic only.
+    """
+    _capture_relay_ctx(ctx)
+    for session_id in session_ids:
+        _require_owned(session_id)
+    rpc_timeout = None if timeout is None else max(0.0, float(timeout)) + 60.0
+    return await _rpc("watch", {
+        "session_ids": session_ids,
+        "timeout": timeout,
+        "include_events": include_events,
+        "exclude_events": exclude_events,
+        "include_thought": include_thought,
+        "include_full": include_full,
+        "max_events": max_events,
+    }, timeout=rpc_timeout)
+
+
+@mcp.tool()
 async def reasonix_list(include_task: bool = False, ctx: Context | None = None) -> dict:
     """List sessions with a compact task preview by default.
 
@@ -529,7 +563,7 @@ async def reasonix_respond_permission(
     session_id: str, option_id: str, ctx: Context | None = None
 ) -> dict:
     """Answer the agent's pending tool-approval or question request. option_id
-    is one of poll's permission_request.options[].optionId, or "cancel"."""
+    is one of watch/poll's permission_request.options[].optionId, or "cancel"."""
     _capture_relay_ctx(ctx)
     _require_owned(session_id)
     return await _rpc("respond_permission", {"session_id": session_id, "option_id": option_id})

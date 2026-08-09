@@ -7,7 +7,7 @@ survive MCP-server death. Flow:
   2. server B (same socket) reconnects: reasonix_list shows the agent,
      poll returns its output (queued in the daemon), send steers it.
   3. reasonix_resume revives a stopped (tombstoned) session.
-  4. 6 agents in parallel: reasonix_wait wakes on all, poll collects, stop all.
+  4. 6 agents in parallel: reasonix_watch returns full terminal results, no polls.
 """
 import json
 import os
@@ -166,14 +166,20 @@ def main() -> None:
             r = b.tool("reasonix_spawn", {"task": f"Reply with exactly: C{i}. Do not use tools."})
             ids.append(r["session_id"])
         print("spawned 6 agents:", [i[:8] for i in ids])
-        w = b.tool("reasonix_wait", {"session_ids": ids, "timeout": 240})
-        assert not w["timed_out"], w
-        print("wait woke:", len(w["woke"]), "of 6")
-        got = []
-        for sid in ids:
-            d = b.wait_idle(sid, timeout=120)
-            text = "".join(t.get("text", "") for t in d.get("turns", []))
-            got.append(text[:20])
+        remaining = set(ids)
+        results = {}
+        while remaining:
+            w = b.tool("reasonix_watch", {
+                "session_ids": list(remaining), "timeout": 240,
+            })
+            assert not w["timed_out"] and w["woke"], w
+            results.update(w["results"])
+            remaining.difference_update(w["woke"])
+        got = [
+            "".join(t.get("text", "") for t in results[sid].get("turns", []))[:20]
+            for sid in ids
+        ]
+        print("watch collected:", len(results), "of 6 without polling")
         print("agents replied:", got)
         assert all("C" in t for t in got), got
         for sid in ids:
