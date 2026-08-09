@@ -10,12 +10,13 @@ Reasonix config and provider credentials.
 ## How it works
 
 ```
-MCP host (Claude Code, Codex, …) ──(MCP stdio)──▶ server.py ──(Unix socket JSON-RPC)──▶ agentd ──(ACP stdio)──▶ reasonix acp ──▶ agents
+MCP host (Claude Code, Codex, …) ──(MCP stdio)──▶ launcher.py ──▶ server.py ──(Unix socket JSON-RPC)──▶ agentd ──(ACP stdio)──▶ reasonix acp ──▶ agents
                                    │  spawn/send/poll/wait/list/…        ▲ owns the subprocesses
                                    └─ relays agent_event pushes ─────────┘
 ```
 
-`server.py` is a thin MCP front-end; **`agentd.py` is a detached daemon that
+`launcher.py` is the per-orchestrator MCP supervisor; `server.py` is a thin
+MCP front-end; **`agentd.py` is a detached daemon that
 owns the agents**. This split is what makes agents survive: close the MCP host
 (or kill the MCP server) and the fleet keeps running in the daemon — a new
 server reconnects to the same socket and `reasonix_list` shows everything
@@ -56,7 +57,7 @@ User scope (available in every project) — example with Claude Code:
 ```sh
 claude mcp add reasonix --scope user -- \
   /home/asmodeus/reasonix-mcp/.venv/bin/python \
-  /home/asmodeus/reasonix-mcp/src/reasonix_mcp/server.py
+  /home/asmodeus/reasonix-mcp/src/reasonix_mcp/launcher.py
 ```
 
 Other MCP hosts (Codex, etc.) register stdio servers through their own
@@ -78,6 +79,7 @@ your MCP client and verify the server is listed.
 | `reasonix_respond_permission(session_id, option_id)` | Answer a tool-approval request (`option_id` from poll's `permission_request.options`, or `"cancel"`). |
 | `reasonix_stop(session_id)` | Cancel + close + kill the agent (tombstone: poll keeps reporting `exited`). |
 | `reasonix_restart_agentd(force?)` | Reload the detached daemon from updated code. Refuses while live agents exist unless `force=true`; the next tool call starts the fresh daemon. |
+| `reasonix_restart_mcp_server()` | Restart this orchestrator's MCP server through `launcher.py`; the shared daemon and all agent sessions remain running. |
 
 ### Agent-done callbacks (push)
 
@@ -258,6 +260,15 @@ transcripts can be resumed after the fresh daemon starts. The next tool call
 automatically starts the new daemon, so no shell command or socket cleanup is
 needed. The daemon is shared by MCP clients, so a restart disconnects other
 clients too; they reconnect automatically on their next tool call.
+
+### Restarting the MCP server
+
+Call `reasonix_restart_mcp_server()` from the orchestrator CLI after updating
+the MCP server code. `launcher.py` receives the restart request, starts a fresh
+stdio server, and leaves the shared `agentd` plus all agent sessions untouched.
+Only that orchestrator's MCP connection is restarted; other orchestrators keep
+running. MCP registrations that still point directly to `server.py` should be
+changed to `launcher.py` once so the in-band restart can be supervised.
 
 ### Orchestrator isolation
 

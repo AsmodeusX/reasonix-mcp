@@ -13,6 +13,7 @@ import socket
 # Project layout: tests/ -> root -> src/reasonix_mcp
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SERVER = os.path.join(ROOT, "src", "reasonix_mcp", "server.py")
+LAUNCHER = os.path.join(ROOT, "src", "reasonix_mcp", "launcher.py")
 PY = os.path.join(ROOT, ".venv", "bin", "python")
 
 

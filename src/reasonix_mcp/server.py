@@ -13,7 +13,8 @@ the fleet running; reasonix_resume revives sessions whose process died.
 Tools:
   reasonix_spawn / reasonix_resume / reasonix_send / reasonix_poll
   reasonix_wait / reasonix_list / reasonix_models / reasonix_transcript
-  reasonix_respond_permission / reasonix_stop / reasonix_restart_agentd
+  reasonix_respond_permission / reasonix_stop / reasonix_restart_agentd /
+  reasonix_restart_mcp_server
 """
 
 from __future__ import annotations
@@ -50,6 +51,8 @@ server; it reloads the daemon once no live agents remain. Keep
 orchestration state in the parent agent. Completed agents can be cleaned up
 after a configured idle grace period (disabled by default) unless spawned with
 keep_alive=true;
+use reasonix_restart_mcp_server after updating this MCP server; it replaces
+only this orchestrator's stdio server through launcher.py and preserves agentd;
 session ownership is scoped to this orchestrator, so never expect to see
 another MCP client's sessions;
 do not claim a child is complete
@@ -60,6 +63,7 @@ mcp = MCPServer("reasonix", instructions=MCP_INSTRUCTIONS)
 NOTIFY_ENABLED = os.environ.get("REASONIX_MCP_NOTIFY", "1").strip().lower() not in ("0", "false", "no", "off")
 AGENT_EVENT_METHOD = "reasonix/agent_event"
 AGENTD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agentd.py")
+MCP_RESTART_EXIT_CODE = 75
 
 _agentd_reader: asyncio.StreamReader | None = None
 _agentd_writer: asyncio.StreamWriter | None = None
@@ -461,6 +465,33 @@ async def reasonix_restart_agentd(force: bool = False, ctx: Context | None = Non
         except Exception:
             pass
     return result
+
+
+@mcp.tool()
+async def reasonix_restart_mcp_server() -> dict:
+    """Restart this MCP server through its per-orchestrator launcher.
+
+    The launcher starts a fresh server after this response is delivered. The
+    detached agentd and all agent sessions remain running. This tool requires
+    the configured MCP command to use ``launcher.py``; a direct server.py
+    command will simply disconnect after returning the response.
+    """
+    asyncio.create_task(_exit_after_mcp_restart())
+    return {
+        "restart_requested": True,
+        "preserves_agents": True,
+        "note": (
+            "this MCP server will restart through launcher.py; agentd and its "
+            "sessions are preserved"
+        ),
+    }
+
+
+async def _exit_after_mcp_restart() -> None:
+    # Let the MCP framework flush the tool result before replacing this
+    # process. The launcher catches this private code and starts server.py.
+    await asyncio.sleep(0.25)
+    os._exit(MCP_RESTART_EXIT_CODE)
 
 
 def main() -> None:
