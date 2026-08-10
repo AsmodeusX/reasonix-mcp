@@ -62,6 +62,12 @@ reasonix_wait is the legacy output-sensitive long poll.
 Omit watch timeout for normal orchestration; its default is indefinite. Never
 copy explicit test safety timeouts (such as 240 seconds) into production watch
 calls unless the user specifically requests a bounded wait.
+A client-side `timed out awaiting tools/call` is the MCP host's transport
+limit, not an agent or daemon failure. Never restart MCP or agentd for that
+error: reissue one watch for the complete remaining fleet. Codex installations
+should set `mcp_servers.reasonix.tool_timeout_sec` above the longest expected
+agent run (86400 is recommended) so the host does not cut off an indefinite
+watch.
 Set watch detail=true, poll, or read the transcript only when deeper output is
 needed. Terminal errors include error_text; watch exposes plan and current_work. The
 daemon and MCP server log event emission/relay results to stderr.

@@ -62,9 +62,27 @@ claude mcp add reasonix --scope user -- \
   /home/asmodeus/reasonix-mcp/src/reasonix_mcp/launcher.py
 ```
 
-Other MCP hosts (Codex, etc.) register stdio servers through their own
-`mcp add` equivalents — same command + args, different client. Then restart
-your MCP client and verify the server is listed.
+For Codex, register the same launcher and raise the per-tool transport timeout
+because `reasonix_watch` is intentionally long-lived:
+
+```toml
+[mcp_servers.reasonix]
+command = "/home/asmodeus/reasonix-mcp/.venv/bin/python"
+args = ["/home/asmodeus/reasonix-mcp/src/reasonix_mcp/launcher.py"]
+tool_timeout_sec = 86400
+```
+
+Codex defaults to a finite per-tool timeout (and existing installations may
+use a shorter explicit value such as 300 seconds). A
+`timed out awaiting tools/call` error at that exact interval is the Codex
+transport ending the call, not Reasonix timing out or an agent failing. Reload
+Codex after changing `config.toml`; restarting only the Reasonix MCP server
+does not reload the host's timeout setting. Never restart MCP or agentd for a
+host-side tool timeout—reissue one watch for the complete remaining fleet.
+
+Other MCP hosts register the stdio server through their own `mcp add`
+equivalents—same command and arguments, different client. Then restart the MCP
+client and verify the server is listed.
 
 ## Tools
 
