@@ -8,6 +8,7 @@ reconnects and sees them via reasonix_list.
 
 Wire protocol over a Unix socket: NDJSON JSON-RPC 2.0, one frame per line.
   server -> daemon:  {"jsonrpc":"2.0","id":N,"method":"spawn","params":{...}}
+  server -> daemon:  {"jsonrpc":"2.0","method":"cancel_request","params":{"request_id":N}}
   daemon -> server:  {"jsonrpc":"2.0","id":N,"result":{...}}  (or "error")
   daemon -> server:  {"method":"agent_event","params":{...}}   (push; best-effort)
 
@@ -411,12 +412,21 @@ class Agentd:
         owner_id = str(params.get("owner_id") or "")
         agents = {sid: self._get(sid, owner_id) for sid in dict.fromkeys(session_ids)}
         watch_task = asyncio.current_task()
-        overlap = [sid for sid in agents if sid in self._active_watch_sessions]
-        if overlap:
-            raise AgentdError(
-                "sessions already have an in-flight watch; use one watch per fleet: "
-                f"{overlap}"
-            )
+        # MCP hosts may cancel a tool call without closing their stdio server.
+        # A newer watch is therefore authoritative and replaces any older
+        # overlapping call instead of requiring an MCP/agentd restart. Loop
+        # because two replacements can race while canceled tasks unwind.
+        while True:
+            overlap_tasks = {
+                task for sid in agents
+                if (task := self._active_watch_sessions.get(sid)) is not None
+                and task is not watch_task
+            }
+            if not overlap_tasks:
+                break
+            for task in overlap_tasks:
+                task.cancel("superseded by a newer watch")
+            await asyncio.gather(*overlap_tasks, return_exceptions=True)
         if watch_task is not None:
             for sid in agents:
                 self._active_watch_sessions[sid] = watch_task
@@ -606,6 +616,7 @@ class Agentd:
             "sessions": sessions,
             "owners": owners,
             "owner_scoping": True,
+            "cancel_request": True,
             "code_signature": self._code_signature,
             "code_update_available": common.agentd_code_signature() != self._code_signature,
         }
@@ -734,6 +745,19 @@ class Agentd:
                 if asyncio.iscoroutine(result):
                     result = await result
             self._send(writer, {"jsonrpc": "2.0", "id": msg.get("id"), "result": result})
+        except asyncio.CancelledError as e:
+            if e.args and e.args[0] == "superseded by a newer watch" and method == "watch":
+                self._send(writer, {
+                    "jsonrpc": "2.0", "id": msg.get("id"),
+                    "result": {
+                        "woke": [], "timed_out": False, "superseded": True, "results": {},
+                    },
+                })
+            else:
+                self._send(writer, {
+                    "jsonrpc": "2.0", "id": msg.get("id"),
+                    "error": {"code": -32800, "message": "request cancelled"},
+                })
         except AgentdError as e:
             self._send(writer, {"jsonrpc": "2.0", "id": msg.get("id"), "error": {"code": e.code, "message": str(e)}})
         except acp_bridge.ACPError as e:
@@ -751,7 +775,7 @@ class Agentd:
     async def client_loop(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._clients.add(writer)
         self._client_owners[writer] = ""
-        requests: set[asyncio.Task] = set()
+        requests: dict[object, asyncio.Task] = {}
         try:
             while True:
                 line = await reader.readline()
@@ -760,6 +784,15 @@ class Agentd:
                 try:
                     msg = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if msg.get("method") == "cancel_request" and "id" not in msg:
+                    params = msg.get("params") or {}
+                    owner_id = str(params.get("owner_id") or "")
+                    known_owner = self._client_owners.get(writer, "")
+                    if not known_owner or owner_id == known_owner:
+                        task = requests.get(params.get("request_id"))
+                        if task is not None and not task.done():
+                            task.cancel("client cancelled request")
                     continue
                 if msg.get("method") and "id" in msg:
                     owner_id = str((msg.get("params") or {}).get("owner_id") or "")
@@ -771,11 +804,23 @@ class Agentd:
                         })
                         continue
                     self._client_owners[writer] = owner_id
+                    request_id = msg.get("id")
+                    if request_id in requests:
+                        self._send(writer, {
+                            "jsonrpc": "2.0", "id": request_id,
+                            "error": {"code": -32600, "message": "duplicate in-flight request id"},
+                        })
+                        continue
                     task = asyncio.create_task(self.dispatch(msg, writer))
-                    requests.add(task)
-                    task.add_done_callback(requests.discard)
+                    requests[request_id] = task
+
+                    def discard(done: asyncio.Task, rid: object = request_id) -> None:
+                        if requests.get(rid) is done:
+                            requests.pop(rid, None)
+
+                    task.add_done_callback(discard)
         finally:
-            pending_requests = list(requests)
+            pending_requests = list(requests.values())
             for task in pending_requests:
                 task.cancel()
             if pending_requests:

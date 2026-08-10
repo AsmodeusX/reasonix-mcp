@@ -94,13 +94,15 @@ and transcript path. Its timeout is disabled by default and it does
 not wake for ordinary text chunks, so no timer loop or follow-up poll is needed.
 Omit `timeout` for normal orchestration. Values such as `timeout=240` in the
 self-tests are test-runner safety guards, not production defaults.
-Use one non-overlapping watch per orchestrator fleet. If another child finishes
+Use one watch per orchestrator fleet. If another child finishes
 while a result is being handled, its terminal state remains pending and the
-next watch returns it immediately. Overlapping watches on the same session are
-rejected to prevent duplicate permission delivery. If the MCP host or server
-restarts during a watch, reconnect, recover the owned fleet with
-`reasonix_list`, and watch it again; undelivered terminal state remains pending
-in agentd.
+next watch returns it immediately. A newer overlapping watch supersedes the
+older call safely; a stale canceled watch never requires an MCP-server restart.
+The displaced call returns `superseded=true`, and the newest call owns the
+fleet. Always include the complete remaining fleet when replacing a watch. If
+the MCP host or server restarts during a watch, reconnect, recover the owned
+fleet with `reasonix_list`, and watch it again; undelivered terminal state
+remains pending in agentd.
 
 Compact watch consumes queued events so long-running sessions stay bounded.
 Use `reasonix_watch(..., detail=true)` when raw event/turn detail is wanted

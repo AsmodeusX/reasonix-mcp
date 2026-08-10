@@ -37,8 +37,10 @@ session_id. Agents keep running even if this MCP server (or the MCP host —
 Claude Code, Codex, …) restarts — reasonix_list shows the fleet, reasonix_resume revives a session
 whose process died. For multiple children keep one reasonix_watch call in
 flight with all ids; it returns compact results for completion, permission,
-or process death without a follow-up poll. Use one non-overlapping watch per
-orchestrator fleet; remove terminal ids and watch the remaining ids again. If
+or process death without a follow-up poll. Keep one watch per orchestrator
+fleet; a newer overlapping watch safely supersedes an older abandoned call, so
+an MCP restart is never required to clear stale watches. Remove terminal ids
+and watch the remaining ids again. If
 a result contains
 permission_request, inspect the tool_call and answer with
 reasonix_respond_permission before watching again. tool_approval=ask gates only
@@ -94,6 +96,7 @@ MCP_RESTART_EXIT_CODE = 75
 
 _agentd_reader: asyncio.StreamReader | None = None
 _agentd_writer: asyncio.StreamWriter | None = None
+_agentd_cancel_supported = False
 _pending: dict[int, asyncio.Future] = {}
 _next_id = itertools.count(1)
 _mcp_session = None  # captured on first tool call, used to relay daemon pushes
@@ -118,7 +121,7 @@ async def _start_agentd(sock: str) -> None:
 
 
 async def _ensure_agentd() -> None:
-    global _agentd_reader, _agentd_writer
+    global _agentd_reader, _agentd_writer, _agentd_cancel_supported
     if _agentd_writer is not None and not _agentd_writer.is_closing():
         return
     sock = common.agentd_sock_path()
@@ -136,10 +139,17 @@ async def _ensure_agentd() -> None:
             raise RuntimeError(f"agentd did not start on {sock} — see agentd.log")
     _agentd_reader, _agentd_writer = reader, writer
     asyncio.create_task(_read_agentd(reader, writer))
+    # Detect daemons from before request cancellation existed. During a rolling
+    # source update they may remain alive to preserve running agents.
+    try:
+        state = await _rpc("ping", {}, timeout=5.0)
+        _agentd_cancel_supported = bool(state.get("cancel_request"))
+    except Exception:
+        _agentd_cancel_supported = False
 
 
 async def _read_agentd(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    global _agentd_reader, _agentd_writer
+    global _agentd_reader, _agentd_writer, _agentd_cancel_supported
     try:
         while True:
             line = await reader.readline()
@@ -167,6 +177,7 @@ async def _read_agentd(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             _agentd_reader = None
         if _agentd_writer is writer:
             _agentd_writer = None
+            _agentd_cancel_supported = False
 
 
 async def _rpc(method: str, params: dict, timeout: float | None = _rpc_default_timeout) -> dict:
@@ -176,22 +187,61 @@ async def _rpc(method: str, params: dict, timeout: float | None = _rpc_default_t
     rid = next(_next_id)
     fut = asyncio.get_running_loop().create_future()
     _pending[rid] = fut
+    writer = _agentd_writer
     frame = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}) + "\n"
     try:
-        _agentd_writer.write(frame.encode())
-        await _agentd_writer.drain()
+        writer.write(frame.encode())
+        await writer.drain()
+    except asyncio.CancelledError:
+        _pending.pop(rid, None)
+        _cancel_agentd_request(writer, rid)
+        raise
     except Exception as e:
         _pending.pop(rid, None)
         raise RuntimeError(f"agentd connection failed: {e}") from e
     try:
         msg = await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.CancelledError:
+        _pending.pop(rid, None)
+        _cancel_agentd_request(writer, rid)
+        raise
     except asyncio.TimeoutError:
         _pending.pop(rid, None)
+        _cancel_agentd_request(writer, rid)
         raise RuntimeError(f"agentd timed out on {method} after {timeout}s") from None
     if msg.get("error"):
         err = msg["error"]
         raise ValueError(err.get("message", "agentd error"))
     return msg.get("result", {})
+
+
+def _cancel_agentd_request(writer: asyncio.StreamWriter, request_id: int) -> None:
+    """Best-effort cancellation for an RPC the MCP client stopped awaiting.
+
+    The write is deliberately synchronous: cancellation cleanup must not add a
+    second await point where the task can be canceled again before agentd sees
+    the notification. A live transport flushes the buffered frame; a closed
+    transport makes agentd's client loop cancel all requests for the socket.
+    """
+    if writer is None or writer.is_closing():
+        return
+    frame = json.dumps({
+        "jsonrpc": "2.0",
+        "method": "cancel_request",
+        "params": {"request_id": request_id, "owner_id": _owner_id},
+    }) + "\n"
+    try:
+        writer.write(frame.encode())
+    except Exception:
+        pass
+    if not _agentd_cancel_supported:
+        # Rolling-upgrade fallback: an older daemon ignores cancel_request.
+        # Closing only this orchestrator's daemon connection makes its existing
+        # client-loop cleanup cancel stale calls while all agents keep running.
+        try:
+            writer.close()
+        except Exception:
+            pass
 
 
 async def _relay_agent_event(event: dict) -> None:
@@ -512,6 +562,8 @@ async def reasonix_watch(
     thought, duplicate turn text, and full history; set detail=true for the
     poll-shaped result. Omit timeout for normal orchestration: the default is
     indefinite. Explicit timeouts are only for deliberately bounded waits.
+    Keep one call for the complete remaining fleet. A newer overlapping call
+    safely supersedes an older abandoned watch; no server restart is needed.
     Wire notifications are diagnostic only.
     """
     _capture_relay_ctx(ctx)
