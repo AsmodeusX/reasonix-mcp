@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import threading
 import time
 import tomllib
 
@@ -193,6 +194,52 @@ def save_owner_sessions(owner_id: str, session_ids: set[str]) -> None:
 
 def session_owner_path(session_id: str) -> str:
     return os.path.join(reasonix_home(), "sessions", f"{session_id}.owner.json")
+
+
+def session_config_path(session_id: str) -> str:
+    return os.path.join(
+        reasonix_home(), "sessions", f"{session_id}.orchestrator-config.json"
+    )
+
+
+def read_session_config(session_id: str) -> dict[str, str]:
+    try:
+        with open(session_config_path(session_id), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return {}
+    return {
+        key: str(data[key])
+        for key in ("model", "effort", "work_mode", "tool_approval")
+        if data.get(key)
+    }
+
+
+def write_session_config(
+    session_id: str,
+    updates: dict[str, str],
+    *,
+    replace: bool = False,
+) -> dict[str, str]:
+    current = {} if replace else read_session_config(session_id)
+    for key in ("model", "effort", "work_mode", "tool_approval"):
+        if key not in updates:
+            continue
+        value = updates[key]
+        if value:
+            current[key] = str(value)
+        else:
+            current.pop(key, None)
+    path = session_config_path(session_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Configuration can be written by concurrent MCP requests and by the
+    # background post-turn apply task. A process-only suffix lets those
+    # writers trample the same temporary file before os.replace().
+    tmp = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(current, fh, sort_keys=True)
+    os.replace(tmp, path)
+    return current
 
 
 def write_session_owner(session_id: str, owner_id: str) -> None:
@@ -661,6 +708,9 @@ def shape_poll(
         "events_filtered": filtered,
         "permission_request": permission,
         "transcript_path": getattr(agent, "transcript_path", None),
+        "config": dict(getattr(agent, "config_values", {}) or {}),
+        "pending_config": dict(getattr(agent, "pending_config", {}) or {}),
+        "pending_config_error": getattr(agent, "pending_config_error", None),
     }
     if include_thought:
         thought, thought_truncated = _cap("".join(thought_parts), MAX_DELTA_TEXT)

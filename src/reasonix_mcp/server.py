@@ -14,7 +14,7 @@ Tools:
   reasonix_spawn / reasonix_resume / reasonix_send / reasonix_poll
   reasonix_watch / reasonix_wait / reasonix_list / reasonix_models / reasonix_transcript
   reasonix_respond_permission / reasonix_stop / reasonix_restart_agentd /
-  reasonix_restart_mcp_server
+  reasonix_restart_mcp_server / reasonix_configure
 """
 
 from __future__ import annotations
@@ -35,8 +35,8 @@ MCP_INSTRUCTIONS = """Reasonix is an agent-orchestration MCP server backed by a
 detached agent daemon. Use reasonix_spawn once per child task and retain each
 session_id. Agents keep running even if this MCP server (or the MCP host —
 Claude Code, Codex, …) restarts — reasonix_list shows the fleet, reasonix_resume revives a session
-whose process died. Never resume a running or idle session; resume is
-idempotent and returns already_live=true if recovery races a live process. For
+whose process died. Resume is idempotent if recovery races a live process;
+optional model/session changes still follow reasonix_configure semantics. For
 multiple children keep one reasonix_watch call in
 flight with all ids; it returns compact results for completion, permission,
 or process death without a follow-up poll. Keep one watch per orchestrator
@@ -61,6 +61,9 @@ and agent questions; the selected option is returned to the child
 automatically. Watch remains authoritative when elicitation is unavailable,
 declined, or canceled. reasonix_poll is for explicit snapshots and
 reasonix_wait is the legacy event-driven, output-sensitive long poll.
+Use reasonix_configure to switch model/effort/work mode/approval. An active
+turn keeps its current model and applies the queued change before the next
+turn; idle agents apply immediately; exited agents apply it on resume.
 Omit watch timeout for normal orchestration; its default is indefinite. Never
 copy explicit test safety timeouts (such as 240 seconds) into production watch
 calls unless the user specifically requests a bounded wait.
@@ -225,7 +228,7 @@ async def _read_agentd(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
 
 _DISCONNECT_RETRY_METHODS = {
-    "list", "models", "ping", "poll", "transcript", "wait", "watch",
+    "configure", "list", "models", "ping", "poll", "transcript", "wait", "watch",
 }
 _CONSUMING_RETRY_METHODS = {"poll", "watch"}
 _next_request_token = itertools.count(1)
@@ -544,6 +547,10 @@ async def reasonix_spawn(
 async def reasonix_resume(
     session_id: str,
     cwd: str = "",
+    model: str = "",
+    effort: str = "",
+    work_mode: str = "",
+    tool_approval: str = "",
     keep_alive: bool = False,
     idle_timeout: float = common.DEFAULT_IDLE_TIMEOUT,
     ctx: Context | None = None,
@@ -551,7 +558,8 @@ async def reasonix_resume(
     """Revive a session whose process died (after a daemon restart, a crash,
     or reasonix_stop — history is persisted on disk). This is idempotent: a
     running/idle session returns already_live=true without opening a second
-    ACP process. Poll/send/watch the existing process in that case.
+    ACP process. Optional model/effort/work_mode/tool_approval values apply to
+    the revived process; on a live session they follow configure semantics.
     """
     _capture_relay_ctx(ctx)
     _require_owned(session_id)
@@ -567,7 +575,7 @@ async def reasonix_resume(
         None,
     )
     if existing is not None and existing.get("status") != "exited":
-        return {
+        result = {
             "session_id": session_id,
             "status": existing.get("status"),
             "cwd": existing.get("cwd") or cwd,
@@ -578,12 +586,54 @@ async def reasonix_resume(
                 "instead of starting another ACP process"
             ),
         }
+        updates = {
+            key: value for key, value in {
+                "model": model,
+                "effort": effort,
+                "work_mode": work_mode,
+                "tool_approval": tool_approval,
+            }.items() if value
+        }
+        if updates:
+            result["config_change"] = await _rpc(
+                "configure", {"session_id": session_id, **updates}
+            )
+        return result
     result = await _rpc("resume", {
         "session_id": session_id, "cwd": cwd,
+        "model": model, "effort": effort,
+        "work_mode": work_mode, "tool_approval": tool_approval,
         "keep_alive": keep_alive, "idle_timeout": idle_timeout,
     })
     _remember_session(session_id)
     return result
+
+
+@mcp.tool()
+async def reasonix_configure(
+    session_id: str,
+    model: str = "",
+    effort: str = "",
+    work_mode: str = "",
+    tool_approval: str = "",
+    ctx: Context | None = None,
+) -> dict:
+    """Change a live or stopped agent's model/session options.
+
+    Idle agents apply immediately. Active turns keep the old configuration and
+    queue the change before their next turn. Exited agents persist the change;
+    call reasonix_resume to launch them with it. At least one option is
+    required. Model changes preserve the session transcript.
+    """
+    _capture_relay_ctx(ctx)
+    _require_owned(session_id)
+    return await _rpc("configure", {
+        "session_id": session_id,
+        "model": model,
+        "effort": effort,
+        "work_mode": work_mode,
+        "tool_approval": tool_approval,
+    })
 
 
 @mcp.tool()

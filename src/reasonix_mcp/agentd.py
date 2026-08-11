@@ -12,7 +12,7 @@ Wire protocol over a Unix socket: NDJSON JSON-RPC 2.0, one frame per line.
   daemon -> server:  {"jsonrpc":"2.0","id":N,"result":{...}}  (or "error")
   daemon -> server:  {"method":"agent_event","params":{...}}   (push; best-effort)
 
-Methods mirror the MCP tools (spawn/send/poll/wait/list/models/transcript/
+Methods mirror the MCP tools (spawn/send/configure/poll/wait/list/models/transcript/
 watch/respond_permission/stop/resume). The daemon holds the authoritative session
 registry; agents carry PDEATHSIG so they die with the daemon, never orphan.
 
@@ -60,6 +60,7 @@ class Agentd:
         self._wait_waiters: dict[str, set[asyncio.Future]] = {}
         self._active_watch_sessions: dict[str, asyncio.Task] = {}
         self._idle_cleanup_tasks: dict[str, asyncio.Task] = {}
+        self._pending_config_tasks: dict[str, asyncio.Task] = {}
         # Consuming calls can finish just as their Unix socket drops. Cache a
         # bounded set of tokenized results so the MCP front-end can reconnect
         # and retry without losing poll deltas or a delivered watch terminal.
@@ -86,6 +87,13 @@ class Agentd:
                     )
                     if kind == acp_bridge.EV_TURN_END:
                         self._loop.call_soon_threadsafe(self._schedule_idle_cleanup, agent)
+                        self._loop.call_soon_threadsafe(
+                            self._schedule_pending_config, agent
+                        )
+                    elif kind == acp_bridge.EV_STATUS and agent.pending_config:
+                        self._loop.call_soon_threadsafe(
+                            self._schedule_pending_config, agent
+                        )
                     elif kind == acp_bridge.EV_PROCESS_EXIT:
                         self._loop.call_soon_threadsafe(self._cancel_idle_cleanup, agent.session_id)
                     print(
@@ -192,6 +200,76 @@ class Agentd:
         self._idle_cleanup_tasks[agent.session_id] = asyncio.create_task(
             self._auto_stop_idle(agent, agent.event_seq, timeout)
         )
+
+    def _schedule_pending_config(self, agent: acp_bridge.ReasonixAgent) -> None:
+        if not getattr(agent, "pending_config", None):
+            return
+        current = self._pending_config_tasks.get(agent.session_id)
+        if current is not None and not current.done():
+            return
+        self._pending_config_tasks[agent.session_id] = asyncio.create_task(
+            self._apply_pending_config(agent)
+        )
+
+    async def _apply_pending_config(self, agent: acp_bridge.ReasonixAgent) -> None:
+        task = asyncio.current_task()
+        try:
+            while agent.pending_config and common.agent_status(agent) != "exited":
+                if agent.active_turn:
+                    return
+                requested = dict(agent.pending_config)
+                try:
+                    result = await asyncio.to_thread(agent.configure, requested)
+                except Exception as exc:
+                    if (
+                        isinstance(exc, acp_bridge.ACPError)
+                        and "active work or background jobs" in exc.message
+                    ):
+                        agent.pending_config_error = None
+                        return
+                    agent.pending_config_error = str(exc)
+                    print(
+                        f"reasonix agent config apply failed: session={agent.session_id} "
+                        f"error={exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return
+                for key, value in requested.items():
+                    if agent.pending_config.get(key) == value:
+                        agent.pending_config.pop(key, None)
+                agent.pending_config_error = None
+                # A newer configure call can arrive while this blocking ACP
+                # rebuild is in flight. Persist its desired values over the
+                # just-applied snapshot so a crash cannot resurrect the older
+                # choice.
+                persisted = dict(result.get("config") or requested)
+                persisted.update(agent.pending_config)
+                common.write_session_config(
+                    agent.session_id, persisted, replace=True
+                )
+                print(
+                    f"reasonix agent config applied: session={agent.session_id} "
+                    f"options={sorted(requested)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        finally:
+            if self._pending_config_tasks.get(agent.session_id) is task:
+                self._pending_config_tasks.pop(agent.session_id, None)
+
+    async def _flush_pending_config(self, agent: acp_bridge.ReasonixAgent) -> None:
+        if not agent.pending_config:
+            return
+        self._schedule_pending_config(agent)
+        task = self._pending_config_tasks.get(agent.session_id)
+        if task is not None:
+            await asyncio.shield(task)
+        if agent.pending_config:
+            detail = agent.pending_config_error or "Reasonix still has active background work"
+            raise AgentdError(
+                f"pending configuration was not applied before the next turn: {detail}"
+            )
 
     def _cached_delivery(self, method: str, params: dict) -> dict | None:
         token = str(params.get("_request_token") or "")
@@ -303,6 +381,9 @@ class Agentd:
         agent.keep_alive = keep_alive
         agent.idle_timeout = idle_timeout
         self._register(agent)
+        common.write_session_config(
+            agent.session_id, agent.config_values, replace=True
+        )
         self._start_agent_turn(agent, task)
         posture = common.sandbox_posture()
         for warning in posture.get("warnings", []):
@@ -320,6 +401,7 @@ class Agentd:
                      "a stopped session."),
             "keep_alive": keep_alive,
             "idle_timeout": idle_timeout,
+            "config": dict(agent.config_values),
         }
         notes = getattr(agent, "spawn_notes", None) or {}
         if notes.get("skipped_options"):
@@ -348,12 +430,13 @@ class Agentd:
             existing = self._registry.get(session_id)
         if existing is not None and getattr(existing, "owner_id", "") != owner_id:
             raise AgentdError(f"unknown session_id {session_id!r} — it belongs to another orchestrator")
+        requested_config = self._config_updates(params, require_any=False)
         if existing is not None and common.agent_status(existing) != "exited":
             # Resume is a recovery operation, but callers can race daemon
             # reconnect/list recovery and invoke it for a process that never
             # died. Treat that as success instead of opening a second ACP
             # process, which Reasonix correctly rejects as "session in use".
-            return {
+            result = {
                 "session_id": session_id,
                 "status": common.agent_status(existing),
                 "cwd": getattr(existing, "cwd", None) or cwd or os.getcwd(),
@@ -364,6 +447,16 @@ class Agentd:
                     "instead of starting another ACP process"
                 ),
             }
+            if requested_config:
+                existing.pending_config.update(requested_config)
+                self._persist_config_request(session_id, requested_config)
+                self._schedule_pending_config(existing)
+                result["config_change"] = {
+                    "queued": bool(existing.active_turn),
+                    "requested": requested_config,
+                    "note": "configuration will apply after the active turn" if existing.active_turn else "configuration apply scheduled",
+                }
+            return result
         if existing is None:
             persisted = os.path.join(common.reasonix_home(), "sessions", f"{session_id}.jsonl")
             if not os.path.isfile(persisted):
@@ -375,7 +468,18 @@ class Agentd:
                 )
         if not cwd:
             cwd = getattr(existing, "cwd", None) or os.getcwd()
-        agent = acp_bridge.ReasonixAgent(cwd=cwd, resume_session_id=session_id)
+        saved_config = common.read_session_config(session_id)
+        if "model" in requested_config and "effort" not in requested_config:
+            saved_config.pop("effort", None)
+        saved_config.update(requested_config)
+        agent = acp_bridge.ReasonixAgent(
+            cwd=cwd,
+            resume_session_id=session_id,
+            model=saved_config.get("model", ""),
+            effort=saved_config.get("effort", ""),
+            work_mode=saved_config.get("work_mode", ""),
+            tool_approval=saved_config.get("tool_approval", ""),
+        )
         agent.status_protocol_injected = common.transcript_has_status_protocol(session_id)
         agent.task = getattr(existing, "task", None) or f"resumed {session_id}"
         agent.cwd = cwd
@@ -393,16 +497,132 @@ class Agentd:
         agent.keep_alive = keep_alive
         agent.idle_timeout = idle_timeout
         self._register(agent)
-        return {
+        common.write_session_config(session_id, agent.config_values, replace=True)
+        result = {
             "session_id": session_id,
             "status": common.agent_status(agent),
             "cwd": cwd,
             "already_live": False,
             "resumed": True,
+            "config": dict(agent.config_values),
             "note": "session resumed from its persisted transcript; send/poll work as before",
         }
+        notes = getattr(agent, "spawn_notes", None) or {}
+        if notes.get("skipped_options"):
+            result["skipped_options"] = notes["skipped_options"]
+        return result
 
-    def send(self, params: dict) -> dict:
+    @staticmethod
+    def _config_updates(params: dict, *, require_any: bool = True) -> dict[str, str]:
+        updates = {
+            key: str(params.get(key) or "").strip()
+            for key in ("model", "effort", "work_mode", "tool_approval")
+            if str(params.get(key) or "").strip()
+        }
+        if require_any and not updates:
+            raise AgentdError("provide at least one of: model, effort, work_mode, tool_approval")
+        if updates.get("work_mode") not in (None, "economy", "balanced", "delivery"):
+            raise AgentdError("work_mode must be one of: economy, balanced, delivery")
+        if updates.get("tool_approval") not in (None, "ask", "auto", "yolo"):
+            raise AgentdError("tool_approval must be one of: ask, auto, yolo")
+        return updates
+
+    @staticmethod
+    def _persist_config_request(
+        session_id: str, updates: dict[str, str]
+    ) -> dict[str, str]:
+        durable = dict(updates)
+        if "model" in durable and "effort" not in durable:
+            # A model-only ACP switch adopts the new model's default effort.
+            # Clear the prior model's effort so crash/resume behaves the same.
+            durable["effort"] = ""
+        return common.write_session_config(session_id, durable)
+
+    async def configure(self, params: dict) -> dict:
+        session_id = params.get("session_id", "")
+        owner_id = str(params.get("owner_id") or "")
+        updates = self._config_updates(params)
+        with self._lock:
+            agent = self._registry.get(session_id)
+        if agent is None:
+            persisted = os.path.join(
+                common.reasonix_home(), "sessions", f"{session_id}.jsonl"
+            )
+            if not os.path.isfile(persisted) or common.read_session_owner(session_id) != owner_id:
+                raise AgentdError(
+                    f"unknown session_id {session_id!r} — did you call reasonix_spawn first?"
+                )
+            self._persist_config_request(session_id, updates)
+            return {
+                "session_id": session_id,
+                "status": "exited",
+                "queued": True,
+                "applies": "on_resume",
+                "requested": updates,
+                "note": "configuration saved; call reasonix_resume to start the stopped agent",
+            }
+        if getattr(agent, "owner_id", "") != owner_id:
+            raise AgentdError(
+                f"unknown session_id {session_id!r} — did you call reasonix_spawn first?"
+            )
+        status = common.agent_status(agent)
+        self._persist_config_request(session_id, updates)
+        if status == "exited":
+            agent.pending_config.update(updates)
+            return {
+                "session_id": session_id,
+                "status": status,
+                "queued": True,
+                "applies": "on_resume",
+                "requested": updates,
+                "note": "configuration saved; call reasonix_resume to start the stopped agent",
+            }
+        if agent.active_turn:
+            agent.pending_config.update(updates)
+            agent.pending_config_error = None
+            return {
+                "session_id": session_id,
+                "status": status,
+                "queued": True,
+                "applies": "after_current_turn",
+                "requested": updates,
+                "note": "the current turn keeps its model; configuration applies before the next turn",
+            }
+        # Mark the update pending before yielding to a worker thread. A
+        # simultaneous reasonix_send will then wait instead of starting a turn
+        # on the old model while the ACP session is rebuilding.
+        agent.pending_config.update(updates)
+        agent.pending_config_error = None
+        self._schedule_pending_config(agent)
+        task = self._pending_config_tasks.get(session_id)
+        if task is not None:
+            await asyncio.shield(task)
+        if agent.pending_config:
+            if agent.pending_config_error:
+                raise AgentdError(
+                    f"configuration was not applied: {agent.pending_config_error}"
+                )
+            return {
+                "session_id": session_id,
+                "status": common.agent_status(agent),
+                "queued": True,
+                "applies": "after_background_work",
+                "requested": updates,
+                "note": "configuration queued until Reasonix background work is idle",
+            }
+        return {
+            "session_id": session_id,
+            "status": common.agent_status(agent),
+            "queued": False,
+            "applied": {
+                key: value
+                for key, value in updates.items()
+                if agent.config_values.get(key) == value
+            },
+            "config": dict(agent.config_values),
+        }
+
+    async def send(self, params: dict) -> dict:
         session_id = params["session_id"]
         message = params.get("message", "")
         expect = params.get("expect", "any")
@@ -416,10 +636,28 @@ class Agentd:
             raise AgentdError(f"agent {session_id} is being cleaned up")
         if agent.status == "exited":
             raise AgentdError(f"agent {session_id} has exited — it can no longer accept messages")
+        if not agent.active_turn:
+            # A completion watch can return before the queued model rebuild
+            # finishes. Never let the next turn race ahead on the old model.
+            await self._flush_pending_config(agent)
         if expect == "steer" and not agent.active_turn:
             raise AgentdError(f"agent {session_id} has no active turn — cannot steer (expect='steer')")
         if expect == "new_turn" and agent.active_turn:
             raise AgentdError(f"agent {session_id} has an active turn — would steer, but expect='new_turn'")
+
+        if expect == "new_turn":
+            try:
+                self._start_agent_turn(agent, message)
+            except acp_bridge.ACPError as exc:
+                raise AgentdError(
+                    f"agent {session_id} became active — cannot start a new turn",
+                    exc.code,
+                ) from exc
+            return {
+                "session_id": session_id,
+                "delivered": "new_turn",
+                "note": "started a new turn with the message",
+            }
 
         delivered = "steered"
         note = "queued as mid-turn guidance"
@@ -430,6 +668,11 @@ class Agentd:
             except acp_bridge.ACPError as e:
                 if e.code != acp_bridge.ERR_INVALID_REQUEST:
                     raise AgentdError(e.message, e.code) from e
+                if expect == "steer":
+                    raise AgentdError(
+                        f"agent {session_id} turn ended before steering; "
+                        "expect='steer' forbids starting a follow-up turn"
+                    ) from e
             try:
                 self._start_agent_turn(agent, message)
                 delivered = "new_turn"
@@ -440,10 +683,6 @@ class Agentd:
                     raise AgentdError(e2.message, e2.code) from e2
         else:
             raise AgentdError("could not deliver message: turn state raced")
-        if expect != "any":
-            expected = "steered" if expect == "steer" else expect
-            if delivered != expected:
-                raise AgentdError(f"send delivered {delivered!r} but expect={expect!r} — nothing further was queued")
         return {"session_id": session_id, "delivered": delivered, "note": note}
 
     def poll(self, params: dict) -> dict:
@@ -694,6 +933,9 @@ class Agentd:
             "permission_request": detailed.get("permission_request"),
             "plan": detailed.get("plan") or [],
             "current_work": detailed.get("current_work"),
+            "config": detailed.get("config") or {},
+            "pending_config": detailed.get("pending_config") or {},
+            "pending_config_error": detailed.get("pending_config_error"),
             "transcript_path": detailed.get("transcript_path"),
             "detail_available": True,
         }
@@ -743,6 +985,9 @@ class Agentd:
                     dict(getattr(a, "current_work", None))
                     if getattr(a, "current_work", None) else None
                 ),
+                "config": dict(getattr(a, "config_values", {}) or {}),
+                "pending_config": dict(getattr(a, "pending_config", {}) or {}),
+                "pending_config_error": getattr(a, "pending_config_error", None),
                 "resumable": status in ("idle", "exited") and os.path.isfile(persisted),
             }
             if getattr(a, "last_error", None) is not None:
@@ -781,6 +1026,9 @@ class Agentd:
     def stop(self, params: dict) -> dict:
         agent = self._get(params["session_id"], str(params.get("owner_id") or ""))
         self._cancel_idle_cleanup(params["session_id"])
+        config_task = self._pending_config_tasks.pop(params["session_id"], None)
+        if config_task is not None and not config_task.done():
+            config_task.cancel()
         agent.cancel_turn()
         agent.close()
         return {"session_id": params["session_id"], "stopped": True}
@@ -810,6 +1058,7 @@ class Agentd:
             common.agent_status(agent) == "exited"
             or (
                 not agent.active_turn
+                and not getattr(agent, "pending_config", None)
                 and getattr(agent, "_pending_permission", None) is None
                 and not getattr(agent, "keep_alive", False)
                 and bool(agent.stop_reason)
@@ -898,6 +1147,10 @@ class Agentd:
     def _shutdown_agents(self) -> dict:
         for session_id in list(self._idle_cleanup_tasks):
             self._cancel_idle_cleanup(session_id)
+        for task in self._pending_config_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._pending_config_tasks.clear()
         with self._lock:
             agents = list(self._registry.values())
             self._registry.clear()

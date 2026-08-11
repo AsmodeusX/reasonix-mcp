@@ -37,6 +37,8 @@ def main() -> None:
     payload = json.loads(response["result"]["content"][0]["text"])
     assert payload["server_restarted"] is True
     assert payload["results"] == {}
+    tools_changed = json.loads(launcher._tools_changed_notification().decode())
+    assert tools_changed["method"] == "notifications/tools/list_changed"
     print("LAUNCHER SELFTEST PASS")
 
 

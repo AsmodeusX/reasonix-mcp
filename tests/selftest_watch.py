@@ -8,6 +8,8 @@ import json
 import os
 import queue
 import sys
+import tempfile
+import threading
 from types import SimpleNamespace
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -294,6 +296,9 @@ def watch_agent(session_id: str) -> SimpleNamespace:
         plan_entries=[],
         current_work=None,
         last_error=None,
+        config_values={},
+        pending_config={},
+        pending_config_error=None,
     )
 
 
@@ -444,6 +449,143 @@ async def check_event_driven_wait() -> None:
     assert not daemon._wait_waiters, daemon._wait_waiters
 
 
+async def check_configure_queues_active_turn() -> None:
+    daemon = Agentd()
+    agent = watch_agent("configure-active")
+    daemon._registry[agent.session_id] = agent
+    original_write = common.write_session_config
+    writes: list[dict] = []
+    applied: list[dict] = []
+
+    def write_config(_session_id: str, updates: dict, **_kwargs) -> dict:
+        writes.append(dict(updates))
+        return dict(updates)
+
+    def configure(updates: dict) -> dict:
+        applied.append(dict(updates))
+        agent.config_values.update(updates)
+        return {
+            "applied_options": dict(updates),
+            "skipped_options": [],
+            "config": dict(agent.config_values),
+        }
+
+    common.write_session_config = write_config
+    agent.configure = configure
+    try:
+        queued = await daemon.configure({
+            "session_id": agent.session_id,
+            "owner_id": agent.owner_id,
+            "model": "codex/gpt-next",
+            "effort": "max",
+        })
+        assert queued["queued"] and queued["applies"] == "after_current_turn"
+        assert not applied
+        agent.active_turn = False
+        agent.status = "idle"
+        await daemon._apply_pending_config(agent)
+        assert applied == [{"model": "codex/gpt-next", "effort": "max"}]
+        assert not agent.pending_config
+
+        agent.status = "exited"
+        stopped = await daemon.configure({
+            "session_id": agent.session_id,
+            "owner_id": agent.owner_id,
+            "model": "codex/stopped-model",
+        })
+        assert stopped["applies"] == "on_resume" and stopped["queued"]
+        assert writes[-1] == {
+            "model": "codex/stopped-model",
+            "effort": "",
+        }
+    finally:
+        common.write_session_config = original_write
+
+
+async def check_configure_blocks_new_turn_until_applied() -> None:
+    daemon = Agentd()
+    agent = watch_agent("configure-send-race")
+    agent.active_turn = False
+    agent.status = "idle"
+    daemon._registry[agent.session_id] = agent
+    started = threading.Event()
+    release = threading.Event()
+    original_write = common.write_session_config
+
+    def write_config(_session_id: str, updates: dict, **_kwargs) -> dict:
+        return dict(updates)
+
+    def configure(updates: dict) -> dict:
+        started.set()
+        assert release.wait(1), "test did not release the model rebuild"
+        agent.config_values.update(updates)
+        return {"config": dict(agent.config_values)}
+
+    def start_turn(_message: str) -> None:
+        agent.active_turn = True
+        agent.status = "running"
+
+    common.write_session_config = write_config
+    agent.configure = configure
+    agent.start_turn = start_turn
+    try:
+        changing = asyncio.create_task(daemon.configure({
+            "session_id": agent.session_id,
+            "owner_id": agent.owner_id,
+            "model": "codex/new-model",
+        }))
+        assert await asyncio.to_thread(started.wait, 1)
+        sending = asyncio.create_task(daemon.send({
+            "session_id": agent.session_id,
+            "owner_id": agent.owner_id,
+            "message": "continue",
+            "expect": "new_turn",
+        }))
+        await asyncio.sleep(0)
+        assert not sending.done(), "new turn raced ahead of model rebuild"
+        release.set()
+        changed, sent = await asyncio.gather(changing, sending)
+        assert changed["config"]["model"] == "codex/new-model"
+        assert sent["delivered"] == "new_turn"
+    finally:
+        release.set()
+        common.write_session_config = original_write
+
+
+async def check_configure_persisted_session_without_tombstone() -> None:
+    daemon = Agentd()
+    old_home = os.environ.get("REASONIX_HOME")
+    with tempfile.TemporaryDirectory(prefix="reasonix-configure-") as scratch:
+        os.environ["REASONIX_HOME"] = scratch
+        session_id = "persisted-without-tombstone"
+        owner_id = "owner-persisted"
+        sessions = os.path.join(scratch, "sessions")
+        os.makedirs(sessions)
+        with open(os.path.join(sessions, f"{session_id}.jsonl"), "w"):
+            pass
+        common.write_session_owner(session_id, owner_id)
+        common.write_session_config(session_id, {
+            "model": "codex/old-model",
+            "effort": "old-model-only-effort",
+        })
+        try:
+            result = await daemon.configure({
+                "session_id": session_id,
+                "owner_id": owner_id,
+                "model": "codex/resurrected-model",
+            })
+            assert result["applies"] == "on_resume", result
+            assert common.read_session_config(session_id)["model"] == (
+                "codex/resurrected-model"
+            )
+            assert "effort" not in common.read_session_config(session_id)
+        finally:
+            if old_home is None:
+                os.environ.pop("REASONIX_HOME", None)
+            else:
+                os.environ["REASONIX_HOME"] = old_home
+
+
 def check_pending_permission_is_durable() -> None:
     agent = watch_agent("permission-race")
     agent._pending_permission = (17, {
@@ -469,6 +611,9 @@ async def main() -> None:
     await check_poll_does_not_steal_watch_terminal()
     check_resume_is_idempotent_for_live_agent()
     await check_event_driven_wait()
+    await check_configure_queues_active_turn()
+    await check_configure_blocks_new_turn_until_applied()
+    await check_configure_persisted_session_without_tombstone()
     check_pending_permission_is_durable()
     daemon = Agentd()
     agent = SimpleNamespace(

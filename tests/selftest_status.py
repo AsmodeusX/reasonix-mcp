@@ -73,6 +73,38 @@ def main() -> None:
         "error_text": "crashed",
     })
     assert not agent._terminal_observed
+
+    configurable = acp_bridge.ReasonixAgent.__new__(acp_bridge.ReasonixAgent)
+    configurable.status = "idle"
+    configurable.active_turn = False
+    configurable.session_id = "configurable"
+    configurable._config_lock = threading.Lock()
+    configurable.config_options = [
+        {"id": "model", "currentValue": "old/model"},
+        {"id": "effort", "currentValue": "high"},
+    ]
+    configurable.config_values = {"model": "old/model", "effort": "high"}
+    calls = []
+
+    def request(_method: str, params: dict, timeout: float) -> dict:
+        calls.append((params["configId"], params["value"], timeout))
+        current = params["value"]
+        if params["configId"] == "model":
+            return {"configOptions": [
+                {"id": "model", "currentValue": current},
+                {"id": "effort", "currentValue": "auto"},
+            ]}
+        return {"configOptions": [
+            {"id": "model", "currentValue": "new/model"},
+            {"id": "effort", "currentValue": current},
+        ]}
+
+    configurable._request = request
+    configured = configurable.configure({"effort": "max", "model": "new/model"})
+    assert [call[:2] for call in calls] == [
+        ("model", "new/model"), ("effort", "max")
+    ], calls
+    assert configured["config"] == {"model": "new/model", "effort": "max"}
     print("STATUS SELFTEST PASS")
 
 

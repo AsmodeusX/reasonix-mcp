@@ -61,7 +61,7 @@ async def main() -> None:
     port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     with open(os.path.join(SCRATCH_HOME, "config.toml"), "w") as f:
-        f.write(f'default_model = "opencode-go/deepseek-v4-flash"\n[[providers]]\nname = "opencode-go"\nkind = "openai"\nbase_url = "http://127.0.0.1:{port}"\napi_key_env = "SCRATCH_KEY"\nmodel = "deepseek-v4-flash"\n')
+        f.write(f'default_model = "opencode-go/deepseek-v4-flash"\n[[providers]]\nname = "opencode-go"\nkind = "openai"\nbase_url = "http://127.0.0.1:{port}"\napi_key_env = "SCRATCH_KEY"\nmodels = ["deepseek-v4-flash", "deepseek-v4-pro"]\ndefault = "deepseek-v4-flash"\nsupported_efforts = ["high", "max"]\ndefault_effort = "high"\n')
     env = dict(os.environ); env["REASONIX_HOME"] = SCRATCH_HOME
     env["REASONIX_MCP_AGENTD_SOCK"] = os.path.join(SCRATCH_HOME, "agentd.sock"); env["SCRATCH_KEY"] = "dummy"
     try:
@@ -173,6 +173,19 @@ async def main() -> None:
                 d = await call(session, "reasonix_poll", {"session_id": sid2})
                 assert d["status"] == "exited", d
                 print("wait on stopped session -> status exited OK")
+
+                configured = await call(session, "reasonix_configure", {
+                    "session_id": sid2,
+                    "model": "opencode-go/deepseek-v4-pro",
+                    "effort": "high",
+                })
+                assert configured["queued"] and configured["applies"] == "on_resume", configured
+                resumed = await call(session, "reasonix_resume", {"session_id": sid2})
+                assert resumed["resumed"] and not resumed["already_live"], resumed
+                assert resumed["config"]["model"] == "opencode-go/deepseek-v4-pro", resumed
+                assert resumed["config"]["effort"] == "high", resumed
+                print("stopped agent resumed on switched model")
+                await call(session, "reasonix_stop", {"session_id": sid2})
 
                 await call(session, "reasonix_stop", {"session_id": sid1})
         print("ORCHESTRATOR SELFTEST PASS")

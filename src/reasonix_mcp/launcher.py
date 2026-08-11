@@ -106,6 +106,11 @@ def _interrupted_wait_response(request_id: str | int, tool_name: str) -> bytes:
     return (json.dumps(response) + "\n").encode()
 
 
+def _tools_changed_notification() -> bytes:
+    """Ask an already-open MCP host to refresh tools after hot reload."""
+    return b'{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n'
+
+
 def _load_replay_state() -> tuple[list[bytes], str | int | None, bool]:
     raw = os.environ.pop(REPLAY_ENV, "")
     if not raw:
@@ -191,6 +196,7 @@ def main() -> int:
                         # restart; consume only the response to our replay.
                         if suppress_initialize_id is not None and message.get("id") == suppress_initialize_id:
                             suppress_initialize_id = None
+                            _write(sys.stdout.buffer, _tools_changed_notification())
                             continue
                         if message.get("method") and "id" in message:
                             server_requests.add(message["id"])

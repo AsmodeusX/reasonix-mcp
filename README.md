@@ -33,6 +33,8 @@ shut down (killing the daemon kills its agents — they carry PDEATHSIG).
 - **Cleanup** can stop completed agents after an idle grace period; it is
   disabled by default. Use `keep_alive=true` for interactive follow-up turns.
 - **Resume** revives a stopped/crashed session from its persisted transcript.
+- **Configure** switches model/effort/session options immediately when idle,
+  after the current turn when active, or on the next resume when stopped.
 - **Stop** cancels + closes + kills; the session stays listed and resumable.
 - **Wake-up**: keep `reasonix_watch` in flight. It returns compact terminal or
   permission results directly, with no timeout and no follow-up poll by default.
@@ -89,9 +91,10 @@ client and verify the server is listed.
 | Tool | Purpose |
 | --- | --- |
 | `reasonix_spawn(task, cwd?, model?, work_mode?, tool_approval?, effort?, keep_alive?, idle_timeout?)` | Start an agent in the daemon on `task`; returns `session_id` + sandbox posture. Completed agents can be cleaned up after the idle grace period when cleanup is enabled, unless `keep_alive=true`. |
-| `reasonix_resume(session_id, cwd?, keep_alive?, idle_timeout?)` | Revive a stopped/crashed session from its persisted transcript. Idempotent: returns `already_live=true` instead of duplicating a running/idle process. |
+| `reasonix_resume(session_id, cwd?, model?, effort?, work_mode?, tool_approval?, keep_alive?, idle_timeout?)` | Revive a stopped/crashed session from its persisted transcript, optionally changing its model/options. Idempotent for live processes. |
 | `reasonix_models()` | List selectable models: `provider/model` refs, default, per-model `supported_efforts`, and `price` hints where configured. |
 | `reasonix_send(session_id, message, expect?)` | Forced steer: queue as mid-turn guidance, or start a new turn if idle. Never dropped. `expect="steer"` refuses to start a new turn. |
+| `reasonix_configure(session_id, model?, effort?, work_mode?, tool_approval?)` | Switch session configuration while preserving history. Idle: immediate. Active: queued before next turn. Exited: persisted for `reasonix_resume`. |
 | `reasonix_poll(session_id, include_events?, exclude_events?, include_thought?, include_full?, max_events?)` | New output / status / completed turns / current `plan` / pending permission request. Static boilerplate is filtered and events are a recent tail by default. |
 | `reasonix_transcript(session_id, max_tool_calls?)` | What the agent actually did: tool calls with args, files touched (write/read/bash), roles, work duration, last text — powers rebase decisions. (Reasonix does not persist token/cost usage; these are activity metrics.) |
 | `reasonix_watch(session_ids, timeout?, detail?, …poll options)` | Primary callback: block indefinitely by default until completion, permission/question, or process death. Returns a compact result; `detail=true` opts into the poll-shaped result. |
@@ -216,6 +219,15 @@ agent is idle (or the turn ended mid-race). Messages are never dropped.
 `expect` (`any` default) narrows that: `expect="steer"` raises instead of
 accidentally starting a new turn; `expect="new_turn"` raises if the message
 was steered into a running turn.
+
+`reasonix_configure` changes the model without replacing the logical session
+or losing its transcript. Reasonix cannot rebuild a model while a turn or
+background job is active, so an active agent reports `queued=true` and keeps
+the old model for that turn; the new configuration is applied before the next
+turn. For a stopped/exited agent, configure first and then call
+`reasonix_resume`, or pass the model/options directly to resume. Desired
+configuration is persisted in a per-session sidecar so daemon/MCP restarts do
+not lose it.
 
 | Option | Values |
 | --- | --- |

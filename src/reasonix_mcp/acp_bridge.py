@@ -175,6 +175,7 @@ class ReasonixAgent:
         self._pending: dict[int, queue.Queue] = {}
         self._ids = itertools.count(1)
         self._wlock = threading.Lock()
+        self._config_lock = threading.Lock()
         self._stderr_tail: list[str] = []
         self._exit_code: int | None = None
         self._closed = False
@@ -212,6 +213,10 @@ class ReasonixAgent:
         # Owned by agentd: the orchestration progress contract belongs in the
         # logical session history once, not at the start of every turn.
         self.status_protocol_injected = False
+        self.config_options: list[dict] = []
+        self.config_values: dict[str, str] = {}
+        self.pending_config: dict[str, str] = {}
+        self.pending_config_error: str | None = None
 
         binary = resolve_reasonix_binary(reasonix_bin)
         env = dict(os.environ)
@@ -246,38 +251,26 @@ class ReasonixAgent:
                 "clientCapabilities": {"fs": {}, "terminal": False},
             }, timeout=spawn_timeout)
             if resume_session_id:
-                self._request("session/resume", {"sessionId": resume_session_id, "cwd": cwd}, timeout=spawn_timeout)
+                res = self._request(
+                    "session/resume",
+                    {"sessionId": resume_session_id, "cwd": cwd},
+                    timeout=spawn_timeout,
+                )
                 self.session_id = resume_session_id
-                self.spawn_notes = {"skipped_options": []}
             else:
                 res = self._request("session/new", {"cwd": cwd}, timeout=spawn_timeout)
                 self.session_id = res["sessionId"]
-                # Apply config options only when the session advertises them: some
-                # models (e.g. gateway models that bake effort into the model id)
-                # expose no `effort` option, and set_config_option would reject it.
-                # Skipped options are reported so callers can pick a variant id.
-                self.spawn_notes: dict = {"skipped_options": []}
-                known_options = {o.get("id") for o in (res.get("configOptions") or [])}
-                for config_id, value in (
-                    ("model", model),
-                    ("effort", effort),
-                    ("work_mode", work_mode),
-                    ("tool_approval", tool_approval),
-                ):
-                    if not value:
-                        continue
-                    if config_id != "model" and config_id not in known_options:
-                        self.spawn_notes["skipped_options"].append(config_id)
-                        continue
-                    opt_res = self._request(
-                        "session/set_config_option",
-                        {"sessionId": self.session_id, "configId": config_id, "value": value},
-                        timeout=spawn_timeout,
-                    )
-                    # A model switch rebuilds the session: refresh which options
-                    # exist (the response carries the refreshed configOptions).
-                    if isinstance(opt_res, dict) and opt_res.get("configOptions"):
-                        known_options = {o.get("id") for o in opt_res["configOptions"]}
+            self._set_config_state((res or {}).get("configOptions") or [])
+            self.spawn_notes = self.configure(
+                {
+                    "model": model,
+                    "effort": effort,
+                    "work_mode": work_mode,
+                    "tool_approval": tool_approval,
+                },
+                timeout=spawn_timeout,
+                skip_unadvertised=True,
+            )
         except Exception:
             self._terminate()
             raise
@@ -285,6 +278,75 @@ class ReasonixAgent:
         # session as idle or suppress the daemon's terminal notification.
         if self.status != "exited":
             self.status = "idle"
+
+    def _set_config_state(self, options: list[dict]) -> None:
+        self.config_options = [dict(option) for option in options if isinstance(option, dict)]
+        self.config_values = {
+            str(option["id"]): str(option["currentValue"])
+            for option in self.config_options
+            if option.get("id") and option.get("currentValue") is not None
+        }
+
+    def configure(
+        self,
+        updates: dict[str, str],
+        *,
+        timeout: float = 60.0,
+        skip_unadvertised: bool = False,
+    ) -> dict:
+        """Apply advertised ACP session options in dependency-safe order.
+
+        Model goes first because rebuilding it refreshes the valid effort
+        choices. Callers must wait until no turn is active.
+        """
+        if self.status == "exited":
+            raise ACPError(-1, "agent process has exited")
+        if self.active_turn:
+            raise ACPError(-32600, "cannot switch configuration while a turn is active")
+        requested = {
+            key: str(value)
+            for key, value in updates.items()
+            if key in ("model", "effort", "work_mode", "tool_approval") and value
+        }
+        skipped: list[str] = []
+        applied: dict[str, str] = {}
+        with self._config_lock:
+            known_options = {option.get("id") for option in self.config_options}
+            for config_id in ("model", "effort", "work_mode", "tool_approval"):
+                value = requested.get(config_id)
+                if not value:
+                    continue
+                if config_id not in known_options:
+                    if skip_unadvertised:
+                        skipped.append(config_id)
+                        continue
+                    raise ACPError(
+                        -32602,
+                        f"session does not advertise config option {config_id!r}",
+                    )
+                if self.config_values.get(config_id) == value:
+                    applied[config_id] = value
+                    continue
+                result = self._request(
+                    "session/set_config_option",
+                    {
+                        "sessionId": self.session_id,
+                        "configId": config_id,
+                        "value": value,
+                    },
+                    timeout=timeout,
+                )
+                if isinstance(result, dict) and "configOptions" in result:
+                    self._set_config_state(result.get("configOptions") or [])
+                    known_options = {option.get("id") for option in self.config_options}
+                else:
+                    self.config_values[config_id] = value
+                applied[config_id] = value
+        return {
+            "applied_options": applied,
+            "skipped_options": skipped,
+            "config": dict(self.config_values),
+        }
 
     # ------------------------------------------------------------------ wire
 
