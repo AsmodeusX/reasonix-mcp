@@ -186,6 +186,10 @@ class ReasonixAgent:
         self._full_thought_snapshot = ""
         self._full_thought_snap_len = 0
         self.on_event = on_event
+        # Daemon-local wake-up hook for the legacy output-sensitive wait.
+        # Unlike on_event, this sees every queued update and is never relayed
+        # as an MCP notification.
+        self.on_activity: Callable[[str, dict], None] | None = None
         # Orchestrator support: event_seq increments on every queued event (lets
         # reasonix_wait/watch detect "something new" without consuming); turns tracks
         # completed turns with their full text + stop_reason (turn boundaries).
@@ -465,7 +469,11 @@ class ReasonixAgent:
                 if payload.get("transcriptPath"):
                     self.transcript_path = payload["transcriptPath"]
             elif kind == EV_PROCESS_EXIT:
-                self._terminal_observed = False
+                # Expected teardown after an already-delivered terminal turn
+                # is a lifecycle transition, not a second completion. Keep an
+                # unobserved or abnormal exit actionable.
+                if payload.get("error") is not None or not self.stop_reason:
+                    self._terminal_observed = False
                 if payload.get("error") is not None:
                     self.last_error = payload["error"]
                 if payload.get("error_text"):
@@ -474,6 +482,11 @@ class ReasonixAgent:
                     self.stop_reason = "error"
             self._events.put((kind, payload))
             self.event_seq += 1
+            if self.on_activity is not None:
+                try:
+                    self.on_activity(kind, payload)
+                except Exception:
+                    pass
             # Orchestrator callback (best-effort, from the reader thread):
             # push when the agent finishes/stops, needs approval, or dies.
             callback_kind = EV_STATUS if status_payload is not None else kind

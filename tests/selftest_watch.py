@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import queue
 import sys
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src", "reasonix_mcp"))
 
 from agentd import Agentd  # noqa: E402
+import acp_bridge  # noqa: E402
 import common  # noqa: E402
 import server as mcp_server  # noqa: E402
 
@@ -62,6 +64,7 @@ class RetryWriter(RecordingWriter):
     def __init__(self) -> None:
         super().__init__()
         self.calls = 0
+        self.tokens: list[str] = []
 
     def write(self, data: bytes) -> None:
         super().write(data)
@@ -69,6 +72,7 @@ class RetryWriter(RecordingWriter):
         if frame.get("method") != "poll" or "id" not in frame:
             return
         self.calls += 1
+        self.tokens.append(str((frame.get("params") or {}).get("_request_token")))
         rid = frame["id"]
 
         def respond() -> None:
@@ -188,6 +192,7 @@ async def check_read_retry() -> None:
         result = await mcp_server._rpc("poll", {"session_id": "retry-me"})
         assert result == {"status": "running", "retried": True}, result
         assert writer.calls == 2, writer.calls
+        assert writer.tokens[0] and writer.tokens[0] == writer.tokens[1], writer.tokens
     finally:
         mcp_server._ensure_agentd = original_ensure
         mcp_server._agentd_writer = original_writer
@@ -274,10 +279,172 @@ async def check_agentd_wire_cancellation(agent: SimpleNamespace) -> None:
     assert reset_writer.closed
 
 
+def watch_agent(session_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        session_id=session_id,
+        owner_id="owner-watch",
+        status="running",
+        active_turn=True,
+        stop_reason=None,
+        _pending_permission=None,
+        _terminal_observed=False,
+        turns=[],
+        event_seq=0,
+        _events=queue.Queue(),
+        plan_entries=[],
+        current_work=None,
+        last_error=None,
+    )
+
+
+async def check_targeted_watch_wakeups() -> None:
+    daemon = Agentd()
+    first_agent = watch_agent("targeted-first")
+    second_agent = watch_agent("targeted-second")
+    daemon._registry = {
+        first_agent.session_id: first_agent,
+        second_agent.session_id: second_agent,
+    }
+
+    def fake_poll(params: dict) -> dict:
+        agent = daemon._registry[params["session_id"]]
+        if params.get("_watch_delivery"):
+            agent._terminal_observed = True
+        return {
+            "session_id": agent.session_id,
+            "status": common.agent_status(agent),
+            "stop_reason": agent.stop_reason,
+            "turns": [],
+            "permission_request": None,
+            "plan": [],
+            "current_work": None,
+            "transcript_path": None,
+        }
+
+    daemon.poll = fake_poll
+    first_params = {
+        "session_ids": [first_agent.session_id],
+        "owner_id": first_agent.owner_id,
+        "_request_token": "targeted-first-delivery",
+    }
+    first = asyncio.create_task(daemon.watch(first_params))
+    second = asyncio.create_task(daemon.watch({
+        "session_ids": [second_agent.session_id],
+        "owner_id": second_agent.owner_id,
+    }))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert set(daemon._watch_waiters) == {
+        first_agent.session_id, second_agent.session_id,
+    }, daemon._watch_waiters
+
+    # Progress is snapshot state, not an actionable completion/decision.
+    daemon._wake_watchers(first_agent.session_id, acp_bridge.EV_STATUS)
+    await asyncio.sleep(0)
+    assert not first.done() and not second.done()
+
+    first_agent.active_turn = False
+    first_agent.status = "idle"
+    first_agent.stop_reason = "end_turn"
+    first_agent.turns = [{"text": "FIRST", "stop_reason": "end_turn"}]
+    daemon._wake_watchers(first_agent.session_id, acp_bridge.EV_TURN_END)
+    first_result = await asyncio.wait_for(first, timeout=1)
+    assert first_result["results"][first_agent.session_id]["message"] == "FIRST"
+    assert not second.done(), "an unrelated agent woke another fleet watch"
+    replayed = await daemon.watch(first_params)
+    assert replayed == first_result, (replayed, first_result)
+
+    second_agent.active_turn = False
+    second_agent.status = "idle"
+    second_agent.stop_reason = "end_turn"
+    second_agent.turns = [{"text": "SECOND", "stop_reason": "end_turn"}]
+    daemon._wake_watchers(second_agent.session_id, acp_bridge.EV_TURN_END)
+    second_result = await asyncio.wait_for(second, timeout=1)
+    assert second_result["results"][second_agent.session_id]["message"] == "SECOND"
+    assert not daemon._watch_waiters, daemon._watch_waiters
+
+
+async def check_poll_does_not_steal_watch_terminal() -> None:
+    daemon = Agentd()
+    agent = watch_agent("poll-race")
+    agent.active_turn = False
+    agent.status = "idle"
+    agent.stop_reason = "end_turn"
+    daemon._registry[agent.session_id] = agent
+    original_shape_poll = common.shape_poll
+
+    def terminal_poll(_agent, **_kwargs) -> dict:
+        return {
+            "session_id": agent.session_id,
+            "status": "idle",
+            "stop_reason": "end_turn",
+        }
+
+    common.shape_poll = terminal_poll
+    daemon._active_watch_sessions[agent.session_id] = asyncio.current_task()
+    try:
+        daemon.poll({"session_id": agent.session_id, "owner_id": agent.owner_id})
+        assert not agent._terminal_observed, "diagnostic poll stole watch completion"
+        daemon.poll({
+            "session_id": agent.session_id,
+            "owner_id": agent.owner_id,
+            "_watch_delivery": True,
+        })
+        assert agent._terminal_observed, "watch delivery did not consume completion"
+    finally:
+        common.shape_poll = original_shape_poll
+        daemon._active_watch_sessions.clear()
+
+
+async def check_event_driven_wait() -> None:
+    daemon = Agentd()
+    first_agent = watch_agent("wait-first")
+    second_agent = watch_agent("wait-second")
+    daemon._registry = {
+        first_agent.session_id: first_agent,
+        second_agent.session_id: second_agent,
+    }
+    waiting = asyncio.create_task(daemon.wait({
+        "session_ids": [first_agent.session_id, second_agent.session_id],
+        "owner_id": first_agent.owner_id,
+        "timeout": 10,
+    }))
+    await asyncio.sleep(0)
+    assert set(daemon._wait_waiters) == {
+        first_agent.session_id, second_agent.session_id,
+    }, daemon._wait_waiters
+    first_agent.event_seq += 1
+    daemon._wake_waiters(first_agent.session_id)
+    result = await asyncio.wait_for(waiting, timeout=1)
+    assert result["woke"] == [first_agent.session_id], result
+    assert not daemon._wait_waiters, daemon._wait_waiters
+
+
+def check_pending_permission_is_durable() -> None:
+    agent = watch_agent("permission-race")
+    agent._pending_permission = (17, {
+        "toolCall": {"title": "Proceed?"},
+        "options": [{"optionId": "yes", "name": "Yes"}],
+    })
+    agent.poll = lambda: []
+    agent.snapshot_turns = lambda: []
+    agent.plan_entries = []
+    agent.current_work = None
+    agent.transcript_path = "/tmp/permission-race.jsonl"
+    agent.last_error = None
+    result = common.shape_poll(agent)
+    assert result["permission_request"]["request_id"] == 17, result
+    assert result["transcript_path"] == agent.transcript_path
+
+
 async def main() -> None:
     await check_connection_probe_serialization()
     await check_old_reader_isolation()
     await check_read_retry()
+    await check_targeted_watch_wakeups()
+    await check_poll_does_not_steal_watch_terminal()
+    await check_event_driven_wait()
+    check_pending_permission_is_durable()
     daemon = Agentd()
     agent = SimpleNamespace(
         session_id="agent-watch",

@@ -95,8 +95,8 @@ client and verify the server is listed.
 | `reasonix_poll(session_id, include_events?, exclude_events?, include_thought?, include_full?, max_events?)` | New output / status / completed turns / current `plan` / pending permission request. Static boilerplate is filtered and events are a recent tail by default. |
 | `reasonix_transcript(session_id, max_tool_calls?)` | What the agent actually did: tool calls with args, files touched (write/read/bash), roles, work duration, last text — powers rebase decisions. (Reasonix does not persist token/cost usage; these are activity metrics.) |
 | `reasonix_watch(session_ids, timeout?, detail?, …poll options)` | Primary callback: block indefinitely by default until completion, permission/question, or process death. Returns a compact result; `detail=true` opts into the poll-shaped result. |
-| `reasonix_wait(session_ids, timeout?)` | Block until any watched session produces output, finishes a turn, or raises a permission request. |
-| `reasonix_list(include_task?)` | All live sessions: id, status, cwd, compact task preview, transcript_path. Set `include_task=true` for full prompts. |
+| `reasonix_wait(session_ids, timeout?)` | Legacy event-driven wait until any watched session produces output, finishes a turn, or raises a permission request. |
+| `reasonix_list(include_task?, pending_only?)` | Sessions with id, status, cwd, compact task preview, plan/current work, and transcript path. `pending_only=true` returns only running, decision-blocked, or uncollected terminal sessions. |
 | `reasonix_respond_permission(session_id, option_id)` | Answer a tool-approval request (`option_id` from watch/poll's `permission_request.options`, or `"cancel"`). |
 | `reasonix_stop(session_id)` | Cancel + close + kill the agent (tombstone: poll keeps reporting `exited`). |
 | `reasonix_restart_agentd(force?)` | Explicitly reload the detached daemon. Source changes already queue a safe automatic reload; `force=true` may terminate live agents. |
@@ -119,8 +119,13 @@ older call safely; a stale canceled watch never requires an MCP-server restart.
 The displaced call returns `superseded=true`, and the newest call owns the
 fleet. Always include the complete remaining fleet when replacing a watch. If
 the MCP host or server restarts during a watch, reconnect, recover the owned
-fleet with `reasonix_list`, and watch it again; undelivered terminal state
-remains pending in agentd.
+fleet with `reasonix_list(pending_only=true)`, and watch it again; undelivered
+terminal state remains pending in agentd.
+
+Python hot reloads safely complete an in-flight watch/wait with
+`server_restarted=true` before replacing the MCP front-end. Agents remain in
+agentd; reissue one watch for the complete remaining fleet. Mutating calls and
+server-to-client permission forms are allowed to finish before reload.
 
 Compact watch consumes queued events so long-running sessions stay bounded.
 Use `reasonix_watch(..., detail=true)` when raw event/turn detail is wanted
@@ -146,7 +151,8 @@ For diagnostics, the server also emits this custom notification on the wire:
 
 > **Orchestrator loop**: `reasonix_watch(session_ids)` → handle each result →
 > answer a permission or remove a terminal id → watch the remaining ids again.
-> `reasonix_wait` remains available as a legacy output-sensitive long poll;
+> `reasonix_wait` remains available as a legacy event-driven,
+> output-sensitive long poll;
 > unlike watch, it requires a follow-up `reasonix_poll`.
 - Diagnostic notifications are always emitted. The daemon and MCP server log
   each emit/relay result so host-side dropping is distinguishable from a
@@ -266,7 +272,7 @@ loop:
   handle event.results                 # no follow-up poll
   reasonix_send(sid, msg, expect="steer") when a discovery invalidates a round
   drop finished ids from the watch list; reasonix_stop() the rest when done
-reasonix_list() whenever you lose track of session_ids
+reasonix_list(pending_only=true) whenever you lose track of session_ids
 ```
 
 ### Caps & truncation
@@ -337,7 +343,10 @@ Registrations that point directly to `server.py` must be changed to
 
 ### Orchestrator isolation
 
-Sessions are scoped to the MCP orchestrator that created them. `reasonix_list`
+Sessions are scoped to the MCP orchestrator conversation that created them.
+Codex thread IDs (and equivalent host session IDs when provided) keep two
+conversations in the same project isolated while allowing that conversation
+to reconnect after an IDE restart. `reasonix_list`
 and all session operations only expose that orchestrator's sessions. The scope
 is stable across MCP server restarts and is derived from the MCP client's name
 and workspace. If multiple instances of the same CLI run in the same workspace,

@@ -71,6 +71,41 @@ def _write(pipe, data: bytes) -> None:
     pipe.flush()
 
 
+def _host_request_kind(message: dict) -> str:
+    """Classify an in-flight host request for safe hot-reload decisions."""
+    method = str(message.get("method") or "")
+    if method != "tools/call":
+        return method
+    params = message.get("params") or {}
+    return str(params.get("name") or method)
+
+
+def _interrupted_wait_response(request_id: str | int, tool_name: str) -> bytes:
+    """Finish a durable long poll before replacing its MCP subprocess."""
+    payload = {
+        "woke": [],
+        "timed_out": False,
+        "server_restarted": True,
+        "note": (
+            "Reasonix MCP reloaded updated code. Agents kept running; reissue "
+            "one reasonix_watch for the complete remaining fleet."
+        ),
+    }
+    if tool_name == "reasonix_watch":
+        payload["results"] = {}
+    else:
+        payload["sessions"] = {}
+    response = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "isError": False,
+        },
+    }
+    return (json.dumps(response) + "\n").encode()
+
+
 def _load_replay_state() -> tuple[list[bytes], str | int | None, bool]:
     raw = os.environ.pop(REPLAY_ENV, "")
     if not raw:
@@ -116,7 +151,7 @@ def main() -> int:
         selector.register(server.stdout, selectors.EVENT_READ, "server")
         host_buffer = b""
         server_buffer = b""
-        host_requests: set[str | int] = set()
+        host_requests: dict[str | int, str] = {}
         server_requests: set[str | int] = set()
         source_changed = False
         reload_announced = False
@@ -143,7 +178,7 @@ def main() -> int:
                             if handshake:
                                 handshake = handshake[:1] + [frame]
                         elif message.get("method") and "id" in message:
-                            host_requests.add(message["id"])
+                            host_requests[message["id"]] = _host_request_kind(message)
                         elif "id" in message:
                             server_requests.discard(message["id"])
                         _write(server.stdin, frame)
@@ -160,7 +195,7 @@ def main() -> int:
                         if message.get("method") and "id" in message:
                             server_requests.add(message["id"])
                         if "id" in message and not message.get("method"):
-                            host_requests.discard(message["id"])
+                            host_requests.pop(message["id"], None)
                         _write(sys.stdout.buffer, line + b"\n")
             current = _source_snapshot()
             if current == snapshot:
@@ -174,11 +209,17 @@ def main() -> int:
                 changed_since = now
             if changed_since is None or now - changed_since < RELOAD_DEBOUNCE:
                 continue
-            if host_requests or server_requests or host_buffer:
+            interruptible = {
+                request_id: kind for request_id, kind in host_requests.items()
+                if kind in ("reasonix_watch", "reasonix_wait")
+            }
+            unsafe_host_requests = set(host_requests) - set(interruptible)
+            if unsafe_host_requests or server_requests or host_buffer:
                 if not reload_announced:
                     print(
                         "reasonix-mcp launcher: source changed; restart queued until "
-                        f"{len(host_requests) + len(server_requests)} in-flight request(s) finish",
+                        f"{len(unsafe_host_requests) + len(server_requests)} "
+                        "non-interruptible request(s) finish",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -194,10 +235,24 @@ def main() -> int:
                     flush=True,
                 )
                 _stop_server(server)
+                for request_id, tool_name in interruptible.items():
+                    _write(
+                        sys.stdout.buffer,
+                        _interrupted_wait_response(request_id, tool_name),
+                    )
                 _exec_updated_launcher(handshake, cached_initialize_id)
             source_changed = True
             print("reasonix-mcp launcher: source changed; restarting MCP server", file=sys.stderr, flush=True)
             _stop_server(server)
+            # Watch/wait state is durable in agentd. Complete these host calls
+            # explicitly so a hot reload never becomes a transport error and
+            # the orchestrator can immediately watch the surviving fleet again.
+            for request_id, tool_name in interruptible.items():
+                _write(
+                    sys.stdout.buffer,
+                    _interrupted_wait_response(request_id, tool_name),
+                )
+                host_requests.pop(request_id, None)
             break
         selector.close()
         return_code = server.wait()

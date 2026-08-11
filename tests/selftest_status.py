@@ -24,12 +24,14 @@ def make_agent() -> acp_bridge.ReasonixAgent:
     agent._current_parts = []
     agent.event_seq = 0
     agent.on_event = None
+    agent.on_activity = None
     agent.turns = []
     agent._turns_served = 0
     agent.stop_reason = None
     agent.last_error = None
     agent.last_error_text = ""
     agent.transcript_path = None
+    agent._terminal_observed = False
     return agent
 
 
@@ -58,6 +60,19 @@ def main() -> None:
         "status": "completed",
     })
     assert agent.current_work["source"] == "plan"
+
+    # Expected teardown after an observed turn must not manufacture a second
+    # completion; abnormal exits remain actionable.
+    agent.stop_reason = "end_turn"
+    agent._terminal_observed = True
+    agent._enqueue(acp_bridge.EV_PROCESS_EXIT, {"code": 0, "stderr": ""})
+    assert agent._terminal_observed
+    agent._enqueue(acp_bridge.EV_PROCESS_EXIT, {
+        "code": 1,
+        "error": {"code": 1, "message": "crashed"},
+        "error_text": "crashed",
+    })
+    assert not agent._terminal_observed
     print("STATUS SELFTEST PASS")
 
 

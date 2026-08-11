@@ -111,11 +111,61 @@ def agentd_sock_path() -> str:
 
 
 def orchestrator_owner_id(client_name: str = "") -> str:
-    """Stable, non-secret owner key used to isolate MCP orchestrators."""
+    """Stable, non-secret owner key used to isolate MCP orchestrators.
+
+    Prefer a conversation/session identity supplied by the host. The first
+    identified conversation in a legacy client+cwd scope claims that scope's
+    old owner id, preserving existing fleets during this migration; other
+    conversations in the same project receive distinct ids.
+    """
     explicit = os.environ.get("REASONIX_MCP_ORCHESTRATOR_ID", "").strip()
     scope = os.path.realpath(os.getcwd())
-    seed = explicit or f"{client_name.strip()}\0{scope}"
-    return "owner-" + hashlib.sha256(seed.encode()).hexdigest()[:24]
+    if explicit:
+        return "owner-" + hashlib.sha256(explicit.encode()).hexdigest()[:24]
+
+    legacy_seed = f"{client_name.strip()}\0{scope}"
+    legacy_owner = "owner-" + hashlib.sha256(legacy_seed.encode()).hexdigest()[:24]
+    instance_key = ""
+    instance_id = ""
+    for key in (
+        "CODEX_THREAD_ID",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_SESSION_ID",
+        "OPENCODE_SESSION_ID",
+    ):
+        value = os.environ.get(key, "").strip()
+        if value:
+            instance_key, instance_id = key, value
+            break
+    if not instance_id:
+        return legacy_owner
+
+    instance_digest = hashlib.sha256(
+        f"{instance_key}\0{instance_id}".encode()
+    ).hexdigest()
+    claim_dir = os.path.join(reasonix_home(), "orchestrator-claims")
+    claim_path = os.path.join(claim_dir, f"{legacy_owner}.json")
+    claimed_by = ""
+    try:
+        os.makedirs(claim_dir, exist_ok=True)
+        fd = os.open(claim_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            with open(claim_path, encoding="utf-8") as fh:
+                claimed_by = str(json.load(fh).get("instance_digest") or "")
+        except (OSError, ValueError, TypeError):
+            pass
+    except OSError:
+        pass
+    else:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"instance_digest": instance_digest}, fh)
+        claimed_by = instance_digest
+    if claimed_by == instance_digest:
+        return legacy_owner
+
+    unique_seed = f"{legacy_seed}\0{instance_key}\0{instance_id}"
+    return "owner-" + hashlib.sha256(unique_seed.encode()).hexdigest()[:24]
 
 
 def owner_state_path(owner_id: str) -> str:
@@ -571,10 +621,17 @@ def shape_poll(
     # still pending. An elicitation or notification response may arrive before
     # the orchestrator drains the original ACP event.
     pending_permission = getattr(agent, "_pending_permission", None)
-    if permission is not None and (
-        pending_permission is None or pending_permission[0] != permission["request_id"]
-    ):
+    if pending_permission is None:
         permission = None
+    elif permission is None or pending_permission[0] != permission["request_id"]:
+        # Permission state is durable until answered. Another poll may have
+        # drained the original queue event while a watch was in flight.
+        request_id, request_params = pending_permission
+        permission = {
+            "request_id": request_id,
+            "tool_call": request_params.get("toolCall", {}),
+            "options": request_params.get("options", []),
+        }
 
     status = agent_status(agent)
     result: dict = {
@@ -592,6 +649,7 @@ def shape_poll(
         "events_dropped": dropped_events,
         "events_filtered": filtered,
         "permission_request": permission,
+        "transcript_path": getattr(agent, "transcript_path", None),
     }
     if include_thought:
         thought, thought_truncated = _cap("".join(thought_parts), MAX_DELTA_TEXT)

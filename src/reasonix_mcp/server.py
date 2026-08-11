@@ -58,7 +58,7 @@ elicitation receive a standard elicitation/create request for permission gates
 and agent questions; the selected option is returned to the child
 automatically. Watch remains authoritative when elicitation is unavailable,
 declined, or canceled. reasonix_poll is for explicit snapshots and
-reasonix_wait is the legacy output-sensitive long poll.
+reasonix_wait is the legacy event-driven, output-sensitive long poll.
 Omit watch timeout for normal orchestration; its default is indefinite. Never
 copy explicit test safety timeouts (such as 240 seconds) into production watch
 calls unless the user specifically requests a bounded wait.
@@ -80,10 +80,12 @@ Lifecycle controls:
   every orchestrator connected to that daemon. Use it after agentd or
   acp_bridge changes. Use reasonix_restart_mcp_server after server.py changes.
 When launcher.py is configured, Python source changes restart this MCP
-front-end automatically and replay its MCP handshake. agentd watches its own
-runtime sources and restarts after active, keep-alive, and decision-blocked
-agents are clear and terminal output has been polled. Manual restart tools
-remain available for explicit control.
+front-end automatically and replay its MCP handshake. An in-flight watch/wait
+is completed with server_restarted=true so the orchestrator can immediately
+rewatch the surviving fleet; other requests finish before reload. agentd
+watches its own runtime sources and restarts after active, keep-alive, and
+decision-blocked agents are clear and terminal output has been delivered by
+watch or poll. Manual restart tools remain available for explicit control.
 The orchestrator status protocol is injected once per persisted child session;
 follow-up and resumed turns do not duplicate it.
 Keep orchestration state in the parent agent. Completed agents can be
@@ -220,7 +222,11 @@ async def _read_agentd(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             _agentd_cancel_supported = None
 
 
-_DISCONNECT_RETRY_METHODS = {"list", "models", "ping", "poll", "transcript", "wait"}
+_DISCONNECT_RETRY_METHODS = {
+    "list", "models", "ping", "poll", "transcript", "wait", "watch",
+}
+_CONSUMING_RETRY_METHODS = {"poll", "watch"}
+_next_request_token = itertools.count(1)
 
 
 async def _rpc(
@@ -232,6 +238,8 @@ async def _rpc(
 ) -> dict:
     params = dict(params)
     params.setdefault("owner_id", _owner_id)
+    if method in _CONSUMING_RETRY_METHODS and "_request_token" not in params:
+        params["_request_token"] = f"{os.getpid()}-{next(_next_request_token)}"
     await _ensure_agentd()
     rid = next(_next_id)
     fut = asyncio.get_running_loop().create_future()
@@ -599,8 +607,8 @@ async def reasonix_wait(
 ) -> dict:
     """Block until any watched session produces output, finishes a turn, or
     raises a permission request (or `timeout` seconds pass). Returns woke ids,
-    per-session status + stop_reason. The authoritative wake-up path — use it as
-    the loop's source of truth; wire notifications are diagnostic only.
+    per-session status + stop_reason. This legacy path is event-driven but
+    output-sensitive and requires a follow-up poll; prefer reasonix_watch.
     """
     _capture_relay_ctx(ctx)
     for session_id in session_ids:
@@ -646,14 +654,21 @@ async def reasonix_watch(
 
 
 @mcp.tool()
-async def reasonix_list(include_task: bool = False, ctx: Context | None = None) -> dict:
+async def reasonix_list(
+    include_task: bool = False,
+    pending_only: bool = False,
+    ctx: Context | None = None,
+) -> dict:
     """List sessions with a compact task preview by default.
 
     Set include_task=true only when the full original orchestration prompt is
-    needed; it can be thousands of words.
+    needed; it can be thousands of words. Set pending_only=true to recover
+    only running, decision-blocked, or not-yet-collected terminal sessions.
     """
     _capture_relay_ctx(ctx)
-    result = await _rpc("list", {"include_task": include_task})
+    result = await _rpc(
+        "list", {"include_task": include_task, "pending_only": pending_only}
+    )
     result["sessions"] = [
         session for session in result.get("sessions", [])
         if session.get("session_id") in _owned_sessions

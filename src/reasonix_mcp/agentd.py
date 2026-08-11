@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import OrderedDict
+from collections.abc import Iterable
 import json
 import os
 import signal
@@ -52,9 +54,16 @@ class Agentd:
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_owners: dict[asyncio.StreamWriter, str] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._watch_waiters: set[asyncio.Future] = set()
+        # Actionable watches are indexed by session. A plan/tool update for one
+        # busy child must not wake every fleet watch in the daemon.
+        self._watch_waiters: dict[str, set[asyncio.Future]] = {}
+        self._wait_waiters: dict[str, set[asyncio.Future]] = {}
         self._active_watch_sessions: dict[str, asyncio.Task] = {}
         self._idle_cleanup_tasks: dict[str, asyncio.Task] = {}
+        # Consuming calls can finish just as their Unix socket drops. Cache a
+        # bounded set of tokenized results so the MCP front-end can reconnect
+        # and retry without losing poll deltas or a delivered watch terminal.
+        self._delivery_cache: OrderedDict[tuple[str, str, str], dict] = OrderedDict()
         self._code_signature = common.agentd_code_signature()
         self._auto_restart_requested = False
 
@@ -72,7 +81,9 @@ class Agentd:
             def _broadcast(kind, payload, agent=agent):
                 try:
                     event = common.build_agent_event(agent, kind, payload)
-                    self._loop.call_soon_threadsafe(self._wake_watchers)
+                    self._loop.call_soon_threadsafe(
+                        self._wake_watchers, agent.session_id, kind
+                    )
                     if kind == acp_bridge.EV_TURN_END:
                         self._loop.call_soon_threadsafe(self._schedule_idle_cleanup, agent)
                     elif kind == acp_bridge.EV_PROCESS_EXIT:
@@ -88,6 +99,14 @@ class Agentd:
                 except Exception:
                     pass
             agent.on_event = _broadcast
+            def _activity(_kind, _payload, agent=agent):
+                # The reader thread checks first so ordinary streaming has no
+                # event-loop scheduling cost unless a legacy wait is active.
+                if agent.session_id in self._wait_waiters:
+                    self._loop.call_soon_threadsafe(
+                        self._wake_waiters, agent.session_id
+                    )
+            agent.on_activity = _activity
         with self._lock:
             self._registry[agent.session_id] = agent
         # The ACP reader can observe an immediate process death during the
@@ -108,13 +127,60 @@ class Agentd:
         if task is not None and not task.done():
             task.cancel()
 
-    def _wake_watchers(self) -> None:
-        """Wake in-flight watch calls after an actionable ACP callback."""
-        waiters = list(self._watch_waiters)
-        self._watch_waiters.clear()
+    def _wake_watchers(self, session_id: str, kind: str) -> None:
+        """Wake only watches affected by an actionable ACP callback."""
+        if kind not in (
+            acp_bridge.EV_TURN_END,
+            acp_bridge.EV_PERMISSION,
+            acp_bridge.EV_PROCESS_EXIT,
+        ):
+            return
+        waiters = list(self._watch_waiters.pop(session_id, ()))
         for waiter in waiters:
             if not waiter.done():
                 waiter.set_result(None)
+
+    def _add_watch_waiter(
+        self, waiter: asyncio.Future, session_ids: Iterable[str]
+    ) -> None:
+        for session_id in session_ids:
+            self._watch_waiters.setdefault(str(session_id), set()).add(waiter)
+
+    def _discard_watch_waiter(
+        self, waiter: asyncio.Future, session_ids: Iterable[str]
+    ) -> None:
+        for session_id in session_ids:
+            sid = str(session_id)
+            waiters = self._watch_waiters.get(sid)
+            if waiters is None:
+                continue
+            waiters.discard(waiter)
+            if not waiters:
+                self._watch_waiters.pop(sid, None)
+
+    def _wake_waiters(self, session_id: str) -> None:
+        waiters = list(self._wait_waiters.pop(session_id, ()))
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+    def _add_wait_waiter(
+        self, waiter: asyncio.Future, session_ids: Iterable[str]
+    ) -> None:
+        for session_id in session_ids:
+            self._wait_waiters.setdefault(str(session_id), set()).add(waiter)
+
+    def _discard_wait_waiter(
+        self, waiter: asyncio.Future, session_ids: Iterable[str]
+    ) -> None:
+        for session_id in session_ids:
+            sid = str(session_id)
+            waiters = self._wait_waiters.get(sid)
+            if waiters is None:
+                continue
+            waiters.discard(waiter)
+            if not waiters:
+                self._wait_waiters.pop(sid, None)
 
     def _schedule_idle_cleanup(self, agent: acp_bridge.ReasonixAgent) -> None:
         if getattr(agent, "keep_alive", False):
@@ -126,6 +192,27 @@ class Agentd:
         self._idle_cleanup_tasks[agent.session_id] = asyncio.create_task(
             self._auto_stop_idle(agent, agent.event_seq, timeout)
         )
+
+    def _cached_delivery(self, method: str, params: dict) -> dict | None:
+        token = str(params.get("_request_token") or "")
+        if not token:
+            return None
+        key = (str(params.get("owner_id") or ""), method, token)
+        result = self._delivery_cache.get(key)
+        if result is not None:
+            self._delivery_cache.move_to_end(key)
+        return result
+
+    def _cache_delivery(self, method: str, params: dict, result: dict) -> dict:
+        token = str(params.get("_request_token") or "")
+        if not token:
+            return result
+        key = (str(params.get("owner_id") or ""), method, token)
+        self._delivery_cache[key] = result
+        self._delivery_cache.move_to_end(key)
+        while len(self._delivery_cache) > 512:
+            self._delivery_cache.popitem(last=False)
+        return result
 
     async def _auto_stop_idle(
         self, agent: acp_bridge.ReasonixAgent, event_seq: int, timeout: float
@@ -334,6 +421,9 @@ class Agentd:
 
     def poll(self, params: dict) -> dict:
         agent = self._get(params["session_id"], str(params.get("owner_id") or ""))
+        cached = self._cached_delivery("poll", params)
+        if cached is not None:
+            return cached
         result = common.shape_poll(
             agent,
             include_events=params.get("include_events"),
@@ -342,11 +432,20 @@ class Agentd:
             include_full=params.get("include_full", common.DEFAULT_INCLUDE_FULL),
             max_events=params.get("max_events"),
         )
-        if result.get("status") != "running" and result.get("stop_reason"):
+        if (
+            result.get("status") != "running"
+            and result.get("stop_reason")
+            and (
+                params.get("_watch_delivery")
+                or agent.session_id not in self._active_watch_sessions
+            )
+        ):
             # Automatic code reload may close a completed idle process, but
             # only after its orchestrator has collected the terminal result.
+            # A diagnostic poll must not steal that result from an in-flight
+            # fleet watch.
             agent._terminal_observed = True
-        return result
+        return self._cache_delivery("poll", params, result)
 
     async def wait(self, params: dict) -> dict:
         session_ids = params.get("session_ids", [])
@@ -361,7 +460,7 @@ class Agentd:
         baselines = {sid: a.event_seq for sid, a in agents.items()}
         deadline = time.monotonic() + timeout
 
-        while True:
+        def snapshot() -> tuple[list[str], dict[str, dict]]:
             woke: list[str] = []
             states: dict[str, dict] = {}
             for sid, a in agents.items():
@@ -384,9 +483,37 @@ class Agentd:
                     states[sid]["error_text"] = a.last_error_text
                 if has_new or pending or status != "running":
                     woke.append(sid)
+            return woke, states
+
+        while True:
+            woke, states = snapshot()
             if woke or time.monotonic() >= deadline:
                 return {"woke": woke, "timed_out": not bool(woke), "sessions": states}
-            await asyncio.sleep(0.2)
+            waiter = asyncio.get_running_loop().create_future()
+            self._add_wait_waiter(waiter, agents)
+            # Close the enqueue/register race using the durable event sequence
+            # and queue state checked by snapshot().
+            woke, states = snapshot()
+            if woke:
+                self._discard_wait_waiter(waiter, agents)
+                waiter.cancel()
+                return {"woke": woke, "timed_out": False, "sessions": states}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._discard_wait_waiter(waiter, agents)
+                waiter.cancel()
+                return {"woke": [], "timed_out": True, "sessions": states}
+            try:
+                await asyncio.wait_for(waiter, timeout=remaining)
+            except asyncio.TimeoutError:
+                woke, states = snapshot()
+                return {
+                    "woke": woke,
+                    "timed_out": not bool(woke),
+                    "sessions": states,
+                }
+            finally:
+                self._discard_wait_waiter(waiter, agents)
 
     async def watch(self, params: dict) -> dict:
         """Block for an actionable event and return a compact result by default.
@@ -411,6 +538,9 @@ class Agentd:
             deadline = time.monotonic() + timeout
         owner_id = str(params.get("owner_id") or "")
         agents = {sid: self._get(sid, owner_id) for sid in dict.fromkeys(session_ids)}
+        cached = self._cached_delivery("watch", params)
+        if cached is not None:
+            return cached
         watch_task = asyncio.current_task()
         # MCP hosts may cancel a tool call without closing their stdio server.
         # A newer watch is therefore authoritative and replaces any older
@@ -431,7 +561,8 @@ class Agentd:
             for sid in agents:
                 self._active_watch_sessions[sid] = watch_task
         try:
-            return await self._watch_actionable(params, agents, owner_id, deadline)
+            result = await self._watch_actionable(params, agents, owner_id, deadline)
+            return self._cache_delivery("watch", params, result)
         finally:
             for sid in agents:
                 if self._active_watch_sessions.get(sid) is watch_task:
@@ -458,6 +589,7 @@ class Agentd:
                     sid: self.poll({
                         "session_id": sid,
                         "owner_id": owner_id,
+                        "_watch_delivery": True,
                         "include_events": params.get("include_events"),
                         "exclude_events": params.get("exclude_events"),
                         "include_thought": params.get("include_thought", common.DEFAULT_INCLUDE_THOUGHT),
@@ -466,36 +598,46 @@ class Agentd:
                     })
                     for sid in woke
                 }
+                # Poll deltas are intentionally single-consumer. If a
+                # diagnostic poll raced this watch, retain the durable latest
+                # turn in the callback so completion never arrives empty.
+                for sid, result in detailed.items():
+                    if not result.get("turns") and agents[sid].turns:
+                        result["turns"] = [dict(agents[sid].turns[-1])]
                 results = (
                     detailed if params.get("detail")
                     else {sid: self._compact_watch_result(result) for sid, result in detailed.items()}
                 )
                 return {"woke": woke, "timed_out": False, "results": results}
             waiter = asyncio.get_running_loop().create_future()
-            self._watch_waiters.add(waiter)
+            self._add_watch_waiter(waiter, agents)
             # Close the check/register race: an event before registration left
             # durable state; one after registration resolves this waiter.
             if any(actionable(agent) for agent in agents.values()):
-                self._watch_waiters.discard(waiter)
+                self._discard_watch_waiter(waiter, agents)
                 waiter.cancel()
                 continue
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self._watch_waiters.discard(waiter)
+                    self._discard_watch_waiter(waiter, agents)
                     waiter.cancel()
                     return {"woke": [], "timed_out": True, "results": {}}
                 try:
                     await asyncio.wait_for(waiter, timeout=remaining)
                 except asyncio.TimeoutError:
+                    # The deadline and terminal callback can race. Durable
+                    # state wins over a timeout at the same instant.
+                    if any(actionable(agent) for agent in agents.values()):
+                        continue
                     return {"woke": [], "timed_out": True, "results": {}}
                 finally:
-                    self._watch_waiters.discard(waiter)
+                    self._discard_watch_waiter(waiter, agents)
             else:
                 try:
                     await waiter
                 finally:
-                    self._watch_waiters.discard(waiter)
+                    self._discard_watch_waiter(waiter, agents)
 
     @staticmethod
     def _compact_watch_result(detailed: dict) -> dict:
@@ -536,6 +678,7 @@ class Agentd:
     def list(self, params: dict | None = None) -> dict:
         params = params or {}
         include_task = bool(params.get("include_task", False))
+        pending_only = bool(params.get("pending_only", False))
         owner_id = str(params.get("owner_id") or "")
         with self._lock:
             items = [
@@ -545,6 +688,17 @@ class Agentd:
         sessions = []
         for sid, a in items:
             status = common.agent_status(a)
+            unobserved_terminal = (
+                status != "running"
+                and bool(a.stop_reason)
+                and not bool(getattr(a, "_terminal_observed", False))
+            )
+            if pending_only and not (
+                status == "running"
+                or a._pending_permission is not None
+                or unobserved_terminal
+            ):
+                continue
             persisted = os.path.join(common.reasonix_home(), "sessions", f"{sid}.jsonl")
             session = {
                 "session_id": sid,
