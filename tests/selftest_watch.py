@@ -396,6 +396,30 @@ async def check_poll_does_not_steal_watch_terminal() -> None:
         daemon._active_watch_sessions.clear()
 
 
+def check_resume_is_idempotent_for_live_agent() -> None:
+    daemon = Agentd()
+    agent = watch_agent("already-live")
+    agent.cwd = "/tmp/already-live"
+    daemon._registry[agent.session_id] = agent
+    result = daemon.resume({
+        "session_id": agent.session_id,
+        "owner_id": agent.owner_id,
+        "cwd": "/tmp/ignored-new-cwd",
+    })
+    assert result == {
+        "session_id": agent.session_id,
+        "status": "running",
+        "cwd": agent.cwd,
+        "already_live": True,
+        "resumed": False,
+        "note": (
+            "session already has a live agent process; use watch/poll/send "
+            "instead of starting another ACP process"
+        ),
+    }, result
+    assert daemon._registry[agent.session_id] is agent
+
+
 async def check_event_driven_wait() -> None:
     daemon = Agentd()
     first_agent = watch_agent("wait-first")
@@ -443,6 +467,7 @@ async def main() -> None:
     await check_read_retry()
     await check_targeted_watch_wakeups()
     await check_poll_does_not_steal_watch_terminal()
+    check_resume_is_idempotent_for_live_agent()
     await check_event_driven_wait()
     check_pending_permission_is_durable()
     daemon = Agentd()

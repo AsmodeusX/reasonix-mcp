@@ -339,6 +339,22 @@ class Agentd:
             existing = self._registry.get(session_id)
         if existing is not None and getattr(existing, "owner_id", "") != owner_id:
             raise AgentdError(f"unknown session_id {session_id!r} — it belongs to another orchestrator")
+        if existing is not None and common.agent_status(existing) != "exited":
+            # Resume is a recovery operation, but callers can race daemon
+            # reconnect/list recovery and invoke it for a process that never
+            # died. Treat that as success instead of opening a second ACP
+            # process, which Reasonix correctly rejects as "session in use".
+            return {
+                "session_id": session_id,
+                "status": common.agent_status(existing),
+                "cwd": getattr(existing, "cwd", None) or cwd or os.getcwd(),
+                "already_live": True,
+                "resumed": False,
+                "note": (
+                    "session already has a live agent process; use watch/poll/send "
+                    "instead of starting another ACP process"
+                ),
+            }
         if existing is None:
             persisted = os.path.join(common.reasonix_home(), "sessions", f"{session_id}.jsonl")
             if not os.path.isfile(persisted):
@@ -372,6 +388,8 @@ class Agentd:
             "session_id": session_id,
             "status": common.agent_status(agent),
             "cwd": cwd,
+            "already_live": False,
+            "resumed": True,
             "note": "session resumed from its persisted transcript; send/poll work as before",
         }
 

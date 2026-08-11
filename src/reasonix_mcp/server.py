@@ -35,7 +35,9 @@ MCP_INSTRUCTIONS = """Reasonix is an agent-orchestration MCP server backed by a
 detached agent daemon. Use reasonix_spawn once per child task and retain each
 session_id. Agents keep running even if this MCP server (or the MCP host —
 Claude Code, Codex, …) restarts — reasonix_list shows the fleet, reasonix_resume revives a session
-whose process died. For multiple children keep one reasonix_watch call in
+whose process died. Never resume a running or idle session; resume is
+idempotent and returns already_live=true if recovery races a live process. For
+multiple children keep one reasonix_watch call in
 flight with all ids; it returns compact results for completion, permission,
 or process death without a follow-up poll. Keep one watch per orchestrator
 fleet; a newer overlapping watch safely supersedes an older abandoned call, so
@@ -546,11 +548,35 @@ async def reasonix_resume(
     ctx: Context | None = None,
 ) -> dict:
     """Revive a session whose process died (after a daemon restart, a crash,
-    or reasonix_stop — history is persisted on disk). Opens a fresh ACP
-    process and session/resume's the stored session; poll/send work as before.
+    or reasonix_stop — history is persisted on disk). This is idempotent: a
+    running/idle session returns already_live=true without opening a second
+    ACP process. Poll/send/watch the existing process in that case.
     """
     _capture_relay_ctx(ctx)
     _require_owned(session_id)
+    # This front-end guard also protects sessions held by an older daemon that
+    # predates idempotent resume. The daemon repeats the check to close the
+    # list/resume race once it reloads.
+    listing = await _rpc("list", {})
+    existing = next(
+        (
+            session for session in listing.get("sessions", [])
+            if session.get("session_id") == session_id
+        ),
+        None,
+    )
+    if existing is not None and existing.get("status") != "exited":
+        return {
+            "session_id": session_id,
+            "status": existing.get("status"),
+            "cwd": existing.get("cwd") or cwd,
+            "already_live": True,
+            "resumed": False,
+            "note": (
+                "session already has a live agent process; use watch/poll/send "
+                "instead of starting another ACP process"
+            ),
+        }
     result = await _rpc("resume", {
         "session_id": session_id, "cwd": cwd,
         "keep_alive": keep_alive, "idle_timeout": idle_timeout,
