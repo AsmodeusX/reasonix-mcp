@@ -102,8 +102,11 @@ MCP_RESTART_EXIT_CODE = 75
 
 _agentd_reader: asyncio.StreamReader | None = None
 _agentd_writer: asyncio.StreamWriter | None = None
-_agentd_cancel_supported = False
+_agentd_cancel_supported: bool | None = None
+_agentd_connect_lock: asyncio.Lock | None = None
+_agentd_probe_task: asyncio.Task | None = None
 _pending: dict[int, asyncio.Future] = {}
+_pending_writers: dict[int, asyncio.StreamWriter] = {}
 _next_id = itertools.count(1)
 _mcp_session = None  # captured on first tool call, used to relay daemon pushes
 _elicitation_tasks: dict[str, asyncio.Task] = {}
@@ -128,30 +131,49 @@ async def _start_agentd(sock: str) -> None:
 
 async def _ensure_agentd() -> None:
     global _agentd_reader, _agentd_writer, _agentd_cancel_supported
-    if _agentd_writer is not None and not _agentd_writer.is_closing():
+    global _agentd_connect_lock, _agentd_probe_task
+    current_task = asyncio.current_task()
+    if (
+        _agentd_writer is not None
+        and not _agentd_writer.is_closing()
+        and (_agentd_cancel_supported is not None or current_task is _agentd_probe_task)
+    ):
         return
-    sock = common.agentd_sock_path()
-    try:
-        reader, writer = await asyncio.open_unix_connection(sock)
-    except OSError:
-        await _start_agentd(sock)
-        for _ in range(100):  # up to ~10s for the daemon to bind
+    if _agentd_connect_lock is None:
+        _agentd_connect_lock = asyncio.Lock()
+    async with _agentd_connect_lock:
+        if (
+            _agentd_writer is not None
+            and not _agentd_writer.is_closing()
+            and _agentd_cancel_supported is not None
+        ):
+            return
+        if _agentd_writer is None or _agentd_writer.is_closing():
+            sock = common.agentd_sock_path()
             try:
                 reader, writer = await asyncio.open_unix_connection(sock)
-                break
             except OSError:
-                await asyncio.sleep(0.1)
-        else:
-            raise RuntimeError(f"agentd did not start on {sock} — see agentd.log")
-    _agentd_reader, _agentd_writer = reader, writer
-    asyncio.create_task(_read_agentd(reader, writer))
-    # Detect daemons from before request cancellation existed. During a rolling
-    # source update they may remain alive to preserve running agents.
-    try:
-        state = await _rpc("ping", {}, timeout=5.0)
-        _agentd_cancel_supported = bool(state.get("cancel_request"))
-    except Exception:
-        _agentd_cancel_supported = False
+                await _start_agentd(sock)
+                for _ in range(100):  # up to ~10s for the daemon to bind
+                    try:
+                        reader, writer = await asyncio.open_unix_connection(sock)
+                        break
+                    except OSError:
+                        await asyncio.sleep(0.1)
+                else:
+                    raise RuntimeError(f"agentd did not start on {sock} — see agentd.log")
+            _agentd_reader, _agentd_writer = reader, writer
+            _agentd_cancel_supported = None
+            asyncio.create_task(_read_agentd(reader, writer))
+        # Detect daemons from before request cancellation existed. Do not let
+        # concurrent RPCs use the connection until this probe has completed:
+        # an unknown capability used to make cancellation close a new socket.
+        _agentd_probe_task = current_task
+        try:
+            state = await _rpc("ping", {}, timeout=5.0, _retry_disconnect=False)
+            _agentd_cancel_supported = bool(state.get("cancel_request"))
+        finally:
+            _agentd_probe_task = None
 
 
 async def _read_agentd(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -167,26 +189,47 @@ async def _read_agentd(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 continue
             if "id" in msg:
                 fut = _pending.pop(msg["id"], None)
+                _pending_writers.pop(msg["id"], None)
                 if fut is not None and not fut.done():
                     fut.set_result(msg)
             elif msg.get("method") == "agent_event":
                 await _relay_agent_event(msg.get("params") or {})
+    except (ConnectionError, asyncio.IncompleteReadError):
+        pass
     finally:
-        # The daemon died (its agents died with it): fail in-flight requests.
-        for fut in _pending.values():
+        # Fail only requests sent through this connection. An old reader can
+        # finish after a replacement is already carrying new RPCs.
+        for rid, fut in list(_pending.items()):
+            if _pending_writers.get(rid) is not writer:
+                continue
+            _pending.pop(rid, None)
+            _pending_writers.pop(rid, None)
             if not fut.done():
-                fut.set_result({"error": {"code": -32000, "message": "agentd disconnected (its agents exited)"}})
-        _pending.clear()
+                fut.set_result({
+                    "error": {
+                        "code": -32001,
+                        "message": "agentd connection closed; agents may still be running",
+                    }
+                })
         # An old reader can finish after a replacement connection is already
         # installed. Do not let it clear the replacement writer.
         if _agentd_reader is reader:
             _agentd_reader = None
         if _agentd_writer is writer:
             _agentd_writer = None
-            _agentd_cancel_supported = False
+            _agentd_cancel_supported = None
 
 
-async def _rpc(method: str, params: dict, timeout: float | None = _rpc_default_timeout) -> dict:
+_DISCONNECT_RETRY_METHODS = {"list", "models", "ping", "poll", "transcript", "wait"}
+
+
+async def _rpc(
+    method: str,
+    params: dict,
+    timeout: float | None = _rpc_default_timeout,
+    *,
+    _retry_disconnect: bool = True,
+) -> dict:
     params = dict(params)
     params.setdefault("owner_id", _owner_id)
     await _ensure_agentd()
@@ -194,29 +237,43 @@ async def _rpc(method: str, params: dict, timeout: float | None = _rpc_default_t
     fut = asyncio.get_running_loop().create_future()
     _pending[rid] = fut
     writer = _agentd_writer
+    if writer is None:
+        _pending.pop(rid, None)
+        raise RuntimeError("agentd connection unavailable after startup")
+    _pending_writers[rid] = writer
     frame = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}) + "\n"
     try:
         writer.write(frame.encode())
         await writer.drain()
     except asyncio.CancelledError:
         _pending.pop(rid, None)
+        _pending_writers.pop(rid, None)
         _cancel_agentd_request(writer, rid)
         raise
     except Exception as e:
         _pending.pop(rid, None)
+        _pending_writers.pop(rid, None)
         raise RuntimeError(f"agentd connection failed: {e}") from e
     try:
         msg = await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.CancelledError:
         _pending.pop(rid, None)
+        _pending_writers.pop(rid, None)
         _cancel_agentd_request(writer, rid)
         raise
     except asyncio.TimeoutError:
         _pending.pop(rid, None)
+        _pending_writers.pop(rid, None)
         _cancel_agentd_request(writer, rid)
         raise RuntimeError(f"agentd timed out on {method} after {timeout}s") from None
     if msg.get("error"):
         err = msg["error"]
+        if (
+            err.get("code") == -32001
+            and _retry_disconnect
+            and method in _DISCONNECT_RETRY_METHODS
+        ):
+            return await _rpc(method, params, timeout=timeout, _retry_disconnect=False)
         raise ValueError(err.get("message", "agentd error"))
     return msg.get("result", {})
 
@@ -240,7 +297,7 @@ def _cancel_agentd_request(writer: asyncio.StreamWriter, request_id: int) -> Non
         writer.write(frame.encode())
     except Exception:
         pass
-    if not _agentd_cancel_supported:
+    if _agentd_cancel_supported is False:
         # Rolling-upgrade fallback: an older daemon ignores cancel_request.
         # Closing only this orchestrator's daemon connection makes its existing
         # client-loop cleanup cancel stale calls while all agents keep running.

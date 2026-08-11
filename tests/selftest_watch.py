@@ -48,6 +48,152 @@ class BlockingDrainWriter(RecordingWriter):
         await asyncio.Event().wait()
 
 
+class EOFReader:
+    async def readline(self) -> bytes:
+        return b""
+
+
+class ResetReader:
+    async def readline(self) -> bytes:
+        raise ConnectionResetError("test reset")
+
+
+class RetryWriter(RecordingWriter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def write(self, data: bytes) -> None:
+        super().write(data)
+        frame = self.frames[-1]
+        if frame.get("method") != "poll" or "id" not in frame:
+            return
+        self.calls += 1
+        rid = frame["id"]
+
+        def respond() -> None:
+            future = mcp_server._pending.pop(rid)
+            mcp_server._pending_writers.pop(rid, None)
+            if self.calls == 1:
+                future.set_result({
+                    "error": {"code": -32001, "message": "connection replaced"}
+                })
+            else:
+                future.set_result({"result": {"status": "running", "retried": True}})
+
+        asyncio.get_running_loop().call_soon(respond)
+
+
+async def check_connection_probe_serialization() -> None:
+    original_open = mcp_server.asyncio.open_unix_connection
+    original_rpc = mcp_server._rpc
+    original_read = mcp_server._read_agentd
+    original_reader = mcp_server._agentd_reader
+    original_writer = mcp_server._agentd_writer
+    original_supported = mcp_server._agentd_cancel_supported
+    original_lock = mcp_server._agentd_connect_lock
+    original_probe = mcp_server._agentd_probe_task
+    probe_started = asyncio.Event()
+    release_probe = asyncio.Event()
+    writer = RecordingWriter()
+    opens = 0
+
+    async def fake_open(_sock: str):
+        nonlocal opens
+        opens += 1
+        return EOFReader(), writer
+
+    async def fake_rpc(method: str, _params: dict, **_kwargs) -> dict:
+        assert method == "ping", method
+        probe_started.set()
+        await release_probe.wait()
+        return {"cancel_request": True}
+
+    async def fake_read(_reader, _writer) -> None:
+        return
+
+    mcp_server.asyncio.open_unix_connection = fake_open
+    mcp_server._rpc = fake_rpc
+    mcp_server._read_agentd = fake_read
+    mcp_server._agentd_reader = None
+    mcp_server._agentd_writer = None
+    mcp_server._agentd_cancel_supported = None
+    mcp_server._agentd_connect_lock = None
+    mcp_server._agentd_probe_task = None
+    try:
+        first = asyncio.create_task(mcp_server._ensure_agentd())
+        await probe_started.wait()
+        second = asyncio.create_task(mcp_server._ensure_agentd())
+        await asyncio.sleep(0)
+        assert not second.done(), "concurrent RPC escaped before capability probe"
+        release_probe.set()
+        await asyncio.gather(first, second)
+        assert opens == 1, opens
+        assert mcp_server._agentd_cancel_supported is True
+    finally:
+        mcp_server.asyncio.open_unix_connection = original_open
+        mcp_server._rpc = original_rpc
+        mcp_server._read_agentd = original_read
+        mcp_server._agentd_reader = original_reader
+        mcp_server._agentd_writer = original_writer
+        mcp_server._agentd_cancel_supported = original_supported
+        mcp_server._agentd_connect_lock = original_lock
+        mcp_server._agentd_probe_task = original_probe
+
+
+async def check_old_reader_isolation() -> None:
+    original_reader = mcp_server._agentd_reader
+    original_writer = mcp_server._agentd_writer
+    original_supported = mcp_server._agentd_cancel_supported
+    old_writer = RecordingWriter()
+    new_writer = RecordingWriter()
+    new_reader = object()
+    old_future = asyncio.get_running_loop().create_future()
+    new_future = asyncio.get_running_loop().create_future()
+    mcp_server._agentd_reader = new_reader
+    mcp_server._agentd_writer = new_writer
+    mcp_server._agentd_cancel_supported = True
+    mcp_server._pending[9001] = old_future
+    mcp_server._pending_writers[9001] = old_writer
+    mcp_server._pending[9002] = new_future
+    mcp_server._pending_writers[9002] = new_writer
+    try:
+        await mcp_server._read_agentd(EOFReader(), old_writer)
+        assert (await old_future)["error"]["code"] == -32001
+        assert not new_future.done(), "old reader failed a replacement connection's RPC"
+        assert mcp_server._pending.get(9002) is new_future
+    finally:
+        mcp_server._pending.pop(9001, None)
+        mcp_server._pending_writers.pop(9001, None)
+        mcp_server._pending.pop(9002, None)
+        mcp_server._pending_writers.pop(9002, None)
+        new_future.cancel()
+        mcp_server._agentd_reader = original_reader
+        mcp_server._agentd_writer = original_writer
+        mcp_server._agentd_cancel_supported = original_supported
+
+
+async def check_read_retry() -> None:
+    original_ensure = mcp_server._ensure_agentd
+    original_writer = mcp_server._agentd_writer
+    original_supported = mcp_server._agentd_cancel_supported
+    writer = RetryWriter()
+
+    async def connected() -> None:
+        mcp_server._agentd_writer = writer
+
+    mcp_server._ensure_agentd = connected
+    mcp_server._agentd_cancel_supported = True
+    try:
+        result = await mcp_server._rpc("poll", {"session_id": "retry-me"})
+        assert result == {"status": "running", "retried": True}, result
+        assert writer.calls == 2, writer.calls
+    finally:
+        mcp_server._ensure_agentd = original_ensure
+        mcp_server._agentd_writer = original_writer
+        mcp_server._agentd_cancel_supported = original_supported
+
+
 async def check_server_cancellation() -> None:
     original_ensure = mcp_server._ensure_agentd
     original_writer = mcp_server._agentd_writer
@@ -123,8 +269,15 @@ async def check_agentd_wire_cancellation(agent: SimpleNamespace) -> None:
     assert not daemon._watch_waiters, daemon._watch_waiters
     assert not daemon._active_watch_sessions, daemon._active_watch_sessions
 
+    reset_writer = RecordingWriter()
+    await daemon.client_loop(ResetReader(), reset_writer)
+    assert reset_writer.closed
+
 
 async def main() -> None:
+    await check_connection_probe_serialization()
+    await check_old_reader_isolation()
+    await check_read_retry()
     daemon = Agentd()
     agent = SimpleNamespace(
         session_id="agent-watch",

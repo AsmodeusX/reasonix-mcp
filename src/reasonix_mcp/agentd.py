@@ -819,6 +819,11 @@ class Agentd:
                             requests.pop(rid, None)
 
                     task.add_done_callback(discard)
+        except (ConnectionError, asyncio.IncompleteReadError):
+            # MCP front-ends can close their daemon socket while replacing a
+            # canceled request or restarting. Normal connection teardown is
+            # not a daemon failure and should not produce an unhandled trace.
+            pass
         finally:
             pending_requests = list(requests.values())
             for task in pending_requests:
