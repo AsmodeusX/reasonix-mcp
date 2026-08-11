@@ -203,10 +203,12 @@ env-overridable (`REASONIX_MCP_DEFAULT_MODEL`, `REASONIX_MCP_DEFAULT_EFFORT`,
 **Model selection**: pass `reasonix_spawn(model="<provider>/<model>", ...)` to
 pick the agent's model per call — `reasonix_models()` lists the valid refs and
 each model's `supported_efforts` (effort is per-model: e.g. `kimi-k3` accepts
-only `high`/`max`; an unsupported value fails at spawn). Some gateway models
-bake effort into the id (`omniroute/codex/gpt-5.6-luna-{low,medium,high,xhigh,
-max}`): they advertise no `effort` config option, so spawn skips it and
-reports `skipped_options` in the result — pick the variant id instead.
+only `high`/`max`; an unsupported value fails at spawn). OpenAI-compatible
+proxy providers must opt into effort with `reasoning_protocol = "openai"`,
+`supported_efforts = [...]`, and `default_effort = "..."` at provider or
+model-override scope. Some gateways instead bake effort into variant model IDs;
+only those gateways should be selected by suffix. If neither mechanism is
+configured, spawn reports `effort` in `skipped_options`.
 
 `reasonix_send` is **forced steer**: a message is always delivered — queued as
 mid-turn guidance while a turn is running, or submitted as a new turn if the
@@ -218,7 +220,7 @@ was steered into a running turn.
 | Option | Values |
 | --- | --- |
 | `model` | any configured `provider/model`, e.g. `opencode-go/deepseek-v4-flash` |
-| `effort` | `auto` · `disabled` · `high` · `max` |
+| `effort` | Model-advertised values: `auto` · `disabled` · `low` · `medium` · `high` · `xhigh` · `max` |
 | `work_mode` | `economy` (lean tool surface) · `balanced` (complete default) · `delivery` (requires acceptance criteria + review/verification evidence) |
 | `tool_approval` | `ask` · `auto` · `yolo` (default) |
 

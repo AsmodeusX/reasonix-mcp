@@ -523,7 +523,8 @@ async def reasonix_spawn(
     tool_approval=yolo (env-overridable REASONIX_MCP_DEFAULT_*). Completed
     agents are cleaned up after an idle grace period; set keep_alive=true for
     an interactive session that needs follow-up turns. work_mode:
-    economy|balanced|delivery; effort: auto|disabled|high|max; tool_approval:
+    economy|balanced|delivery; effort values are model-advertised and can
+    include auto|disabled|low|medium|high|xhigh|max; tool_approval:
     ask|auto|yolo. `cwd` is confined to the project dir + [sandbox] allow_write
     (escape: REASONIX_MCP_ALLOW_ANY_CWD=1). Returns the effective sandbox
     posture, and `skipped_options` when the selected model does not advertise

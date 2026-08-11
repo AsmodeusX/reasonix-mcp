@@ -435,6 +435,9 @@ def available_models() -> dict:
                 "price": dict(prov.get("price") or {}),
                 "prices": dict(prov.get("prices") or {}),
                 "context_window": prov.get("context_window"),
+                "reasoning_protocol": prov.get("reasoning_protocol"),
+                "supported_efforts": list(prov.get("supported_efforts") or []),
+                "default_effort": prov.get("default_effort"),
             }
         for model_ref, meta in (cfg.get("model_overrides") or {}).items():
             if isinstance(meta, dict):
@@ -457,11 +460,17 @@ def available_models() -> dict:
                 or {}
             )
             entry: dict = {"ref": ref, "provider": name, "model": m, "default": ref == f"{name}/{prov['default']}"}
-            efforts = meta.get("supported_efforts")
+            efforts = meta.get("supported_efforts") or prov.get("supported_efforts")
             if efforts:
                 entry["supported_efforts"] = list(efforts)
-            if meta.get("default_effort"):
-                entry["default_effort"] = str(meta["default_effort"])
+            default_effort = meta.get("default_effort") or prov.get("default_effort")
+            if default_effort:
+                entry["default_effort"] = str(default_effort)
+            reasoning_protocol = (
+                meta.get("reasoning_protocol") or prov.get("reasoning_protocol")
+            )
+            if reasoning_protocol:
+                entry["reasoning_protocol"] = str(reasoning_protocol)
             if meta.get("context_window"):
                 entry["context_window"] = int(meta["context_window"])
             elif prov.get("context_window"):
@@ -474,7 +483,9 @@ def available_models() -> dict:
     return {
         "default_model": default_model,
         "models": models,
-        "effort_options": ["auto", "disabled", "high", "max"],
+        "effort_options": [
+            "auto", "disabled", "low", "medium", "high", "xhigh", "max",
+        ],
         "config_files": reasonix_config_files(),
         "note": "Pass a model 'ref' (provider/model) to reasonix_spawn(model=...).",
     }

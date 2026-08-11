@@ -324,11 +324,20 @@ class Agentd:
         notes = getattr(agent, "spawn_notes", None) or {}
         if notes.get("skipped_options"):
             result["skipped_options"] = notes["skipped_options"]
-            result["skipped_options_note"] = (
-                "these config options are not advertised by the selected model and "
-                "were not applied (e.g. effort is often baked into the model id — "
-                "pick a -low/-high/-max variant instead)"
-            )
+            if "effort" in notes["skipped_options"]:
+                result["skipped_options_note"] = (
+                    "effort was not advertised by the selected model and was not "
+                    "applied. For an OpenAI-compatible proxy, configure "
+                    "reasoning_protocol='openai', supported_efforts, and "
+                    "default_effort on the provider/model override. Use a model-name "
+                    "effort variant only when that gateway actually encodes effort "
+                    "in model IDs"
+                )
+            else:
+                result["skipped_options_note"] = (
+                    "these config options were not advertised by the selected model "
+                    "and were not applied"
+                )
         return result
 
     def resume(self, params: dict) -> dict:
