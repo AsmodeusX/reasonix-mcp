@@ -690,7 +690,7 @@ class Agentd:
         cached = self._cached_delivery("poll", params)
         if cached is not None:
             return cached
-        result = common.shape_poll(
+        detailed = common.shape_poll(
             agent,
             include_events=params.get("include_events"),
             exclude_events=params.get("exclude_events"),
@@ -698,6 +698,15 @@ class Agentd:
             include_full=params.get("include_full", common.DEFAULT_INCLUDE_FULL),
             max_events=params.get("max_events"),
         )
+        verbose = bool(
+            params.get("detail", False)
+            or params.get("include_events") is not None
+            or params.get("exclude_events") is not None
+            or params.get("include_thought", common.DEFAULT_INCLUDE_THOUGHT)
+            or params.get("include_full", common.DEFAULT_INCLUDE_FULL)
+            or params.get("max_events") is not None
+        )
+        result = detailed if verbose else self._compact_poll_result(detailed)
         if (
             result.get("status") != "running"
             and result.get("stop_reason")
@@ -856,6 +865,9 @@ class Agentd:
                         "session_id": sid,
                         "owner_id": owner_id,
                         "_watch_delivery": True,
+                        # Watch consumes detail internally before applying its
+                        # own terminal-result compaction below.
+                        "detail": True,
                         "include_events": params.get("include_events"),
                         "exclude_events": params.get("exclude_events"),
                         "include_thought": params.get("include_thought", common.DEFAULT_INCLUDE_THOUGHT),
@@ -906,24 +918,20 @@ class Agentd:
                     self._discard_watch_waiter(waiter, agents)
 
     @staticmethod
-    def _compact_watch_result(detailed: dict) -> dict:
+    def _bounded_message(message: str, label: str) -> tuple[str, bool]:
+        return common.bounded_orchestrator_message(message, label)
+
+    @classmethod
+    def _compact_poll_result(cls, detailed: dict) -> dict:
+        """Reduce an ordinary poll to state needed for orchestration."""
+        return common.compact_poll_result(detailed)
+
+    @classmethod
+    def _compact_watch_result(cls, detailed: dict) -> dict:
         """Reduce a consumed poll result to one context-lean outcome."""
         turns = detailed.get("turns") or []
         message = str(turns[-1].get("text") or "") if turns else str(detailed.get("text") or "")
-        limit = max(0, common.MAX_WATCH_MESSAGE)
-        message_truncated = len(message) > limit
-        if message_truncated:
-            if limit == 0:
-                message = ""
-            else:
-                marker = "\n…[watch message truncated]…\n"
-                available = max(0, limit - len(marker))
-                head = available // 2
-                tail = available - head
-                message = (
-                    marker[:limit] if not available
-                    else message[:head] + marker + message[-tail:]
-                )
+        message, message_truncated = cls._bounded_message(message, "watch message")
         result = {
             "session_id": detailed.get("session_id"),
             "status": detailed.get("status"),

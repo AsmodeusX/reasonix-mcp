@@ -59,8 +59,9 @@ injected into an orchestrator model's conversation. Clients that advertise MCP
 elicitation receive a standard elicitation/create request for permission gates
 and agent questions; the selected option is returned to the child
 automatically. Watch remains authoritative when elicitation is unavailable,
-declined, or canceled. reasonix_poll is for explicit snapshots and
-reasonix_wait is the legacy event-driven, output-sensitive long poll.
+declined, or canceled. reasonix_poll provides explicit snapshots and is compact
+by default; use detail=true only for diagnostics. reasonix_wait is the legacy
+event-driven, output-sensitive long poll.
 Use reasonix_configure to switch model/effort/work mode/approval. An active
 turn keeps its current model and applies the queued change before the next
 turn; idle agents apply immediately; exited agents apply it on resume.
@@ -73,7 +74,7 @@ error: reissue one watch for the complete remaining fleet. Codex installations
 should set `mcp_servers.reasonix.tool_timeout_sec` above the longest expected
 agent run (86400 is recommended) so the host does not cut off an indefinite
 watch.
-Set watch detail=true, poll, or read the transcript only when deeper output is
+Set watch/poll detail=true or read the transcript only when deeper output is
 needed. Terminal errors include error_text; watch exposes plan and current_work. The
 daemon and MCP server log event emission/relay results to stderr.
 Lifecycle controls:
@@ -653,6 +654,7 @@ async def reasonix_send(
 @mcp.tool()
 async def reasonix_poll(
     session_id: str,
+    detail: bool = False,
     include_events: list[str] | None = None,
     exclude_events: list[str] | None = None,
     include_thought: bool = common.DEFAULT_INCLUDE_THOUGHT,
@@ -660,22 +662,39 @@ async def reasonix_poll(
     max_events: int | None = None,
     ctx: Context | None = None,
 ) -> dict:
-    """Read recent output the agent produced since the last poll.
+    """Read a context-lean snapshot of recent agent state and output.
 
-    Always returns text (delta), turns (completed, with stop_reason), plan,
-    current_work, events, status, permission_request. Ordinary polls return a small recent
-    event tail; include_events opts event types back in (and gets the larger
-    event cap). Static setup events are filtered by default. thought/full_* are
-    opt-in (include_thought / include_full). Errors include error_text.
+    By default returns status, a capped `message` when new output exists,
+    stop_reason, plan/current_work, pending permission, and errors when present.
+    Set detail=true for the legacy diagnostic shape with text, turns, events,
+    counters, transcript path, and configuration. Existing explicit selectors
+    (include_events/exclude_events/max_events/include_thought/include_full)
+    also opt into that detailed shape. Static setup events remain filtered
+    unless explicitly selected.
     """
     _capture_relay_ctx(ctx)
     _require_owned(session_id)
-    return await _rpc("poll", {
+    result = await _rpc("poll", {
         "session_id": session_id,
+        "detail": detail,
         "include_events": include_events, "exclude_events": exclude_events,
         "include_thought": include_thought, "include_full": include_full,
         "max_events": max_events,
     })
+    verbose = bool(
+        detail
+        or include_events is not None
+        or exclude_events is not None
+        or include_thought
+        or include_full
+        or max_events is not None
+    )
+    # Compatibility with an older shared daemon that is waiting for its
+    # agents to become restart-safe: compact its legacy response here so MCP
+    # hot reload delivers the lean contract immediately.
+    if not verbose and ({"events", "turns", "text"} & result.keys()):
+        return common.compact_poll_result(result)
+    return result
 
 
 @mcp.tool()

@@ -120,14 +120,17 @@ async def main() -> None:
                 # first poll: static boilerplate must be filtered out; if the
                 # 401 turn already ended, turns carries it (consumed here);
                 # thought/full_* are opt-in -> absent by default
-                d = await call(session, "reasonix_poll", {"session_id": sid1})
+                d = await call(session, "reasonix_poll", {
+                    "session_id": sid1,
+                    "detail": True,
+                })
                 types = [e["type"] for e in d["events"]]
                 assert "available_commands_update" not in types and "config_option_update" not in types, types
                 assert d["events_filtered"] >= 1, d
                 for key in ("thought", "full_thought", "full_text"):
                     assert key not in d, f"{key} should be opt-in, got {list(d.keys())}"
                 size = len(json.dumps(d))
-                print(f"first poll: {size} bytes, events={len(d['events'])}, filtered={d['events_filtered']} (was ~31KB before fix; no thought/full_*)")
+                print(f"first detailed poll: {size} bytes, events={len(d['events'])}, filtered={d['events_filtered']} (was ~31KB before static filtering)")
                 if d["status"] == "idle":
                     assert d["turns"] and d["turns"][-1]["stop_reason"] == "error", d
                     print("turns OK at first poll:", d["turns"])
@@ -138,6 +141,15 @@ async def main() -> None:
                 })
                 assert "thought" in d2 and "full_thought" in d2 and "full_text" in d2, list(d2.keys())
                 print("include_thought/include_full opt-in OK")
+
+                lean = await call(session, "reasonix_poll", {"session_id": sid1})
+                noisy = {
+                    "events", "events_dropped", "events_filtered", "turns", "text",
+                    "text_truncated", "transcript_path", "config", "full_text",
+                }
+                assert not (noisy & lean.keys()), lean
+                assert {"session_id", "status", "plan"}.issubset(lean), lean
+                print("ordinary poll compact by default:", len(json.dumps(lean)), "bytes")
 
                 # wait wakes when the 401 turn ends (both idle with stop_reason=error)
                 w = await call(session, "reasonix_wait", {"session_ids": [sid1, sid2], "timeout": 60})

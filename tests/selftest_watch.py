@@ -586,6 +586,44 @@ async def check_configure_persisted_session_without_tombstone() -> None:
                 os.environ["REASONIX_HOME"] = old_home
 
 
+async def check_server_compacts_legacy_daemon_poll() -> None:
+    session_id = "legacy-daemon-poll"
+    original_rpc = mcp_server._rpc
+    original_owned = set(mcp_server._owned_sessions)
+
+    async def legacy_rpc(_method: str, _params: dict, **_kwargs) -> dict:
+        return {
+            "session_id": session_id,
+            "status": "idle",
+            "stop_reason": "end_turn",
+            "text": "done",
+            "text_truncated": False,
+            "turns": [{"text": "done", "stop_reason": "end_turn"}],
+            "plan": [],
+            "current_work": None,
+            "events": [{"type": "large_legacy_event"}],
+            "events_dropped": 0,
+            "events_filtered": 0,
+            "permission_request": None,
+            "config": {"model": "legacy/model"},
+            "pending_config": {},
+            "pending_config_error": None,
+            "transcript_path": "/tmp/legacy.jsonl",
+        }
+
+    mcp_server._rpc = legacy_rpc
+    mcp_server._owned_sessions.add(session_id)
+    try:
+        compact = await mcp_server.reasonix_poll(session_id)
+        assert compact["message"] == "done"
+        assert not ({"events", "turns", "text", "config"} & compact.keys())
+        detailed = await mcp_server.reasonix_poll(session_id, detail=True)
+        assert detailed["events"] and detailed["turns"]
+    finally:
+        mcp_server._rpc = original_rpc
+        mcp_server._owned_sessions = original_owned
+
+
 def check_pending_permission_is_durable() -> None:
     agent = watch_agent("permission-race")
     agent._pending_permission = (17, {
@@ -614,6 +652,7 @@ async def main() -> None:
     await check_configure_queues_active_turn()
     await check_configure_blocks_new_turn_until_applied()
     await check_configure_persisted_session_without_tombstone()
+    await check_server_compacts_legacy_daemon_poll()
     check_pending_permission_is_durable()
     daemon = Agentd()
     agent = SimpleNamespace(
@@ -662,6 +701,35 @@ async def main() -> None:
     assert compact["message_truncated"] is True
     assert len(compact["message"]) <= max(0, common.MAX_WATCH_MESSAGE)
     assert not ({"events", "turns", "text", "thought", "full_text"} & compact.keys())
+
+    poll_compact = daemon._compact_poll_result({
+        "session_id": "compact",
+        "status": "running",
+        "text": long_text,
+        "text_truncated": False,
+        "turns": [],
+        "plan": [{"content": "Implement", "status": "in_progress"}],
+        "current_work": {
+            "source": "plan",
+            "summary": "Implement",
+            "plan_step": {"content": "Implement", "status": "in_progress"},
+        },
+        "permission_request": None,
+        "events": [{"type": "tool_call", "rawInput": "large"}],
+        "events_dropped": 12,
+        "events_filtered": 30,
+        "transcript_path": "/tmp/compact.jsonl",
+        "config": {"model": "large/catalogue"},
+        "pending_config": {},
+        "pending_config_error": None,
+    })
+    assert poll_compact["message_truncated"] is True
+    assert poll_compact["plan"] and poll_compact["current_work"]
+    assert "plan_step" not in poll_compact["current_work"]
+    assert not ({
+        "events", "events_dropped", "events_filtered", "turns", "text",
+        "transcript_path", "config", "permission_request",
+    } & poll_compact.keys()), poll_compact
     print("WATCH CONCURRENCY SELFTEST PASS")
 
 

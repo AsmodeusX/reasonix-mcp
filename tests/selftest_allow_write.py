@@ -68,15 +68,15 @@ async def main() -> None:
                 final = None
                 while time.monotonic() < deadline:
                     d = await call(session, "reasonix_poll", {"session_id": sid})
-                    if d.get("text"):
-                        print("  agent:", d["text"][-160:].replace("\n", " | "))
+                    if d.get("message"):
+                        print("  agent:", d["message"][-160:].replace("\n", " | "))
                     if d["status"] in ("idle", "exited"):
                         final = d
                         break
                     await asyncio.sleep(2)
                 assert final is not None, "turn never ended"
                 print("stop_reason:", final.get("stop_reason"))
-                print("agent said:", "".join(t.get("text", "") for t in final.get("turns", []))[-200:] or "(no turns)")
+                print("agent said:", final.get("message", "")[-200:] or "(no message)")
                 await call(session, "reasonix_stop", {"session_id": sid})
 
         exists = os.path.isfile(PROBE)

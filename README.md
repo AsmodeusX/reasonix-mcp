@@ -28,8 +28,9 @@ shut down (killing the daemon kills its agents — they carry PDEATHSIG).
 - **Spawn** returns a `session_id` immediately; the agent works in the daemon.
 - **Send** steers a running agent *mid-turn* via `_reasonix.io/session/steer`;
   if idle it starts a new turn.
-- **Poll** returns recent output since last poll: text, turns, plan, events,
-  permission requests, stop reason, and terminal error text when applicable.
+- **Poll** returns a compact status, capped message, plan/current work,
+  permission request, stop reason, and terminal error text when applicable.
+  Diagnostic fields are opt-in with `detail=true`.
 - **Cleanup** can stop completed agents after an idle grace period; it is
   disabled by default. Use `keep_alive=true` for interactive follow-up turns.
 - **Resume** revives a stopped/crashed session from its persisted transcript.
@@ -95,7 +96,7 @@ client and verify the server is listed.
 | `reasonix_models()` | List selectable models: `provider/model` refs, default, per-model `supported_efforts`, and `price` hints where configured. |
 | `reasonix_send(session_id, message, expect?)` | Forced steer: queue as mid-turn guidance, or start a new turn if idle. Never dropped. `expect="steer"` refuses to start a new turn. |
 | `reasonix_configure(session_id, model?, effort?, work_mode?, tool_approval?)` | Switch session configuration while preserving history. Idle: immediate. Active: queued before next turn. Exited: persisted for `reasonix_resume`. |
-| `reasonix_poll(session_id, include_events?, exclude_events?, include_thought?, include_full?, max_events?)` | New output / status / completed turns / current `plan` / pending permission request. Static boilerplate is filtered and events are a recent tail by default. |
+| `reasonix_poll(session_id, detail?, include_events?, exclude_events?, include_thought?, include_full?, max_events?)` | Context-lean status / capped message / current plan-work / pending permission. Set `detail=true` for diagnostic events, turns, counters, transcript path, and configuration. |
 | `reasonix_transcript(session_id, max_tool_calls?)` | What the agent actually did: tool calls with args, files touched (write/read/bash), roles, work duration, last text — powers rebase decisions. (Reasonix does not persist token/cost usage; these are activity metrics.) |
 | `reasonix_watch(session_ids, timeout?, detail?, …poll options)` | Primary callback: block indefinitely by default until completion, permission/question, or process death. Returns a compact result; `detail=true` opts into the poll-shaped result. |
 | `reasonix_wait(session_ids, timeout?)` | Legacy event-driven wait until any watched session produces output, finishes a turn, or raises a permission request. |
@@ -242,33 +243,37 @@ A spawned session emits a burst of static setup events
 (`available_commands_update` — 24 slash commands with descriptions — and
 `config_option_update` — the full model catalogue). Unfiltered, that is
 **~31 KB / ~8k tokens per poll** for a 4-byte reply (measured), which kills
-parallel orchestration. By default `reasonix_poll` **omits those two types**
-from `events` (they are implied by spawn and available via `transcript_path`);
-`events_filtered` counts what was omitted. To change the filter:
+parallel orchestration. By default `reasonix_poll` omits the entire diagnostic
+event stream and returns only orchestration state: `status`, a capped `message`
+when output changed, `stop_reason`, `plan`, `current_work`, pending permission,
+and errors. Empty and unchanged metadata is omitted. Use `detail=true` to
+retrieve the prior detailed shape. In that shape, the two static setup types
+are still filtered and `events_filtered` counts what was omitted. To change
+the filter:
 
 - `include_events=["tool_call","tool_call_update","plan"]` — only these
   sessionUpdate types (permission requests are always included);
-- Ordinary polls return a small recent event tail (50 by default; set
+- Detailed polls return a small recent event tail (50 by default; set
   `max_events` to choose another value). `include_events` opts named types
   back in, including static setup types when explicitly named.
 - `exclude_events=[...]` — drop additional types;
 - the orchestrator-relevant set is `tool_call`, `tool_call_update`, `plan`,
   `permission_request`.
 
-Every poll also includes `current_work`: the active native tool call when one
-is running, or the plan step marked `in_progress`. Agents spawned through this
-server receive a small status contract asking them to keep that plan current.
+Poll includes `current_work` when there is active work: either the active
+native tool call or the plan step marked `in_progress`. Agents spawned through
+this server receive a small status contract asking them to keep that plan current.
 It is injected exactly once per persisted session: follow-up turns do not
 repeat it, and resume detects it in session history. Explicit task restrictions
 on tools take precedence.
 
-`turns` in poll results gives completed turns as `[{text, stop_reason}]` —
+`turns` in detailed poll results gives completed turns as `[{text, stop_reason}]` —
 clean turn boundaries (full_text alone concatenates turns).
 
 **Thought and `full_*` are opt-in.** Reasoning is the bulk of what effort=max
-models emit, so `reasonix_poll` does **not** return `thought` / `full_thought` /
-`full_text` by default — it returns only what changed (`text` delta, `turns`,
-events, status). They stay accumulated server-side and are available on demand:
+models emit, so ordinary `reasonix_poll` does **not** return `thought`,
+`full_thought`, `full_text`, `text`, `turns`, or events. Accumulated output
+stays server-side and is available on demand:
 
 - `include_thought=True` → `thought` (delta) + `full_thought`
 - `include_full=True` → `full_text` (whole conversation; `turns` usually
@@ -297,7 +302,8 @@ the cuts are reported, never silent:
 | Field | Limit (env override) |
 | --- | --- |
 | `events` | recent tail (50 by default; explicit cap 200) — `events_dropped` counts the cut |
-| `text` | last `MAX_DELTA_TEXT` (100k) chars — `text_truncated` |
+| compact poll `message` | first/last `MAX_WATCH_MESSAGE` (4k) chars — `message_truncated` |
+| detailed `text` | last `MAX_DELTA_TEXT` (100k) chars — `text_truncated` |
 | compact watch `message` | first/last `MAX_WATCH_MESSAGE` (4k) chars — `message_truncated` |
 | `thought` / `full_thought` (only with `include_thought`) | last `MAX_FULL_TEXT` (200k) chars — `*_truncated` |
 | `full_text` (only with `include_full`) | last `MAX_FULL_TEXT` (200k) chars — `full_text_truncated` |
@@ -419,12 +425,12 @@ loops, implementing across many files. The bridge is built for that:
 - **No default timeout.** A turn runs until it finishes or you call
   `reasonix_stop` (cancels the turn, closes the session, kills the process).
 - **You can come back anytime.** `reasonix_poll` reports `status: "running"`
-  with everything new since your last poll — leave it for an hour, then check
-  again. `reasonix_send` steers even mid-turn.
+  with a capped new message and current plan/work — leave it for an hour, then
+  check again. `reasonix_send` steers even mid-turn.
 - **Memory is bounded.** Unpolled chunk events are capped in the server; poll
-  results cap `text`/`thought`/`full_text` and the structured `events` list
-  (tails kept, `*_truncated` / `events_dropped` flags report the cut) so a
-  long gap can't blow up the MCP host's context.
+  caps compact messages, while opt-in detailed results cap
+  `text`/`thought`/`full_text` and the structured `events` list (tails kept,
+  `*_truncated` / `events_dropped` report the cut).
 
 One constraint, now mostly lifted: agents live in the **daemon**, not the MCP
 server — the MCP host can close and come back and the fleet is still running

@@ -78,7 +78,7 @@ class RawMCP:
     def wait_idle(self, sid, timeout=180.0):
         dl = time.monotonic() + timeout
         while time.monotonic() < dl:
-            d = self.tool("reasonix_poll", {"session_id": sid})
+            d = self.tool("reasonix_poll", {"session_id": sid, "detail": True})
             if d["status"] in ("idle", "exited"):
                 return d
             time.sleep(2)
@@ -131,7 +131,7 @@ def main() -> None:
         assert sid in by_id, f"lost session after reconnect: {list(by_id)}"
         print("reconnect: reasonix_list sees the agent:", by_id[sid]["status"])
 
-        d = b.tool("reasonix_poll", {"session_id": sid})
+        d = b.tool("reasonix_poll", {"session_id": sid, "detail": True})
         assert d["status"] in ("running", "idle"), d
         if d["status"] != "idle":
             d = b.wait_idle(sid)

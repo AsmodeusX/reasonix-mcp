@@ -124,7 +124,7 @@ def main() -> None:
                 break
             time.sleep(2)
         assert final, "agent never finished after the answer"
-        text = "".join(t.get("text", "") for t in final.get("turns", []))
+        text = final.get("message", "")
         print("stop_reason:", final.get("stop_reason"), "| agent reply:", text[:120])
         assert "A" in text, f"agent did not acknowledge the chosen label: {text!r}"
         call_tool("reasonix_stop", {"session_id": sid}, 6)

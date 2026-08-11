@@ -741,3 +741,61 @@ def shape_poll(
         result["error"] = agent.last_error
         result["error_text"] = getattr(agent, "last_error_text", "") or error_text(agent.last_error)
     return result
+
+
+def bounded_orchestrator_message(message: str, label: str) -> tuple[str, bool]:
+    """Keep the useful beginning and outcome of a long agent message."""
+    limit = max(0, MAX_WATCH_MESSAGE)
+    if len(message) <= limit:
+        return message, False
+    if limit == 0:
+        return "", True
+    marker = f"\n…[{label} truncated]…\n"
+    available = max(0, limit - len(marker))
+    if not available:
+        return marker[:limit], True
+    head = available // 2
+    tail = available - head
+    return message[:head] + marker + message[-tail:], True
+
+
+def compact_poll_result(detailed: dict) -> dict:
+    """Reduce a detailed/legacy poll response to orchestration state."""
+    turns = detailed.get("turns") or []
+    message = (
+        str(turns[-1].get("text") or "")
+        if turns
+        else str(detailed.get("text") or "")
+    )
+    message, message_truncated = bounded_orchestrator_message(
+        message, "poll message"
+    )
+    result = {
+        "session_id": detailed.get("session_id"),
+        "status": detailed.get("status"),
+        "plan": detailed.get("plan") or [],
+    }
+    for key in ("stop_reason", "permission_request"):
+        if detailed.get(key) is not None:
+            result[key] = detailed[key]
+    if detailed.get("current_work") is not None:
+        current_work = dict(detailed["current_work"])
+        current_work.pop("plan_step", None)
+        result["current_work"] = current_work
+    if message:
+        result["message"] = message
+    if message_truncated or detailed.get("text_truncated"):
+        result["message_truncated"] = True
+    if detailed.get("pending_config"):
+        result["pending_config"] = detailed["pending_config"]
+    if detailed.get("pending_config_error"):
+        result["pending_config_error"] = detailed["pending_config_error"]
+    if detailed.get("error") is not None:
+        error_message = str(detailed.get("error_text") or detailed["error"])
+        error_message, error_truncated = bounded_orchestrator_message(
+            error_message, "poll error"
+        )
+        result["error_text"] = error_message
+        if error_truncated:
+            result["error_truncated"] = True
+    return result

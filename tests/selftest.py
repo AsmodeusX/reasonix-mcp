@@ -62,8 +62,8 @@ async def wait_idle(session, sid: str, what: str, timeout: float = TURN_TIMEOUT)
     last = None
     while time.monotonic() < deadline:
         r = await call(session, "reasonix_poll", {"session_id": sid})
-        if r.get("text") or r.get("thought"):
-            print(f"  [{what}] text={r.get('text', '')[:120]!r} status={r.get('status')}")
+        if r.get("message"):
+            print(f"  [{what}] message={r['message'][:120]!r} status={r.get('status')}")
         if r.get("status") in ("idle", "exited"):
             return r
         await asyncio.sleep(POLL_INTERVAL)
@@ -102,8 +102,7 @@ async def _run(env: dict) -> None:
             print("spawned:", r)
 
             r = await wait_idle(session, sid, "first turn")
-            turns = r.get("turns", [])
-            assert turns and "PONG" in turns[-1]["text"], f"expected PONG, got {turns!r}"
+            assert "PONG" in r.get("message", ""), f"expected PONG, got {r!r}"
             assert r.get("stop_reason") == "end_turn", r
             # thought/full_* are opt-in now: absent by default
             for key in ("thought", "full_thought", "full_text"):
@@ -117,8 +116,7 @@ async def _run(env: dict) -> None:
             print("send:", r)
 
             r = await wait_idle(session, sid, "second turn")
-            turns = r.get("turns", [])
-            assert turns and "STEERED" in turns[-1]["text"], f"expected STEERED, got {turns!r}"
+            assert "STEERED" in r.get("message", ""), f"expected STEERED, got {r!r}"
             print("second turn OK")
 
             # opt-in: include_thought / include_full surface the accumulators
