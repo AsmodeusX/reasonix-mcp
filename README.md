@@ -230,6 +230,14 @@ turn. For a stopped/exited agent, configure first and then call
 configuration is persisted in a per-session sidecar so daemon/MCP restarts do
 not lose it.
 
+The same tool changes `tool_approval` (`ask`, `auto`, or `yolo`) at any point.
+Idle agents change immediately; active agents use the new mode from their next
+turn. To avoid deadlock, changing `ask` to `yolo` while a tool permission is
+pending selects its non-persistent `allow_once` option and auto-allows further
+tool gates for the remainder of that turn. It never answers an agent's explicit
+question (`kind="other"`). Changing to `auto` leaves an existing decision
+pending because automatic policy is not equivalent to unconditional approval.
+
 | Option | Values |
 | --- | --- |
 | `model` | any configured `provider/model`, e.g. `opencode-go/deepseek-v4-flash` |
@@ -322,8 +330,9 @@ commands and write outside cwd. Note Reasonix semantics: `bash = "off"` means
 **unconfined** (execution allowed), while `bash = "enforce"` jails commands in
 bubblewrap when available. The clearer posture names are `sandbox = "bwrap"`
 or `sandbox = "none"`; with `none`, `allow_write` cannot be enforced for bash
-and a warning is returned/logged. Changing config while an agent runs does not
-change that agent; inspect the spawn response for its effective posture. Under
+and a warning is returned/logged. Sandbox posture itself is fixed for the ACP
+process; session options requested during a turn apply before its next turn.
+Inspect the spawn response for the effective sandbox posture. Under
 `tool_approval = "ask"`, gated commands raise a
 `permission_request` in watch/poll — answer with `reasonix_respond_permission`;
 approving blind is not required: the request's `tool_call` carries the tool

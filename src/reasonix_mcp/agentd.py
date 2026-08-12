@@ -81,6 +81,18 @@ class Agentd:
         if self._loop is not None:
             def _broadcast(kind, payload, agent=agent):
                 try:
+                    if kind == acp_bridge.EV_PERMISSION:
+                        resolution = self._auto_answer_pending_permission(agent)
+                        if resolution is not None:
+                            print(
+                                "reasonix permission auto-resolved after mode change: "
+                                f"session={agent.session_id} option={resolution}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            # Already answered: do not wake a watch or open a
+                            # stale elicitation form for this request.
+                            return
                     event = common.build_agent_event(agent, kind, payload)
                     self._loop.call_soon_threadsafe(
                         self._wake_watchers, agent.session_id, kind
@@ -210,6 +222,54 @@ class Agentd:
         self._pending_config_tasks[agent.session_id] = asyncio.create_task(
             self._apply_pending_config(agent)
         )
+
+    @staticmethod
+    def _permission_allow_once_option(params: dict) -> str | None:
+        """Find a non-persistent affirmative option without guessing."""
+        ranked: list[tuple[int, str]] = []
+        for option in params.get("options", []):
+            if not isinstance(option, dict) or not option.get("optionId"):
+                continue
+            option_id = str(option["optionId"])
+            values = {
+                str(value).lower().replace("-", "_").replace(" ", "_")
+                for value in (option_id, option.get("name") or "")
+            }
+            if "allow_once" in values or "approve_once" in values:
+                rank = 0
+            elif any(
+                ("allow" in value or "approve" in value) and "once" in value
+                for value in values
+            ):
+                rank = 1
+            elif values & {"allow", "approve", "yes"}:
+                rank = 2
+            else:
+                continue
+            ranked.append((rank, option_id))
+        return min(ranked)[1] if ranked else None
+
+    @classmethod
+    def _auto_answer_pending_permission(
+        cls, agent: acp_bridge.ReasonixAgent
+    ) -> str | None:
+        """Emulate queued YOLO for tool gates until the active turn ends.
+
+        Explicit agent questions (kind=other) always remain user decisions.
+        """
+        if (getattr(agent, "pending_config", {}) or {}).get("tool_approval") != "yolo":
+            return None
+        pending = getattr(agent, "_pending_permission", None)
+        if pending is None:
+            return None
+        _request_id, params = pending
+        tool_call = params.get("toolCall") or {}
+        if str(tool_call.get("kind") or "").lower() == "other":
+            return None
+        option_id = cls._permission_allow_once_option(params)
+        if option_id is None:
+            return None
+        return option_id if agent.answer_permission(option_id) else None
 
     async def _apply_pending_config(self, agent: acp_bridge.ReasonixAgent) -> None:
         task = asyncio.current_task()
@@ -580,14 +640,40 @@ class Agentd:
         if agent.active_turn:
             agent.pending_config.update(updates)
             agent.pending_config_error = None
-            return {
+            permission_resolution = self._auto_answer_pending_permission(agent)
+            permission_still_pending = (
+                getattr(agent, "_pending_permission", None) is not None
+            )
+            note = (
+                "the current turn keeps its configuration; changes apply "
+                "before the next turn"
+            )
+            if permission_resolution is not None:
+                note = (
+                    "pending tool permission allowed once; YOLO is emulated for "
+                    "further tool gates in this turn and applies durably before "
+                    "the next turn"
+                )
+            elif permission_still_pending and updates.get("tool_approval") in (
+                "auto", "yolo"
+            ):
+                note = (
+                    "configuration queued, but the pending request still needs "
+                    "an explicit answer (agent questions and unknown/auto-policy "
+                    "decisions are never guessed)"
+                )
+            result = {
                 "session_id": session_id,
                 "status": status,
                 "queued": True,
                 "applies": "after_current_turn",
                 "requested": updates,
-                "note": "the current turn keeps its model; configuration applies before the next turn",
+                "note": note,
             }
+            if "tool_approval" in updates:
+                result["permission_resolution"] = permission_resolution
+                result["permission_still_pending"] = permission_still_pending
+            return result
         # Mark the update pending before yielding to a worker thread. A
         # simultaneous reasonix_send will then wait instead of starting a turn
         # on the old model while the ACP session is rebuilding.

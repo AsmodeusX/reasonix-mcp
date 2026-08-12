@@ -552,6 +552,73 @@ async def check_configure_blocks_new_turn_until_applied() -> None:
         common.write_session_config = original_write
 
 
+async def check_permission_mode_changes_resolve_only_tool_gates() -> None:
+    daemon = Agentd()
+    agent = watch_agent("permission-mode-change")
+    daemon._registry[agent.session_id] = agent
+    original_write = common.write_session_config
+    answers: list[str] = []
+
+    def write_config(_session_id: str, updates: dict, **_kwargs) -> dict:
+        return dict(updates)
+
+    def answer_permission(option_id: str) -> bool:
+        answers.append(option_id)
+        agent._pending_permission = None
+        return True
+
+    common.write_session_config = write_config
+    agent.answer_permission = answer_permission
+    try:
+        agent._pending_permission = (41, {
+            "toolCall": {"kind": "execute", "title": "Run command"},
+            "options": [
+                {"optionId": "reject_once", "name": "Reject"},
+                {"optionId": "allow_always", "name": "Always allow"},
+                {"optionId": "allow_once", "name": "Allow once"},
+            ],
+        })
+        changed = await daemon.configure({
+            "session_id": agent.session_id,
+            "owner_id": agent.owner_id,
+            "tool_approval": "yolo",
+        })
+        assert changed["permission_resolution"] == "allow_once", changed
+        assert not changed["permission_still_pending"]
+        assert answers == ["allow_once"]
+        assert agent.pending_config["tool_approval"] == "yolo"
+
+        # A later gate in the same still-active turn follows queued YOLO even
+        # though ACP cannot durably rebuild the option until turn end.
+        agent._pending_permission = (42, {
+            "toolCall": {"kind": "execute", "title": "Run another command"},
+            "options": [{"optionId": "allow_once", "name": "Allow once"}],
+        })
+        assert daemon._auto_answer_pending_permission(agent) == "allow_once"
+        assert answers == ["allow_once", "allow_once"]
+
+        # Explicit agent questions never become approvals, even in YOLO.
+        agent._pending_permission = (43, {
+            "toolCall": {"kind": "other", "title": "Which design?"},
+            "options": [{"optionId": "choice_a", "name": "A"}],
+        })
+        assert daemon._auto_answer_pending_permission(agent) is None
+        assert agent._pending_permission is not None
+
+        # AUTO cannot safely infer how policy would classify an already-open
+        # request, so it remains pending.
+        agent.pending_config.clear()
+        auto = await daemon.configure({
+            "session_id": agent.session_id,
+            "owner_id": agent.owner_id,
+            "tool_approval": "auto",
+        })
+        assert auto["permission_resolution"] is None
+        assert auto["permission_still_pending"] is True
+    finally:
+        common.write_session_config = original_write
+
+
 async def check_configure_persisted_session_without_tombstone() -> None:
     daemon = Agentd()
     old_home = os.environ.get("REASONIX_HOME")
@@ -651,6 +718,7 @@ async def main() -> None:
     await check_event_driven_wait()
     await check_configure_queues_active_turn()
     await check_configure_blocks_new_turn_until_applied()
+    await check_permission_mode_changes_resolve_only_tool_gates()
     await check_configure_persisted_session_without_tombstone()
     await check_server_compacts_legacy_daemon_poll()
     check_pending_permission_is_durable()

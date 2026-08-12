@@ -176,6 +176,7 @@ class ReasonixAgent:
         self._ids = itertools.count(1)
         self._wlock = threading.Lock()
         self._config_lock = threading.Lock()
+        self._permission_lock = threading.Lock()
         self._stderr_tail: list[str] = []
         self._exit_code: int | None = None
         self._closed = False
@@ -385,7 +386,8 @@ class ReasonixAgent:
                     if rid is not None:  # inbound request (e.g. permission)
                         if method == "session/request_permission":
                             params = msg.get("params", {})
-                            self._pending_permission = (rid, params)
+                            with self._permission_lock:
+                                self._pending_permission = (rid, params)
                             self._enqueue(EV_PERMISSION, {"id": rid, "params": params})
                         else:
                             # Unknown inbound request: answer method-not-found so
@@ -670,21 +672,27 @@ class ReasonixAgent:
 
     def respond_permission(self, request_id: int, option_id: str | None) -> None:
         """Answer a session/request_permission request from the agent."""
+        with self._permission_lock:
+            if self._pending_permission and self._pending_permission[0] == request_id:
+                self._pending_permission = None
         outcome = {"outcome": "cancelled"} if option_id is None else {"outcome": "selected", "optionId": option_id}
         self._write({"jsonrpc": "2.0", "id": request_id, "result": {"outcome": outcome}})
-        if self._pending_permission and self._pending_permission[0] == request_id:
-            self._pending_permission = None
 
     def answer_permission(self, option_id: str | None) -> bool:
         """Answer the latest pending permission request; False if none pending."""
-        if self._pending_permission is None:
-            return False
-        rid, params = self._pending_permission
-        if option_id is not None:
-            known = {o.get("optionId") for o in params.get("options", [])}
-            if option_id not in known:
-                raise ACPError(-32602, f"unknown permission option {option_id!r}; choose from {sorted(known)}")
-        self.respond_permission(rid, option_id)
+        with self._permission_lock:
+            if self._pending_permission is None:
+                return False
+            rid, params = self._pending_permission
+            if option_id is not None:
+                known = {o.get("optionId") for o in params.get("options", [])}
+                if option_id not in known:
+                    raise ACPError(-32602, f"unknown permission option {option_id!r}; choose from {sorted(known)}")
+            # Claim before writing so concurrent elicitation/configuration
+            # responders cannot both answer this request.
+            self._pending_permission = None
+        outcome = {"outcome": "cancelled"} if option_id is None else {"outcome": "selected", "optionId": option_id}
+        self._write({"jsonrpc": "2.0", "id": rid, "result": {"outcome": outcome}})
         return True
 
     def cancel_turn(self) -> None:

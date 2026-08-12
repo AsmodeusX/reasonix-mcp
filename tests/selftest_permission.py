@@ -4,8 +4,8 @@ integration feedback could not exercise.
 
 Spawns an agent with tool_approval="ask", asks it to run a bash command, and
 verifies the session/request_permission round-trip: one blocking watch
-surfaces the request (with tool name + args), respond_permission approves it,
-and a second watch returns completion and the command's result. No polling.
+surfaces the request, then an on-the-fly switch to yolo resolves that pending
+tool gate and lets the turn complete. No polling.
 """
 
 from __future__ import annotations
@@ -76,8 +76,13 @@ async def main() -> None:
                 opts = [o.get("optionId") for o in req["options"]]
                 print("options:", opts)
                 assert "allow_once" in opts
-                r = await call(session, "reasonix_respond_permission", {"session_id": sid, "option_id": "allow_once"})
-                print("responded:", r)
+                r = await call(session, "reasonix_configure", {
+                    "session_id": sid,
+                    "tool_approval": "yolo",
+                })
+                assert r.get("permission_resolution") == "allow_once", r
+                assert not r.get("permission_still_pending"), r
+                print("switched ask -> yolo; pending gate resolved:", r)
 
                 watched = await call(session, "reasonix_watch", {
                     "session_ids": [sid], "timeout": 180,
@@ -87,8 +92,8 @@ async def main() -> None:
                 assert final["status"] in ("idle", "exited"), final
                 print("stop_reason:", final.get("stop_reason"), "| text:", final.get("message", "")[-200:])
                 wrote = os.path.isfile(PROBE) and open(PROBE).read() == "PERMISSION_OK"
-                print("probe file written after approval:", wrote)
-                assert wrote, "approved bash command did not produce the file"
+                print("probe file written after live mode change:", wrote)
+                assert wrote, "ask -> yolo did not release the pending bash command"
                 await call(session, "reasonix_stop", {"session_id": sid})
         print("PERMISSION WATCH SELFTEST PASS")
     finally:

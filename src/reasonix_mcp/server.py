@@ -64,7 +64,9 @@ by default; use detail=true only for diagnostics. reasonix_wait is the legacy
 event-driven, output-sensitive long poll.
 Use reasonix_configure to switch model/effort/work mode/approval. An active
 turn keeps its current model and applies the queued change before the next
-turn; idle agents apply immediately; exited agents apply it on resume.
+turn; idle agents apply immediately; exited agents apply it on resume. An
+ask→yolo change immediately allows a pending tool gate once, but never answers
+an explicit agent question. ask→auto preserves pending decisions.
 Omit watch timeout for normal orchestration; its default is indefinite. Never
 copy explicit test safety timeouts (such as 240 seconds) into production watch
 calls unless the user specifically requests a bounded wait.
@@ -389,6 +391,14 @@ def _schedule_elicitation(event: dict) -> None:
     task.add_done_callback(lambda _done, sid=session_id: _elicitation_tasks.pop(sid, None))
 
 
+def _cancel_resolved_elicitation(session_id: str, result: dict) -> None:
+    if not result.get("permission_resolution"):
+        return
+    elicitation = _elicitation_tasks.get(session_id)
+    if elicitation is not None and not elicitation.done():
+        elicitation.cancel()
+
+
 async def _elicit_agent_decision(event: dict) -> None:
     """Bridge an ACP permission/question request to standard MCP elicitation."""
     session = _mcp_session
@@ -596,9 +606,11 @@ async def reasonix_resume(
             }.items() if value
         }
         if updates:
-            result["config_change"] = await _rpc(
+            config_change = await _rpc(
                 "configure", {"session_id": session_id, **updates}
             )
+            _cancel_resolved_elicitation(session_id, config_change)
+            result["config_change"] = config_change
         return result
     result = await _rpc("resume", {
         "session_id": session_id, "cwd": cwd,
@@ -624,17 +636,22 @@ async def reasonix_configure(
     Idle agents apply immediately. Active turns keep the old configuration and
     queue the change before their next turn. Exited agents persist the change;
     call reasonix_resume to launch them with it. At least one option is
-    required. Model changes preserve the session transcript.
+    required. Model changes preserve the session transcript. During an active
+    turn, tool_approval=yolo immediately allows known tool gates once and keeps
+    doing so until the durable switch applies; agent questions are untouched.
+    tool_approval=auto never guesses an already-pending decision.
     """
     _capture_relay_ctx(ctx)
     _require_owned(session_id)
-    return await _rpc("configure", {
+    result = await _rpc("configure", {
         "session_id": session_id,
         "model": model,
         "effort": effort,
         "work_mode": work_mode,
         "tool_approval": tool_approval,
     })
+    _cancel_resolved_elicitation(session_id, result)
+    return result
 
 
 @mcp.tool()
