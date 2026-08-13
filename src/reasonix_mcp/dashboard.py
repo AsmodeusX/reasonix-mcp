@@ -783,6 +783,13 @@ async def api_routines(request: Request) -> Response:
     if request.method == "GET":
         return JSONResponse({"routines": [dashboard_routine(v) for v in routines.list_all()]})
     data = await body_json(request)
+    template_id = str(data.get("template_id") or "")
+    if template_id:
+        try:
+            data = routines.apply_template(template_id, data)
+            data["template_id"] = template_id
+        except ValueError as exc:
+            raise DashboardError(str(exc)) from exc
     owner = str(data.get("owner_id") or "")
     ordinary_owners = {item for item in known_owners() if not item.startswith("routine-")}
     if owner not in ordinary_owners:
@@ -793,6 +800,11 @@ async def api_routines(request: Request) -> Response:
         raise DashboardError(str(exc)) from exc
     ensure_routined()
     return JSONResponse(dashboard_routine(value), status_code=201)
+
+
+async def api_routine_templates(request: Request) -> Response:
+    await require_auth(request)
+    return JSONResponse({"templates": routines.templates()})
 
 
 async def api_routine(request: Request) -> Response:
@@ -1059,6 +1071,7 @@ def create_app(password: str) -> Starlette:
             Route("/static/{name}", static_file),
             Route("/api/health", api_health),
             Route("/api/fleet", api_fleet),
+            Route("/api/routine-templates", api_routine_templates),
             Route("/api/routines", api_routines, methods=["GET", "POST"]),
             Route("/api/routines/{routine_id}", api_routine),
             Route(

@@ -30,6 +30,27 @@ def main() -> None:
         import routined
 
         owner = "owner-test"
+        catalog = routines.templates()
+        assert len(catalog) >= 10
+        assert len({item["template_id"] for item in catalog}) == len(catalog)
+        assert {"github-issue-maintainer", "crash-fuzzer", "flaky-test-fixer"} <= {
+            item["template_id"] for item in catalog
+        }
+        templated_data = routines.apply_template("crash-fuzzer", {
+            "cwd": scratch, "name": "Custom crash sweep", "timezone": "Europe/Athens",
+        })
+        templated_data["template_id"] = "crash-fuzzer"
+        templated = routines.create(owner, templated_data)
+        assert templated["template_id"] == "crash-fuzzer"
+        assert templated["name"] == "Custom crash sweep"
+        assert templated["delegation"] == "encouraged"
+        assert routines.template("crash-fuzzer")["name"] == "Crash fuzzer"
+        try:
+            routines.template("not-a-template")
+            raise AssertionError("unknown template was accepted")
+        except ValueError:
+            pass
+
         daily = routines.create(owner, {
             "name": "Issue maintainer", "prompt": "Review current issues safely",
             "cwd": scratch, "schedule_kind": "daily", "daily_at": "09:30",

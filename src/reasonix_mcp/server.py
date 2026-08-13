@@ -16,6 +16,7 @@ Tools:
   reasonix_respond_permission / reasonix_stop / reasonix_restart_agentd /
   reasonix_restart_mcp_server / reasonix_configure / reasonix_dashboard
   reasonix_routine_create / reasonix_routine_list / reasonix_routine_configure /
+  reasonix_routine_templates / reasonix_routine_from_template /
   reasonix_routine_run / reasonix_routine_stop / reasonix_routine_delete
 """
 
@@ -1148,6 +1149,44 @@ async def reasonix_routine_create(
         "tool_approval": tool_approval, "enabled": enabled,
         "run_immediately": run_immediately,
     })
+    result = _routine_result(value, True, False)
+    result["scheduler"] = await _ensure_routined()
+    return result
+
+
+@mcp.tool()
+async def reasonix_routine_templates() -> dict:
+    """List curated, editable starting configurations for loop agents."""
+    return {"templates": routines.templates()}
+
+
+@mcp.tool()
+async def reasonix_routine_from_template(
+    template_id: str, cwd: str, name: str = "", schedule_kind: str = "",
+    interval_minutes: int | None = None, daily_at: str = "", timezone: str = "",
+    overlap_policy: str = "", delegation: str = "", model: str = "",
+    effort: str = "", work_mode: str = "", tool_approval: str = "",
+    enabled: bool | None = None, run_immediately: bool = False,
+    ctx: Context | None = None,
+) -> dict:
+    """Create a routine from a curated template with optional overrides.
+
+    The resulting routine is an ordinary editable routine; the template is a
+    starting point, not a locked policy. Use reasonix_routine_templates first
+    to inspect template prompts and defaults.
+    """
+    _capture_relay_ctx(ctx)
+    overrides = {
+        "name": name, "cwd": cwd, "schedule_kind": schedule_kind,
+        "interval_minutes": interval_minutes, "daily_at": daily_at,
+        "timezone": timezone, "overlap_policy": overlap_policy,
+        "delegation": delegation, "model": model, "effort": effort,
+        "work_mode": work_mode, "tool_approval": tool_approval,
+        "enabled": enabled, "run_immediately": run_immediately,
+    }
+    data = routines.apply_template(template_id, overrides)
+    data["template_id"] = template_id
+    value = routines.create(_owner_id, data)
     result = _routine_result(value, True, False)
     result["scheduler"] = await _ensure_routined()
     return result

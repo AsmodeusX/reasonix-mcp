@@ -17,6 +17,99 @@ import common
 MAX_RUN_HISTORY = 100
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}$")
 
+_TEMPLATE_DEFAULTS = {
+    "schedule_kind": "daily", "daily_at": "09:00", "interval_minutes": 1440,
+    "timezone": "UTC", "overlap_policy": "skip", "delegation": "encouraged",
+    "tool_approval": "auto", "work_mode": "balanced", "enabled": True,
+}
+
+ROUTINE_TEMPLATES = [
+    {
+        "template_id": "github-issue-maintainer", "name": "GitHub issue maintainer",
+        "category": "triage", "description": "Triages issues and prepares one reviewed fix PR.",
+        "prompt": """Inspect currently open GitHub issues and pull requests plus repository state. Do not duplicate an existing issue, branch, PR, or active effort. Select at most one well-scoped, reproducible issue whose fix is appropriate for this repository. Delegate independent reproduction or code investigation when useful, review all findings, implement the smallest robust fix, run focused tests, and open a draft PR with evidence and links. Never merge, close a report, or make unrelated changes.""",
+        "work_mode": "delivery",
+    },
+    {
+        "template_id": "pr-review-maintainer", "name": "PR review maintainer",
+        "category": "triage", "description": "Reviews active PRs and prepares bounded follow-up fixes.",
+        "prompt": """Inspect active pull requests, their review feedback, checks, and current branch state. Pick at most one PR that needs a concrete bounded action. Do not repeat feedback already addressed or duplicate another contributor's work. Reproduce failures, review the changed code for correctness and security, and either report precise actionable findings or prepare a focused follow-up commit on an authorized branch. Run relevant tests. Never approve or merge a PR on behalf of a human.""",
+        "work_mode": "delivery",
+    },
+    {
+        "template_id": "crash-fuzzer", "name": "Crash fuzzer",
+        "category": "reliability", "description": "Exercises the app and root-causes one real crash.",
+        "prompt": """Run the application in its supported local test or simulator environment and explore realistic inputs and interaction sequences for crashes. Preserve reproducibility artifacts and avoid production systems or destructive external actions. If a genuine new crash is found, reduce it to the smallest deterministic reproduction, identify the root cause, add a regression test, implement a focused fix, and prepare a draft PR. If no reproducible crash is found, report coverage and stop without speculative changes.""",
+        "work_mode": "delivery",
+    },
+    {
+        "template_id": "duplicate-unifier", "name": "Duplicate unifier",
+        "category": "quality", "description": "Consolidates one proven duplicate implementation.",
+        "prompt": """Scan for similar implementations that have measurably diverged while representing the same concept. Select at most one high-confidence duplication. Compare semantics, callers, edge cases, and tests before changing anything. Consolidate only when one shared abstraction is clearly simpler and preserves behavior; otherwise report the candidates and stop. Add or update tests and prepare a focused draft PR.""",
+    },
+    {
+        "template_id": "dead-code-remover", "name": "Dead-code remover",
+        "category": "cleanup", "description": "Removes one provably unreachable code path.",
+        "prompt": """Use static references, build configuration, tests, and runtime evidence available in the repository to identify dead code. Remove at most one bounded target only when it is provably unreachable. Treat reflection, plugins, generated code, public APIs, migrations, and platform-specific paths as live unless proven otherwise. If evidence is insufficient, add narrowly scoped observability when appropriate or report the candidate without deleting it. Run focused tests and prepare a draft PR.""",
+    },
+    {
+        "template_id": "useless-test-pruner", "name": "Useless-test pruner",
+        "category": "tests", "description": "Removes or repairs one test that cannot detect failure.",
+        "prompt": """Inspect tests for assertions that cannot fail, mocks that bypass the behavior under test, permanently skipped cases, or exact duplicates. Select at most one high-confidence target. Prefer repairing a weak test when it covers meaningful behavior; delete it only when it adds no independent signal. Demonstrate the diagnosis, preserve coverage, run the affected test suite, and prepare a focused draft PR.""",
+    },
+    {
+        "template_id": "flaky-test-fixer", "name": "Flaky-test fixer",
+        "category": "tests", "description": "Reproduces and fixes one flaky CI test.",
+        "prompt": """Inspect recent CI failures and repository test history for a likely flaky test. Work on at most one candidate. Reproduce the failure repeatedly or establish strong causal evidence; distinguish product races from test-only timing assumptions. Fix the root cause rather than increasing sleeps, retries, or timeouts. Stress the focused test after the change and prepare a draft PR with reproduction and verification evidence. If flakiness cannot be established, report findings without changing code.""",
+        "work_mode": "delivery",
+    },
+    {
+        "template_id": "logic-simplifier", "name": "Logic simplifier",
+        "category": "quality", "description": "Simplifies one convoluted logic path without changing behavior.",
+        "prompt": """Identify one bounded area of unnecessarily convoluted business logic. Establish current behavior from tests, callers, invariants, and edge cases before editing. Simplify control flow or data transformations only when the result is materially easier to reason about and does not broaden scope. Add characterization tests where needed, run focused verification, and prepare a draft PR. Do not combine unrelated cleanup.""",
+    },
+    {
+        "template_id": "logic-bugfinder", "name": "Logic bugfinder",
+        "category": "reliability", "description": "Models a tricky invariant and fixes one demonstrated bug.",
+        "prompt": """Select one complex, high-risk logic path and model its inputs, state transitions, invariants, and boundary conditions. Use focused tests or a small model to search for a concrete counterexample. Change production code only when a bug is reproducible or strongly demonstrated. Add a regression test, implement the smallest root-cause fix, run relevant verification, and prepare a draft PR. Report a clean result without speculative edits when no bug is established.""",
+        "work_mode": "delivery",
+    },
+    {
+        "template_id": "shipped-feature-cleaner", "name": "Shipped-feature cleaner",
+        "category": "cleanup", "description": "Removes one fully shipped feature flag safely.",
+        "prompt": """Inspect feature flags and rollout configuration for a flag whose shipped state is conclusively permanent across supported environments. Select at most one flag. Verify ownership, rollback expectations, tests, configuration, telemetry references, and both code branches. Remove the obsolete path and flag plumbing only with sufficient evidence, preserve the shipped behavior, run focused tests, and prepare a draft PR. Never alter a live rollout or uncertain flag.""",
+    },
+    {
+        "template_id": "internal-feature-cleaner", "name": "Internal-feature cleaner",
+        "category": "cleanup", "description": "Ships or removes one forgotten internal-only feature.",
+        "prompt": """Find one bounded internal-only feature or experiment that appears forgotten. Establish ownership, usage, intended outcome, and dependencies from repository evidence and available telemetry. Do not make a product decision without evidence: prepare a safe completion when intent is clear, remove it only when unused and authorized, or report the decision needed. Run focused tests and open a draft PR only for a well-supported mechanical change.""",
+    },
+    {
+        "template_id": "abstraction-reviewer", "name": "Abstraction reviewer",
+        "category": "architecture", "description": "Fixes one leaky or over-engineered abstraction.",
+        "prompt": """Inspect dependency direction, ownership boundaries, repeated escape hatches, and abstractions that expose implementation details. Select at most one concrete, high-impact layering violation or needless abstraction. Trace callers and compatibility constraints. Make the smallest change that restores a clear boundary or removes indirection, without a broad rewrite. Add or update tests, run focused verification, and prepare a draft PR.""",
+    },
+]
+
+
+def templates() -> list[dict]:
+    return [{**_TEMPLATE_DEFAULTS, **item} for item in ROUTINE_TEMPLATES]
+
+
+def template(template_id: str) -> dict:
+    value = next((item for item in templates() if item["template_id"] == template_id), None)
+    if value is None:
+        raise ValueError(f"unknown routine template {template_id!r}")
+    return value
+
+
+def apply_template(template_id: str, overrides: dict) -> dict:
+    value = template(template_id)
+    value.pop("category", None)
+    value.pop("description", None)
+    value.pop("template_id", None)
+    return {**value, **{key: item for key, item in overrides.items() if item not in (None, "")}}
+
 
 def routine_dir() -> str:
     return os.path.join(os.path.dirname(common.agentd_sock_path()), "routines")
@@ -165,6 +258,9 @@ def create(owner_id: str, data: dict) -> dict:
         "created_at": now, "updated_at": now, "runs": [],
         "pending_triggers": 1 if data.get("run_immediately") else 0,
     }
+    if data.get("template_id"):
+        template(str(data["template_id"]))
+        value["template_id"] = str(data["template_id"])
     value["next_run_at"] = next_scheduled(value, now) if value["enabled"] else None
     with locked():
         _write(value)

@@ -107,6 +107,8 @@ client and verify the server is listed.
 | `reasonix_restart_mcp_server()` | Explicitly restart this orchestrator's MCP server through `launcher.py`; source changes are watched automatically. |
 | `reasonix_dashboard(open_browser?)` | Open or reuse the authenticated local fleet UI for current and previous agents across orchestrators. Supports live steering, stop/resume, configuration, and permission responses. |
 | `reasonix_routine_create(name, prompt, …)` | Create a durable manual, interval, or daily loop agent. Each iteration starts in fresh context and may delegate through native Reasonix subagents. |
+| `reasonix_routine_templates()` | List curated maintenance templates with complete prompts and safe defaults. |
+| `reasonix_routine_from_template(template_id, cwd, …overrides)` | Create an editable routine from a curated template. |
 | `reasonix_routine_list(include_prompt?, include_results?)` | Compact routine state, schedule, queued triggers, and latest 20 runs for this orchestrator. Full prompts/results are opt-in. |
 | `reasonix_routine_configure(routine_id, …)` | Edit, pause, or enable a routine; changes apply to future runs. |
 | `reasonix_routine_run(routine_id)` | Queue an immediate run while honoring its skip/queue overlap policy. |
@@ -199,6 +201,15 @@ run results, or open the run's normal agent timeline. Routine sessions use a
 separate internal owner, so they do not pollute ordinary orchestrator fleets.
 The creator's MCP client can only list or mutate its own routines; the local
 authenticated dashboard intentionally provides machine-wide administration.
+
+The creation form also includes curated starting templates for GitHub issue
+maintenance, PR review, crash fuzzing, duplicate unification, dead-code and
+weak-test removal, flaky tests, logic simplification and bug finding, shipped
+feature cleanup, forgotten internal features, and abstraction review. A
+template copies a complete prompt and conservative defaults into the form;
+the user can inspect and edit every field before saving. Templates are equally
+available to orchestrators through `reasonix_routine_templates()` and
+`reasonix_routine_from_template()`.
 
 Unattended routines default to `tool_approval=auto`, not YOLO. Choose YOLO only
 for trusted repositories and tightly scoped prompts. Ask-mode permission and

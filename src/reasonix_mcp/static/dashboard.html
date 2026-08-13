@@ -166,6 +166,8 @@
     <form id="routine-form" method="dialog" class="routine-form">
       <header><h2 id="routine-form-title">New loop agent</h2><button type="button" id="routine-cancel">×</button></header>
       <input id="routine-edit-id" type="hidden">
+      <label id="routine-template-field">Template<select id="routine-template"><option value="">Blank / custom</option></select></label>
+      <p id="routine-template-description" class="hint"></p>
       <label>Name<input id="routine-name" required maxlength="80"></label>
       <label>Orchestrator<select id="routine-owner" required></select></label>
       <label>Working directory<input id="routine-cwd" required></label>

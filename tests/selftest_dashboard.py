@@ -234,6 +234,11 @@ def main() -> None:
         headers = {key.lower(): value for key, value in headers.items()}
         assert headers["cache-control"] == "no-store"
         assert "frame-ancestors 'none'" in headers["content-security-policy"]
+        status, templates, _ = request(base + "/api/routine-templates", password)
+        assert status == 200
+        assert len(templates["templates"]) >= 10
+        assert any(item["template_id"] == "github-issue-maintainer"
+                   for item in templates["templates"])
         status, body, _ = request(base + "/api/health")
         assert status == 401 and body["error"] == "unauthorized", (status, body)
         stream_request = urllib.request.Request(
