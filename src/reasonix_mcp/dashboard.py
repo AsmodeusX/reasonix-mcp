@@ -33,6 +33,8 @@ from starlette.routing import Route
 import uvicorn
 
 import common
+import routined
+import routines
 
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -55,6 +57,8 @@ def dashboard_signature() -> str:
     for path in [
         __file__,
         common.__file__,
+        routines.__file__,
+        routined.__file__,
         os.path.join(STATIC_DIR, "dashboard.html"),
         os.path.join(STATIC_DIR, "dashboard.css"),
         os.path.join(STATIC_DIR, "dashboard.js"),
@@ -105,6 +109,29 @@ async def ensure_agentd() -> None:
     writer.close()
     with contextlib.suppress(Exception):
         await writer.wait_closed()
+
+
+def ensure_routined() -> None:
+    try:
+        with open(routined.STATE_PATH, encoding="utf-8") as fh:
+            pid = int(json.load(fh).get("pid") or 0)
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            command = fh.read().replace(b"\0", b" ").decode(errors="replace")
+        if os.path.abspath(routined.__file__) in command:
+            return
+    except (OSError, ValueError, TypeError):
+        pass
+    runtime = os.path.dirname(routined.STATE_PATH)
+    os.makedirs(runtime, exist_ok=True)
+    log = open(os.path.join(runtime, "routined.log"), "ab")
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(routined.__file__)],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            start_new_session=True, env=dict(os.environ),
+        )
+    finally:
+        log.close()
 
 
 async def agentd_rpc(owner_id: str, method: str, params: dict | None = None) -> dict:
@@ -425,6 +452,7 @@ class DashboardState:
         self.observers: dict[str, asyncio.Task] = {}
         self.permission_requests: dict[str, dict] = {}
         self.timeline_files: dict[str, tuple[int, int]] = {}
+        self.routine_files: dict[str, tuple[int, int]] = {}
         self.closed = False
 
     async def publish(self, event: dict) -> None:
@@ -437,7 +465,12 @@ class DashboardState:
 
     async def sync_observers(self) -> None:
         while not self.closed:
-            owners = known_owners()
+            owners = {
+                owner for owner in known_owners() if not owner.startswith("routine-")
+            } | {
+                routined.routine_owner(value["routine_id"])
+                for value in routines.list_all()
+            }
             for owner in owners:
                 task = self.observers.get(owner)
                 if task is None or task.done():
@@ -445,7 +478,27 @@ class DashboardState:
             for owner in set(self.observers) - owners:
                 self.observers.pop(owner).cancel()
             await self.sync_timeline_files()
+            await self.sync_routine_files()
             await asyncio.sleep(3)
+
+    async def sync_routine_files(self) -> None:
+        current: dict[str, tuple[int, int]] = {}
+        for value in routines.list_all():
+            routine_id = str(value.get("routine_id") or "")
+            try:
+                stat = os.stat(routines.path_for(routine_id))
+            except (OSError, ValueError):
+                continue
+            fingerprint = (stat.st_mtime_ns, stat.st_size)
+            current[routine_id] = fingerprint
+            previous = self.routine_files.get(routine_id)
+            if previous is not None and previous != fingerprint:
+                await self.publish({
+                    "type": "routine_changed", "routine_id": routine_id,
+                })
+        for routine_id in set(self.routine_files) - set(current):
+            await self.publish({"type": "routine_deleted", "routine_id": routine_id})
+        self.routine_files = current
 
     async def sync_timeline_files(self) -> None:
         current: dict[str, tuple[int, int]] = {}
@@ -617,7 +670,7 @@ async def api_health(request: Request) -> Response:
 
 
 async def fleet_snapshot() -> dict:
-    owners = sorted(known_owners())
+    owners = sorted(owner for owner in known_owners() if not owner.startswith("routine-"))
     live_by_owner: dict[str, dict[str, dict]] = defaultdict(dict)
     sidecars_by_owner: dict[str, set[str]] = defaultdict(set)
     for path in glob.glob(os.path.join(common.reasonix_home(), "sessions", "*.owner.json")):
@@ -713,10 +766,94 @@ async def api_fleet(request: Request) -> Response:
     return JSONResponse(await fleet_snapshot())
 
 
+def dashboard_routine(value: dict) -> dict:
+    result = routines.public(value, include_prompt=True)
+    result["runs"] = result.get("runs", [])[-100:]
+    for run in result["runs"]:
+        for key in ("message", "error"):
+            if isinstance(run.get(key), str) and len(run[key]) > MAX_TRANSCRIPT_TEXT:
+                run[key] = run[key][-MAX_TRANSCRIPT_TEXT:]
+                run[f"{key}_truncated"] = True
+    return result
+
+
+async def api_routines(request: Request) -> Response:
+    await require_auth(request)
+    if request.method == "GET":
+        return JSONResponse({"routines": [dashboard_routine(v) for v in routines.list_all()]})
+    data = await body_json(request)
+    owner = str(data.get("owner_id") or "")
+    ordinary_owners = {item for item in known_owners() if not item.startswith("routine-")}
+    if owner not in ordinary_owners:
+        raise DashboardError("select a known orchestrator owner")
+    try:
+        value = routines.create(owner, data)
+    except ValueError as exc:
+        raise DashboardError(str(exc)) from exc
+    ensure_routined()
+    return JSONResponse(dashboard_routine(value), status_code=201)
+
+
+async def api_routine(request: Request) -> Response:
+    await require_auth(request)
+    routine_id = request.path_params["routine_id"]
+    try:
+        return JSONResponse(dashboard_routine(routines.get(routine_id)))
+    except ValueError as exc:
+        raise DashboardError(str(exc), 404) from exc
+
+
+async def api_routine_action(request: Request) -> Response:
+    await require_auth(request)
+    routine_id = request.path_params["routine_id"]
+    action = request.path_params["action"]
+    data = await body_json(request)
+    try:
+        value = routines.get(routine_id)
+        if action == "configure":
+            allowed = {
+                "name", "prompt", "cwd", "schedule_kind", "interval_minutes",
+                "daily_at", "timezone", "overlap_policy", "delegation", "model",
+                "effort", "work_mode", "tool_approval", "enabled",
+            }
+            changes = {key: data[key] for key in allowed if key in data}
+            if not changes:
+                raise ValueError("provide a setting to change")
+            result = dashboard_routine(routines.update(routine_id, None, changes))
+        elif action == "run":
+            result = routines.trigger(routine_id, None)
+            result["routine_id"] = routine_id
+        elif action == "stop":
+            run = next((item for item in reversed(value.get("runs", []))
+                        if item.get("status") in ("starting", "running")), None)
+            if not run or not run.get("session_id"):
+                raise ValueError("routine has no stoppable active agent")
+            result = await agentd_rpc(routined.routine_owner(routine_id), "stop", {
+                "session_id": run["session_id"],
+            })
+            routined.update_run(routine_id, run["run_id"], {
+                "status": "canceled", "finished_at": time.time(),
+                "stop_reason": "canceled",
+            })
+        elif action == "delete":
+            routines.delete(routine_id, None)
+            result = {"deleted": True, "routine_id": routine_id}
+        else:
+            raise DashboardError("unknown routine action", 404)
+    except ValueError as exc:
+        raise DashboardError(str(exc), 409) from exc
+    ensure_routined()
+    await request.app.state.dashboard.publish({
+        "type": "routine_changed", "routine_id": routine_id, "action": action,
+    })
+    return JSONResponse(result)
+
+
 async def api_session(request: Request) -> Response:
     await require_auth(request)
     session_id = request.path_params["session_id"]
     owner = owner_for_session(session_id)
+    preview = transcript_preview(session_id)
     messages, transcript = transcript_messages(session_id)
     live = None
     try:
@@ -736,6 +873,8 @@ async def api_session(request: Request) -> Response:
             live["permission_request"] = cached
     persisted_config = common.read_session_config(session_id)
     if live is not None:
+        live["task"] = live.get("task") or preview.get("task") or f"Session {session_id[:8]}"
+        live["cwd"] = live.get("cwd") or preview.get("cwd") or ""
         reported_config = live.get("config")
         live["config_known"] = isinstance(reported_config, dict) and bool(reported_config)
         live["config_source"] = "agent" if live["config_known"] else (
@@ -749,6 +888,8 @@ async def api_session(request: Request) -> Response:
         "session": live or {
             "session_id": session_id,
             "status": "previous",
+            "task": preview.get("task") or f"Session {session_id[:8]}",
+            "cwd": preview.get("cwd") or "",
             "resumable": transcript["exists"],
             "config": common.read_session_config(session_id),
             "config_known": bool(persisted_config),
@@ -898,6 +1039,7 @@ def create_app(token: str) -> Starlette:
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):
+        ensure_routined()
         dashboard.sync_task = asyncio.create_task(dashboard.sync_observers())
         try:
             yield
@@ -916,6 +1058,12 @@ def create_app(token: str) -> Starlette:
             Route("/static/{name}", static_file),
             Route("/api/health", api_health),
             Route("/api/fleet", api_fleet),
+            Route("/api/routines", api_routines, methods=["GET", "POST"]),
+            Route("/api/routines/{routine_id}", api_routine),
+            Route(
+                "/api/routines/{routine_id}/{action}",
+                api_routine_action, methods=["POST"],
+            ),
             Route("/api/events", api_events),
             Route("/api/sessions/{session_id}", api_session),
             Route("/api/sessions/{session_id}/{action}", api_action, methods=["POST"]),

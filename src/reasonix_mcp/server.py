@@ -15,6 +15,8 @@ Tools:
   reasonix_watch / reasonix_wait / reasonix_list / reasonix_models / reasonix_transcript
   reasonix_respond_permission / reasonix_stop / reasonix_restart_agentd /
   reasonix_restart_mcp_server / reasonix_configure / reasonix_dashboard
+  reasonix_routine_create / reasonix_routine_list / reasonix_routine_configure /
+  reasonix_routine_run / reasonix_routine_stop / reasonix_routine_delete
 """
 
 from __future__ import annotations
@@ -37,6 +39,8 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver import Context
 
 import common
+import routined
+import routines
 
 MCP_INSTRUCTIONS = """Reasonix is an agent-orchestration MCP server backed by a
 detached agent daemon. Use reasonix_spawn once per child task and retain each
@@ -97,6 +101,12 @@ Lifecycle controls:
 - reasonix_dashboard() opens a loopback-only authenticated fleet UI. It sees
   current and previous sessions across local orchestrators without consuming
   their watch queues; actions are owner-scoped by persisted session metadata.
+Durable routines create a fresh context for every manual, interval, or daily
+iteration and continue while MCP clients and the dashboard are closed. A
+routine may delegate through native task/fleet/subagents when configured.
+Use overlap_policy=skip to prevent duplicate maintenance work, or queue to
+serialize every trigger. reasonix_routine_list is compact unless prompt/result
+details are explicitly requested.
 When launcher.py is configured, Python source changes restart this MCP
 front-end automatically and replay its MCP handshake. An in-flight watch/wait
 is completed with server_restarted=true so the orchestrator can immediately
@@ -122,6 +132,10 @@ DASHBOARD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "das
 DASHBOARD_STATE = os.path.join(os.path.dirname(common.agentd_sock_path()), "dashboard.json")
 DASHBOARD_LOCK = os.path.join(os.path.dirname(common.agentd_sock_path()), "dashboard.lock")
 DASHBOARD_PORT = int(os.environ.get("REASONIX_MCP_DASHBOARD_PORT", "8746"))
+ROUTINED_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "routined.py")
+ROUTINED_START_LOCK = os.path.join(
+    os.path.dirname(common.agentd_sock_path()), "routined-start.lock"
+)
 MCP_RESTART_EXIT_CODE = 75
 
 _agentd_reader: asyncio.StreamReader | None = None
@@ -693,6 +707,65 @@ def _require_owned(session_id: str) -> None:
         )
 
 
+def _read_routined_state() -> dict:
+    try:
+        with open(routined.STATE_PATH, encoding="utf-8") as fh:
+            value = json.load(fh)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _is_routined_process(pid: int) -> bool:
+    if pid <= 1:
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            command = fh.read().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        return False
+    return os.path.abspath(ROUTINED_SCRIPT) in command
+
+
+async def _ensure_routined() -> dict:
+    """Start the durable scheduler once; stale code self-execs in place."""
+    os.makedirs(os.path.dirname(ROUTINED_START_LOCK), exist_ok=True)
+    lock_fd = os.open(ROUTINED_START_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        await asyncio.to_thread(fcntl.flock, lock_fd, fcntl.LOCK_EX)
+        state = _read_routined_state()
+        pid = int(state.get("pid") or 0)
+        if _is_routined_process(pid):
+            return {"running": True, "pid": pid, "started": False}
+        with contextlib.suppress(OSError):
+            if _read_routined_state().get("pid") == state.get("pid"):
+                os.unlink(routined.STATE_PATH)
+        log = open(
+            os.path.join(os.path.dirname(routined.STATE_PATH), "routined.log"), "ab"
+        )
+        try:
+            process = subprocess.Popen(
+                [sys.executable, ROUTINED_SCRIPT], stdin=subprocess.DEVNULL,
+                stdout=log, stderr=log, start_new_session=True, env=dict(os.environ),
+            )
+        finally:
+            log.close()
+        for _ in range(100):
+            state = _read_routined_state()
+            if state.get("pid") == process.pid and _is_routined_process(process.pid):
+                return {"running": True, "pid": process.pid, "started": True}
+            if process.poll() is not None:
+                break
+            await asyncio.sleep(0.1)
+        raise RuntimeError(
+            "routine scheduler did not start; inspect ~/.reasonix-mcp/routined.log"
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 @mcp.tool()
 async def reasonix_spawn(
     task: str,
@@ -1024,12 +1097,149 @@ async def reasonix_stop(session_id: str, ctx: Context | None = None) -> dict:
     return await _rpc("stop", {"session_id": session_id})
 
 
+def _routine_for_owner(routine_id: str) -> dict:
+    value = routines.get(routine_id)
+    if value.get("owner_id") != _owner_id:
+        raise ValueError("routine is owned by another orchestrator")
+    return value
+
+
+def _routine_result(value: dict, include_prompt: bool, include_results: bool) -> dict:
+    result = routines.public(value, include_prompt=include_prompt)
+    compact_runs = []
+    for run in result.get("runs", [])[-20:]:
+        item = dict(run)
+        if not include_results:
+            message = str(item.pop("message", "") or "")
+            item.pop("config", None)
+            if message:
+                item["message_preview"] = common.task_preview(message)
+        compact_runs.append(item)
+    result["runs"] = compact_runs
+    result["runs_total"] = len(value.get("runs", []))
+    return result
+
+
+@mcp.tool()
+async def reasonix_routine_create(
+    name: str, prompt: str, cwd: str = "", schedule_kind: str = "daily",
+    interval_minutes: int = 1440, daily_at: str = "09:00", timezone: str = "UTC",
+    overlap_policy: str = "skip", delegation: str = "allowed",
+    model: str = common.DEFAULT_MODEL, effort: str = common.DEFAULT_EFFORT,
+    work_mode: str = common.DEFAULT_WORK_MODE, tool_approval: str = "auto",
+    enabled: bool = True, run_immediately: bool = False,
+    ctx: Context | None = None,
+) -> dict:
+    """Create a durable fresh-context routine.
+
+    schedule_kind is manual|interval|daily. Daily schedules use daily_at HH:MM
+    in an IANA timezone. overlap_policy is skip|queue. delegation is
+    disabled|allowed|encouraged. The unattended-safe approval default is auto;
+    choose yolo explicitly only for a trusted prompt and repository.
+    """
+    _capture_relay_ctx(ctx)
+    value = routines.create(_owner_id, {
+        "name": name, "prompt": prompt, "cwd": cwd or os.getcwd(),
+        "schedule_kind": schedule_kind, "interval_minutes": interval_minutes,
+        "daily_at": daily_at, "timezone": timezone,
+        "overlap_policy": overlap_policy, "delegation": delegation,
+        "model": model, "effort": effort, "work_mode": work_mode,
+        "tool_approval": tool_approval, "enabled": enabled,
+        "run_immediately": run_immediately,
+    })
+    result = _routine_result(value, True, False)
+    result["scheduler"] = await _ensure_routined()
+    return result
+
+
+@mcp.tool()
+async def reasonix_routine_list(
+    include_prompt: bool = False, include_results: bool = False,
+    ctx: Context | None = None,
+) -> dict:
+    """List this orchestrator's routines and latest 20 runs compactly."""
+    _capture_relay_ctx(ctx)
+    scheduler = await _ensure_routined()
+    values = [
+        _routine_result(value, include_prompt, include_results)
+        for value in routines.list_all() if value.get("owner_id") == _owner_id
+    ]
+    return {"routines": values, "scheduler": scheduler}
+
+
+@mcp.tool()
+async def reasonix_routine_configure(
+    routine_id: str, name: str = "", prompt: str = "", cwd: str = "",
+    schedule_kind: str = "", interval_minutes: int | None = None,
+    daily_at: str = "", timezone: str = "", overlap_policy: str = "",
+    delegation: str = "", model: str = "", effort: str = "",
+    work_mode: str = "", tool_approval: str = "", enabled: bool | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Change a routine; settings apply to future fresh-context runs."""
+    _capture_relay_ctx(ctx)
+    _routine_for_owner(routine_id)
+    values = {
+        "name": name, "prompt": prompt, "cwd": cwd,
+        "schedule_kind": schedule_kind, "interval_minutes": interval_minutes,
+        "daily_at": daily_at, "timezone": timezone,
+        "overlap_policy": overlap_policy, "delegation": delegation,
+        "model": model, "effort": effort, "work_mode": work_mode,
+        "tool_approval": tool_approval, "enabled": enabled,
+    }
+    changes = {key: value for key, value in values.items() if value not in ("", None)}
+    if not changes:
+        raise ValueError("provide at least one routine setting to change")
+    value = routines.update(routine_id, _owner_id, changes)
+    await _ensure_routined()
+    return _routine_result(value, True, False)
+
+
+@mcp.tool()
+async def reasonix_routine_run(routine_id: str, ctx: Context | None = None) -> dict:
+    """Queue an immediate fresh-context run, respecting overlap policy."""
+    _capture_relay_ctx(ctx)
+    _routine_for_owner(routine_id)
+    result = routines.trigger(routine_id, _owner_id)
+    result.update({"routine_id": routine_id, "scheduler": await _ensure_routined()})
+    return result
+
+
+@mcp.tool()
+async def reasonix_routine_stop(routine_id: str, ctx: Context | None = None) -> dict:
+    """Stop the active parent agent; future schedules remain enabled."""
+    _capture_relay_ctx(ctx)
+    value = _routine_for_owner(routine_id)
+    run = next((item for item in reversed(value.get("runs", []))
+                if item.get("status") in ("starting", "running")), None)
+    if not run or not run.get("session_id"):
+        raise ValueError("routine has no stoppable active agent")
+    result = await routined.rpc(
+        routined.routine_owner(routine_id), "stop", {"session_id": run["session_id"]}
+    )
+    routined.update_run(routine_id, run["run_id"], {
+        "status": "canceled", "finished_at": time.time(), "stop_reason": "canceled",
+    })
+    return {**result, "routine_id": routine_id, "run_id": run["run_id"]}
+
+
+@mcp.tool()
+async def reasonix_routine_delete(routine_id: str, ctx: Context | None = None) -> dict:
+    """Delete a routine and run history; active runs are refused."""
+    _capture_relay_ctx(ctx)
+    _routine_for_owner(routine_id)
+    routines.delete(routine_id, _owner_id)
+    return {"deleted": True, "routine_id": routine_id}
+
+
 def _dashboard_source_signature() -> str:
     digest = hashlib.sha256()
     package_dir = os.path.dirname(DASHBOARD_SCRIPT)
     for path in [
         DASHBOARD_SCRIPT,
         os.path.join(package_dir, "common.py"),
+        os.path.join(package_dir, "routines.py"),
+        os.path.join(package_dir, "routined.py"),
         os.path.join(package_dir, "static", "dashboard.html"),
         os.path.join(package_dir, "static", "dashboard.css"),
         os.path.join(package_dir, "static", "dashboard.js"),

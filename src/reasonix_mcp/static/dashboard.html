@@ -24,6 +24,10 @@
         <div class="brand-mark">R</div>
         <div><strong>Reasonix</strong><span>Fleet control</span></div>
       </header>
+      <section class="routine-sidebar">
+        <div class="routine-sidebar-heading"><strong>Loop agents</strong><button id="new-routine" title="Create routine">＋</button></div>
+        <nav id="routines" class="routine-list"></nav>
+      </section>
       <div class="sidebar-tools">
         <input id="search" type="search" placeholder="Search agents">
         <select id="status-filter">
@@ -111,6 +115,26 @@
           </div>
         </form>
       </section>
+
+      <section id="routine-view" class="routine-view hidden">
+        <header class="session-header">
+          <div class="session-title">
+            <div class="eyebrow">LOOP AGENT · FRESH CONTEXT EACH RUN</div>
+            <h1 id="routine-title"></h1>
+            <div class="meta-row"><span id="routine-status" class="badge"></span><code id="routine-id"></code><span id="routine-next"></span></div>
+          </div>
+          <div class="header-actions">
+            <button id="routine-edit">Edit</button><button id="routine-toggle"></button>
+            <button id="routine-run" class="primary">Run now</button><button id="routine-stop" class="danger">Stop run</button>
+          </div>
+        </header>
+        <div class="content-scroll routine-content">
+          <section class="panel"><div class="panel-heading"><h2>Instructions</h2></div><pre id="routine-prompt" class="routine-prompt"></pre></section>
+          <section class="panel"><div class="panel-heading"><h2>Configuration</h2></div><dl id="routine-facts" class="routine-facts"></dl></section>
+          <section class="panel"><div class="panel-heading"><h2>Run history</h2></div><div id="routine-runs" class="routine-runs"></div></section>
+          <button id="routine-delete" class="danger">Delete routine</button>
+        </div>
+      </section>
     </main>
 
     <aside id="inspector" class="inspector hidden">
@@ -138,6 +162,31 @@
       </section>
     </aside>
   </div>
+  <dialog id="routine-dialog">
+    <form id="routine-form" method="dialog" class="routine-form">
+      <header><h2 id="routine-form-title">New loop agent</h2><button type="button" id="routine-cancel">×</button></header>
+      <input id="routine-edit-id" type="hidden">
+      <label>Name<input id="routine-name" required maxlength="80"></label>
+      <label>Orchestrator<select id="routine-owner" required></select></label>
+      <label>Working directory<input id="routine-cwd" required></label>
+      <label>Instructions<textarea id="routine-instructions" required rows="7" placeholder="Check open issues, choose one safe task, delegate independent investigation when useful, and open a reviewed PR. Do not duplicate existing work."></textarea></label>
+      <div class="form-grid">
+        <label>Schedule<select id="routine-schedule"><option value="daily">Daily</option><option value="interval">Interval</option><option value="manual">Manual only</option></select></label>
+        <label class="daily-field">Daily at<input id="routine-daily" type="time" value="09:00"></label>
+        <label class="interval-field hidden">Every minutes<input id="routine-interval" type="number" min="1" value="1440"></label>
+        <label>Timezone<input id="routine-timezone" value="UTC"></label>
+        <label>Overlap<select id="routine-overlap"><option value="skip">Skip overlapping run</option><option value="queue">Queue every run</option></select></label>
+        <label>Delegation<select id="routine-delegation"><option value="allowed">Allowed</option><option value="encouraged">Encouraged</option><option value="disabled">Disabled</option></select></label>
+        <label>Model<select id="routine-model"></select></label>
+        <label>Effort<select id="routine-effort"></select></label>
+        <label>Approval<select id="routine-approval"><option value="auto">Auto</option><option value="ask">Ask</option><option value="yolo">YOLO</option></select></label>
+        <label>Work mode<select id="routine-mode"><option value="balanced">Balanced</option><option value="economy">Economy</option><option value="delivery">Delivery</option></select></label>
+      </div>
+      <label class="check"><input id="routine-enabled" type="checkbox" checked> Enabled</label>
+      <label id="run-now-label" class="check"><input id="routine-immediate" type="checkbox"> Run once immediately</label>
+      <footer><button type="button" id="routine-cancel-bottom">Cancel</button><button type="submit" class="primary">Save routine</button></footer>
+    </form>
+  </dialog>
   <div id="toast" class="toast hidden"></div>
   <script src="/static/dashboard.js"></script>
 </body>

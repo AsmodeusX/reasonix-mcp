@@ -102,12 +102,17 @@ def main() -> None:
     old_sock = os.environ.get("REASONIX_MCP_AGENTD_SOCK")
     old_dashboard_port = os.environ.get("REASONIX_MCP_DASHBOARD_PORT")
     dashboard_pid = 0
+    routined_pid = 0
     try:
         reasonix_home = os.path.join(scratch, "home")
         sock_path = os.path.join(scratch, "agentd.sock")
         os.environ["REASONIX_HOME"] = reasonix_home
         os.environ["REASONIX_MCP_AGENTD_SOCK"] = sock_path
         os.environ["REASONIX_MCP_DASHBOARD_PORT"] = str(free_port())
+        # dashboard is imported above so pin its scheduler constants to this
+        # test's runtime before the app lifespan starts it.
+        dashboard.routined.STATE_PATH = os.path.join(scratch, "routined.json")
+        dashboard.routined.PROCESS_LOCK = os.path.join(scratch, "routined.lock")
         import server as mcp_server  # noqa: E402
 
         common.write_session_owner("session-one", "owner-one")
@@ -236,6 +241,12 @@ def main() -> None:
             assert stream.readline() == b"data: {}\n"
         mode = os.stat(state_file).st_mode & 0o777
         assert mode == 0o600, oct(mode)
+        for _ in range(50):
+            if os.path.exists(dashboard.routined.STATE_PATH):
+                with open(dashboard.routined.STATE_PATH, encoding="utf-8") as fh:
+                    routined_pid = int(json.load(fh).get("pid") or 0)
+                break
+            time.sleep(0.02)
         print("DASHBOARD SELFTEST PASS")
     finally:
         if dashboard_pid:
@@ -247,6 +258,9 @@ def main() -> None:
                 except ProcessLookupError:
                     break
                 time.sleep(0.1)
+        if routined_pid:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(routined_pid, 15)
         if old_home is None:
             os.environ.pop("REASONIX_HOME", None)
         else:

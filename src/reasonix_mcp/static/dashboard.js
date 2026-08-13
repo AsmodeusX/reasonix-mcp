@@ -1,4 +1,4 @@
-const state = { token: "", fleet: null, selected: null, detail: null, refreshTimer: null, collapsedOwners: new Set(), originalConfig: {}, timelineSession: null };
+const state = { token: "", fleet: null, routines: [], selected: null, selectedRoutine: null, detail: null, refreshTimer: null, collapsedOwners: new Set(), originalConfig: {}, timelineSession: null };
 const $ = id => document.getElementById(id);
 
 function tokenFromLocation() {
@@ -35,14 +35,19 @@ function selectedSummary() {
 }
 
 async function refreshFleet(keepSelection=true) {
-  state.fleet = await api("/api/fleet");
-  renderFleet();
+  const [fleet,routineData] = await Promise.all([api("/api/fleet"),api("/api/routines")]);
+  state.fleet=fleet;state.routines=routineData.routines||[];
+  renderFleet();renderRoutines();
   if (keepSelection && state.selected) {
     const found=selectedSummary();
     if(found) renderSummary(found);
   }
+  if(keepSelection&&state.selectedRoutine){if(selectedRoutine())renderRoutineDetail();else{$("routine-view").classList.add("hidden");$("empty").classList.remove("hidden");state.selectedRoutine=null;}}
   $("connection-dot").classList.add("online"); $("connection-label").textContent="Live";
 }
+function routineState(r){const active=[...(r.runs||[])].reverse().find(x=>x.status==="starting"||x.status==="running");return active?active.status:(r.enabled?((r.runs||[]).at(-1)?.status||"scheduled"):"paused");}
+function scheduleText(r){if(r.schedule_kind==="manual")return "Manual";if(r.schedule_kind==="interval")return `Every ${r.interval_minutes}m`;return `${r.daily_at} ${r.timezone}`;}
+function renderRoutines(){const root=$("routines");root.innerHTML="";for(const r of state.routines){const status=routineState(r),b=document.createElement("button");b.className=`routine-item ${r.routine_id===state.selectedRoutine?"active":""}`;b.innerHTML=`<span class="status-dot ${escapeHtml(status)}"></span><span><strong>${escapeHtml(r.name)}</strong><small>${escapeHtml(status)} · ${escapeHtml(scheduleText(r))}</small></span>`;b.onclick=()=>selectRoutine(r.routine_id);root.appendChild(b);}}
 function matches(session) {
   const q=$("search").value.trim().toLowerCase(), f=$("status-filter").value;
   if(q && !`${session.task} ${session.cwd} ${session.session_id}`.toLowerCase().includes(q)) return false;
@@ -75,9 +80,12 @@ function renderFleet() {
   }
 }
 async function selectSession(id) {
-  state.selected=id; renderFleet();
+  state.selected=id;state.selectedRoutine=null;renderFleet();renderRoutines();$("routine-view").classList.add("hidden");
   await loadDetail();
 }
+function selectedRoutine(){return state.routines.find(r=>r.routine_id===state.selectedRoutine)||null;}
+function selectRoutine(id){state.selectedRoutine=id;state.selected=null;state.detail=null;renderFleet();renderRoutines();$("empty").classList.add("hidden");$("session-view").classList.add("hidden");$("inspector").classList.add("hidden");$("routine-view").classList.remove("hidden");renderRoutineDetail();}
+function renderRoutineDetail(){const r=selectedRoutine();if(!r)return;const active=[...(r.runs||[])].reverse().find(x=>["starting","running"].includes(x.status)),status=routineState(r);$("routine-title").textContent=r.name;$("routine-status").textContent=status;$("routine-status").className=`badge ${status}`;$("routine-id").textContent=r.routine_id;$("routine-next").textContent=r.next_run_at?`Next ${dateTime(r.next_run_at)}`:"No scheduled run";$("routine-prompt").textContent=r.prompt;$("routine-facts").innerHTML=facts({Schedule:scheduleText(r),Directory:r.cwd,Orchestrator:r.owner_id,Model:r.model,Effort:r.effort,Approval:r.tool_approval,"Work mode":r.work_mode,Delegation:r.delegation,"Overlap policy":r.overlap_policy,"Queued triggers":r.pending_triggers||0});$("routine-toggle").textContent=r.enabled?"Pause":"Enable";$("routine-stop").disabled=!active||!active.session_id;const runs=[...(r.runs||[])].reverse();$("routine-runs").innerHTML=runs.length?runs.map(run=>`<div class="routine-run"><strong>${escapeHtml(run.status)}</strong><span>${escapeHtml(run.message||run.error||"No result recorded yet")}<small>${escapeHtml(run.trigger||"")} · ${escapeHtml(dateTime(run.started_at||run.created_at))}${run.finished_at?` → ${escapeHtml(dateTime(run.finished_at))}`:""}</small></span>${run.session_id?`<a href="#" data-session="${escapeHtml(run.session_id)}">Open agent</a>`:""}</div>`).join(""):`<div class="plan-empty">No runs yet. Run it now or wait for its schedule.</div>`;for(const link of $("routine-runs").querySelectorAll("[data-session]"))link.onclick=e=>{e.preventDefault();selectSession(link.dataset.session);};}
 async function loadDetail() {
   if(!state.selected)return;
   try { state.detail=await api(`/api/sessions/${encodeURIComponent(state.selected)}`); renderDetail(); }
@@ -147,6 +155,10 @@ async function eventStream() {
   }
 }
 function scheduleRefresh(event){clearTimeout(state.refreshTimer);state.refreshTimer=setTimeout(async()=>{await refreshFleet();if(state.selected && (!event.session_id||event.session_id===state.selected||(event.event||{}).session_id===state.selected))await loadDetail();},180);}
+function setRoutineScheduleFields(){const kind=$("routine-schedule").value;document.querySelector(".daily-field").classList.toggle("hidden",kind!=="daily");document.querySelector(".interval-field").classList.toggle("hidden",kind!=="interval");}
+function openRoutineForm(r=null){const owners=state.fleet?.orchestrators||[],models=state.fleet?.models?.models||[],efforts=state.fleet?.models?.effort_options||[];$("routine-form-title").textContent=r?"Edit loop agent":"New loop agent";$("routine-edit-id").value=r?.routine_id||"";$("routine-name").value=r?.name||"";$("routine-owner").innerHTML=owners.map(o=>`<option value="${escapeHtml(o.owner_id)}">${escapeHtml(o.label)}</option>`).join("");$("routine-owner").value=r?.owner_id||owners[0]?.owner_id||"";$("routine-owner").disabled=Boolean(r);$("routine-cwd").value=r?.cwd||"";$("routine-instructions").value=r?.prompt||"";$("routine-schedule").value=r?.schedule_kind||"daily";$("routine-daily").value=r?.daily_at||"09:00";$("routine-interval").value=r?.interval_minutes||1440;$("routine-timezone").value=r?.timezone||Intl.DateTimeFormat().resolvedOptions().timeZone||"UTC";$("routine-overlap").value=r?.overlap_policy||"skip";$("routine-delegation").value=r?.delegation||"allowed";$("routine-model").innerHTML=models.map(m=>`<option value="${escapeHtml(m.ref)}">${escapeHtml(m.ref)}</option>`).join("");$("routine-model").value=r?.model||state.fleet?.models?.default||models[0]?.ref||"";$("routine-effort").innerHTML=efforts.map(v=>`<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join("");$("routine-effort").value=r?.effort||"max";$("routine-approval").value=r?.tool_approval||"auto";$("routine-mode").value=r?.work_mode||"balanced";$("routine-enabled").checked=r?.enabled??true;$("routine-immediate").checked=false;$("run-now-label").classList.toggle("hidden",Boolean(r));setRoutineScheduleFields();$("routine-dialog").showModal();}
+function routineFormData(){return {name:$("routine-name").value.trim(),owner_id:$("routine-owner").value,cwd:$("routine-cwd").value.trim(),prompt:$("routine-instructions").value.trim(),schedule_kind:$("routine-schedule").value,daily_at:$("routine-daily").value,interval_minutes:Number($("routine-interval").value),timezone:$("routine-timezone").value.trim(),overlap_policy:$("routine-overlap").value,delegation:$("routine-delegation").value,model:$("routine-model").value,effort:$("routine-effort").value,tool_approval:$("routine-approval").value,work_mode:$("routine-mode").value,enabled:$("routine-enabled").checked,run_immediately:$("routine-immediate").checked};}
+async function routineAction(action,body={}){const id=state.selectedRoutine;if(!id)return;try{const result=await api(`/api/routines/${encodeURIComponent(id)}/${action}`,{method:"POST",body:JSON.stringify(body)});toast(`${action} succeeded`);await refreshFleet();return result;}catch(e){toast(e.message,true);throw e;}}
 async function authenticate(token){state.token=token;try{const requested=sessionFromLocation();await api("/api/health");sessionStorage.setItem("reasonix-dashboard-token",token);history.replaceState(null,"",location.pathname);$("auth-screen").classList.add("hidden");$("app").classList.remove("hidden");await refreshFleet(false);if(requested&&[...(state.fleet?.orchestrators||[])].some(o=>o.sessions.some(s=>s.session_id===requested)))await selectSession(requested);eventStream();}catch(e){state.token="";$("auth-screen").classList.remove("hidden");$("app").classList.add("hidden");toast("Invalid or expired dashboard token",true);}}
 
 $("auth-form").onsubmit=e=>{e.preventDefault();authenticate($("token-input").value.trim());};
@@ -158,5 +170,8 @@ for(const id of ["model-select","effort-select","approval-select","work-mode-sel
 $("apply-config").onclick=()=>act("configure",configChanges()).then(r=>{$("config-note").textContent=r.note||"Applied";});
 $("stop-button").onclick=()=>{if(confirm("Stop this agent process? Its persisted session remains resumable."))act("stop");};
 $("resume-button").onclick=()=>{const s=selectedSummary();const cwd=prompt("Resume working directory",s?.cwd||"");if(cwd!==null)act("resume",{cwd});};
+$("new-routine").onclick=()=>openRoutineForm();$("routine-edit").onclick=()=>openRoutineForm(selectedRoutine());$("routine-schedule").onchange=setRoutineScheduleFields;for(const id of ["routine-cancel","routine-cancel-bottom"])$(id).onclick=()=>$("routine-dialog").close();
+$("routine-form").onsubmit=async e=>{e.preventDefault();const id=$("routine-edit-id").value,data=routineFormData();try{let saved;if(id){delete data.owner_id;delete data.run_immediately;saved=await api(`/api/routines/${encodeURIComponent(id)}/configure`,{method:"POST",body:JSON.stringify(data)});}else saved=await api("/api/routines",{method:"POST",body:JSON.stringify(data)});$("routine-dialog").close();state.selectedRoutine=saved.routine_id;state.selected=null;await refreshFleet();renderRoutineDetail();toast(id?"Routine updated":"Routine created");}catch(err){toast(err.message,true);}};
+$("routine-run").onclick=()=>routineAction("run");$("routine-stop").onclick=()=>{if(confirm("Stop the active routine parent agent?"))routineAction("stop");};$("routine-toggle").onclick=()=>{const r=selectedRoutine();routineAction("configure",{enabled:!r.enabled});};$("routine-delete").onclick=()=>{if(confirm("Delete this routine and its run history?"))routineAction("delete").then(()=>{state.selectedRoutine=null;$("routine-view").classList.add("hidden");$("empty").classList.remove("hidden");});};
 
 const initial=tokenFromLocation(); if(initial)authenticate(initial); else $("auth-screen").classList.remove("hidden");

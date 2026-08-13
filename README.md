@@ -106,6 +106,12 @@ client and verify the server is listed.
 | `reasonix_restart_agentd(force?)` | Explicitly reload the detached daemon. Source changes already queue a safe automatic reload; `force=true` may terminate live agents. |
 | `reasonix_restart_mcp_server()` | Explicitly restart this orchestrator's MCP server through `launcher.py`; source changes are watched automatically. |
 | `reasonix_dashboard(open_browser?)` | Open or reuse the authenticated local fleet UI for current and previous agents across orchestrators. Supports live steering, stop/resume, configuration, and permission responses. |
+| `reasonix_routine_create(name, prompt, …)` | Create a durable manual, interval, or daily loop agent. Each iteration starts in fresh context and may delegate through native Reasonix subagents. |
+| `reasonix_routine_list(include_prompt?, include_results?)` | Compact routine state, schedule, queued triggers, and latest 20 runs for this orchestrator. Full prompts/results are opt-in. |
+| `reasonix_routine_configure(routine_id, …)` | Edit, pause, or enable a routine; changes apply to future runs. |
+| `reasonix_routine_run(routine_id)` | Queue an immediate run while honoring its skip/queue overlap policy. |
+| `reasonix_routine_stop(routine_id)` | Stop the current parent agent without disabling future scheduled runs. |
+| `reasonix_routine_delete(routine_id)` | Delete an inactive routine and its scheduler run history. Agent transcripts remain in Reasonix. |
 
 ## Local fleet dashboard
 
@@ -148,6 +154,65 @@ HTML, CSS, JavaScript, or backend source changes replaces that verified
 dashboard process and starts the current code; agentd and every agent remain
 untouched. The replacement preserves port 8746 and its authentication token,
 so already-open browser tabs reconnect to the upgraded dashboard.
+
+## Loop agents and routines
+
+Loop agents are durable maintenance routines. They run independently of the
+MCP stdio process, IDE, CLI orchestrator, and dashboard. A singleton
+`routined.py` scheduler stores definitions and the latest 100 run records as
+mode-`0600` JSON under `~/.reasonix-mcp/routines/`. It reloads its own source
+in place when code changes; running agents remain in `agentd` and are not
+interrupted. The default global limit is four concurrent routine parents;
+override it with `REASONIX_MCP_ROUTINE_CONCURRENCY`.
+
+Every iteration calls `spawn` and receives a new session and context. The
+routine instructions and execution contract are injected exactly once into
+that new session: inspect current state, act idempotently, and avoid duplicate
+issues, branches, PRs, or fixes. Previous context is never resumed. Durable run
+history keeps the final result and a link to the persisted agent transcript,
+but it is not fed into the next prompt. A crash after spawn is recovered using
+the unique run marker rather than spawning duplicate work.
+
+Schedules can be `manual`, fixed-delay `interval`, or `daily` at `HH:MM` in an
+IANA timezone. If the machine was off, a past-due schedule runs once after the
+scheduler returns; missed intervals are not replayed in a burst. With
+`overlap_policy=skip`, a due tick while the prior run is active is recorded as
+skipped. With `queue`, up to ten triggers are retained and executed serially.
+Pausing prevents scheduled runs but still permits an explicit **Run now**.
+
+`delegation=allowed` or `encouraged` tells the fresh parent it may use
+Reasonix's native `task`, `fleet`, `parallel_tasks`, or configured subagent
+skills. Child lifecycle remains managed by Reasonix, and the parent must review
+child results before acting. `disabled` explicitly prohibits delegation for
+that routine.
+
+The dashboard's **Loop agents** section can create and fully configure a
+routine, run it immediately, pause/enable it, stop its active parent, inspect
+run results, or open the run's normal agent timeline. Routine sessions use a
+separate internal owner, so they do not pollute ordinary orchestrator fleets.
+The creator's MCP client can only list or mutate its own routines; the local
+authenticated dashboard intentionally provides machine-wide administration.
+
+Unattended routines default to `tool_approval=auto`, not YOLO. Choose YOLO only
+for trusted repositories and tightly scoped prompts. Ask-mode permission and
+agent-question gates remain pending until answered from the dashboard; the
+scheduler never guesses. External effects such as creating or merging a GitHub
+PR require credentials and explicit authorization in the routine prompt. A
+routine does not auto-merge merely because it can inspect GitHub.
+
+Example daily issue/PR maintenance configuration:
+
+```text
+name: GitHub issue maintainer
+schedule: daily, 09:00 Europe/Athens
+overlap: skip
+delegation: encouraged
+approval: auto
+prompt: Inspect currently open issues and PRs. Do not duplicate existing work.
+        Select at most one well-scoped mechanical fix. Delegate independent
+        investigation when useful, review the result, run focused tests, and
+        open a PR with evidence. Never merge or close user reports yourself.
+```
 
 ### Completion and decision delivery
 
