@@ -132,7 +132,10 @@ The sidebar groups current and previous sessions by orchestrator. Selecting an
 agent shows its persisted runs, agent messages, reasoning blocks, tool calls
 and results, plan, and current work. Orchestrators are collapsible preview
 buttons; active runs are the default view and fleets/runs are ordered newest
-first. The selected run timeline opens at its latest activity. Accepted
+first. The selected agent or loop-agent ID is kept in the credential-free URL
+fragment, so refreshing the page restores the same detail view—including a
+routine-owned run that is not listed in an ordinary orchestrator fleet. The
+selected run timeline opens at its latest activity. Accepted
 mid-turn steering messages are persisted in an owner-scoped orchestration
 timeline and merged at their transcript byte boundary, so the guidance appears
 between the agent events that happened before and after it even when Reasonix
