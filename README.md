@@ -140,7 +140,8 @@ local fleets.
 Only one healthy dashboard is reused. Calling `reasonix_dashboard()` after its
 HTML, CSS, JavaScript, or backend source changes replaces that verified
 dashboard process and starts the current code; agentd and every agent remain
-untouched.
+untouched. The replacement preserves its loopback port and authentication
+token, so already-open browser tabs reconnect to the upgraded dashboard.
 
 ### Completion and decision delivery
 

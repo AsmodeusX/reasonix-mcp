@@ -156,6 +156,7 @@ def main() -> None:
         replaced = asyncio.run(mcp_server.reasonix_dashboard(open_browser=False))
         assert replaced["started"] is True, replaced
         assert int(replaced["pid"]) != dashboard_pid, (replaced, dashboard_pid)
+        assert replaced["url"] == first["url"], (replaced, first)
         dashboard_pid = int(replaced["pid"])
         with open(state_file, encoding="utf-8") as fh:
             runtime = json.load(fh)

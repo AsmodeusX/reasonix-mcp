@@ -1084,7 +1084,10 @@ async def _reasonix_dashboard_locked(open_browser: bool) -> dict:
         }
 
     old_pid = int(state.get("pid") or 0)
-    if _is_dashboard_process(old_pid):
+    verified_old_process = _is_dashboard_process(old_pid)
+    preserved_port = int(state.get("port") or 0) if verified_old_process else 0
+    preserved_token = str(state.get("token") or "") if verified_old_process else ""
+    if verified_old_process:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.kill(old_pid, 15)
         for _ in range(30):
@@ -1106,7 +1109,8 @@ async def _reasonix_dashboard_locked(open_browser: bool) -> dict:
             [
                 sys.executable,
                 DASHBOARD_SCRIPT,
-                "--port", "0",
+                "--port", str(preserved_port),
+                *(["--token", preserved_token] if preserved_token else []),
                 "--state-file", DASHBOARD_STATE,
             ],
             stdin=subprocess.DEVNULL,
