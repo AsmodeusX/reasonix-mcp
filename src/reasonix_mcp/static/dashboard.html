@@ -27,6 +27,7 @@
       <div class="sidebar-tools">
         <input id="search" type="search" placeholder="Search agents">
         <select id="status-filter">
+          <option value="active" selected>Active runs</option>
           <option value="all">All agents</option>
           <option value="running">Running</option>
           <option value="current">Current</option>
@@ -84,7 +85,7 @@
 
           <section class="panel conversation-panel">
             <div class="panel-heading">
-              <h2>Conversation</h2>
+              <h2>Runs <span id="run-count" class="count"></span></h2>
               <button id="reload-detail" class="text-button">Reload transcript</button>
             </div>
             <div id="messages" class="messages"></div>
@@ -115,6 +116,7 @@
     <aside id="inspector" class="inspector hidden">
       <section>
         <h2>Agent controls</h2>
+        <div id="current-config" class="current-config"></div>
         <label>Model<select id="model-select"></select></label>
         <label>Effort<select id="effort-select"></select></label>
         <label>Approval<select id="approval-select">

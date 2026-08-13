@@ -102,7 +102,29 @@ def main() -> None:
 
         common.write_session_owner("session-one", "owner-one")
         common.save_owner_sessions("owner-one", {"session-one"})
+        transcript_path = os.path.join(reasonix_home, "sessions", "session-one.jsonl")
+        with open(transcript_path, "w", encoding="utf-8") as fh:
+            for row in [
+                {"role": "system", "content": 'Current workspace: "/tmp/project"'},
+                {"role": "user", "createdAt": 1_786_000_000_000, "content": (
+                    '<capability-route version="1">internal routing</capability-route>\n'
+                    "Build the requested feature"
+                )},
+                {"role": "assistant", "reasoning_content": "Inspect the inputs", "tool_calls": [
+                    {"id": "call-1", "name": "read_file", "arguments": '{"path":"a"}'}
+                ]},
+                {"role": "tool", "name": "read_file", "tool_call_id": "call-1", "content": "contents"},
+                {"role": "assistant", "content": "Implemented **successfully**."},
+            ]:
+                fh.write(json.dumps(row) + "\n")
         assert dashboard.owner_for_session("session-one") == "owner-one"
+        assert dashboard.transcript_preview("session-one")["task"] == "Build the requested feature"
+        messages, transcript = dashboard.transcript_messages("session-one")
+        entries = transcript["runs"][0]["entries"]
+        assert [entry["kind"] for entry in entries] == [
+            "message", "reasoning", "tool_call", "tool_result", "message"
+        ], entries
+        assert messages[-1]["text"] == "Implemented **successfully**."
         try:
             dashboard.owner_for_session("session-two")
             raise AssertionError("unknown session was accepted")

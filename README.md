@@ -117,10 +117,16 @@ random 256-bit token in its fragment; runtime state is stored mode `0600` in
 authenticates every API, event stream, and action.
 
 The sidebar groups current and previous sessions by orchestrator. Selecting an
-agent shows its persisted conversation, tool calls, plan, and current work.
+agent shows its persisted runs, agent messages, reasoning blocks, tool calls
+and results, plan, and current work. Orchestrators are collapsible preview
+buttons; active runs are the default view and fleets/runs are ordered newest
+first. The selected run timeline opens at its latest activity.
 For a live agent, the user can steer or follow up, stop it, switch model,
 effort, work mode, or approval policy, and answer pending permission or agent
-questions. Stopped and historical sessions can be resumed from the UI.
+questions. The control panel shows the values reported by the agent separately
+from queued changes; an old daemon that cannot report them says `Unknown`
+instead of presenting a placeholder as current state. Stopped and historical
+sessions can be resumed from the UI.
 
 Dashboard observation is deliberately separate from orchestration delivery:
 it opens one read-only event socket per owner and never calls `reasonix_watch`,

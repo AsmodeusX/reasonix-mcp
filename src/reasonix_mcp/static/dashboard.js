@@ -1,10 +1,11 @@
-const state = { token: "", fleet: null, selected: null, detail: null, refreshTimer: null };
+const state = { token: "", fleet: null, selected: null, detail: null, refreshTimer: null, collapsedOwners: new Set(), originalConfig: {} };
 const $ = id => document.getElementById(id);
 
 function tokenFromLocation() {
   const hash = new URLSearchParams(location.hash.replace(/^#/, ""));
   return hash.get("token") || sessionStorage.getItem("reasonix-dashboard-token") || "";
 }
+function sessionFromLocation() { return new URLSearchParams(location.hash.replace(/^#/, "")).get("session") || ""; }
 function headers(json=false) {
   const h = { Authorization: `Bearer ${state.token}` };
   if (json) h["Content-Type"] = "application/json";
@@ -23,7 +24,10 @@ function toast(message, error=false) {
 }
 function escapeHtml(value="") { const d=document.createElement("div"); d.textContent=String(value); return d.innerHTML; }
 function shortPath(path="") { const parts=path.split("/").filter(Boolean); return parts.length ? parts.slice(-2).join("/") : "Unknown project"; }
-function when(ts) { if (!ts) return ""; const d=new Date(ts*1000); const delta=(Date.now()-d)/1000; if(delta<60)return "now"; if(delta<3600)return `${Math.floor(delta/60)}m`; if(delta<86400)return `${Math.floor(delta/3600)}h`; return d.toLocaleDateString(); }
+function dateOf(ts) { return new Date(ts > 1e12 ? ts : ts*1000); }
+function when(ts) { if (!ts) return ""; const d=dateOf(ts); const delta=(Date.now()-d)/1000; if(delta<60)return "now"; if(delta<3600)return `${Math.floor(delta/60)}m`; if(delta<86400)return `${Math.floor(delta/3600)}h`; return d.toLocaleDateString(); }
+function dateTime(ts) { return ts ? dateOf(ts).toLocaleString() : "Time unavailable"; }
+function formatText(value="") { return escapeHtml(value).replace(/^#{1,6}\s+(.+)$/gm,'<strong class="md-heading">$1</strong>').replace(/^\s*-\s+/gm,"• ").replace(/`([^`\n]+)`/g,"<code>$1</code>").replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>"); }
 function selectedSummary() {
   if (!state.fleet || !state.selected) return null;
   for (const owner of state.fleet.orchestrators) for (const session of owner.sessions) if(session.session_id===state.selected) return session;
@@ -42,6 +46,7 @@ async function refreshFleet(keepSelection=true) {
 function matches(session) {
   const q=$("search").value.trim().toLowerCase(), f=$("status-filter").value;
   if(q && !`${session.task} ${session.cwd} ${session.session_id}`.toLowerCase().includes(q)) return false;
+  if(f==="active" && session.status!=="running" && !(session.live&&session.permission_request)) return false;
   if(f==="running" && session.status!=="running") return false;
   if(f==="current" && !session.live) return false;
   if(f==="previous" && !session.historical) return false;
@@ -53,13 +58,19 @@ function renderFleet() {
   for(const owner of state.fleet?.orchestrators||[]) {
     const sessions=owner.sessions.filter(matches); if(!sessions.length) continue;
     const section=document.createElement("section"); section.className="owner";
-    section.innerHTML=`<div class="owner-header"><span>${escapeHtml(owner.label)}</span><span class="owner-count">${sessions.length}</span></div>`;
+    const collapsed=state.collapsedOwners.has(owner.owner_id);
+    const ownerButton=document.createElement("button");ownerButton.type="button";ownerButton.className="owner-header";ownerButton.setAttribute("aria-expanded",String(!collapsed));
+    const preview=sessions.slice(0,2).map(s=>`<span>${escapeHtml((s.task||s.session_id).slice(0,38))}</span>`).join("");
+    ownerButton.innerHTML=`<span class="owner-caret">${collapsed?"›":"⌄"}</span><span class="owner-name">${escapeHtml(owner.label)}</span><span class="owner-stats"><b>${owner.counts.running}</b> running · ${sessions.length}</span><span class="owner-preview">${preview}</span>`;
+    ownerButton.onclick=()=>{if(collapsed)state.collapsedOwners.delete(owner.owner_id);else state.collapsedOwners.add(owner.owner_id);renderFleet();};section.appendChild(ownerButton);
+    const children=document.createElement("div");children.className=`owner-agents${collapsed?" hidden":""}`;
     for(const session of sessions) {
       const button=document.createElement("button"); button.className=`session-item ${session.session_id===state.selected?"active":""}`;
       const dot=session.permission_request?"permission":session.status;
-      button.innerHTML=`<span class="status-dot ${escapeHtml(dot)}"></span><span><strong>${escapeHtml(session.task||session.session_id)}</strong><small>${escapeHtml(shortPath(session.cwd))} · ${escapeHtml(session.status)} ${when(session.updated_at)}</small></span>`;
-      button.onclick=()=>selectSession(session.session_id); section.appendChild(button);
+      button.innerHTML=`<span class="status-dot ${escapeHtml(dot)}"></span><span><strong>${escapeHtml(session.task||session.session_id)}</strong><small>${escapeHtml(shortPath(session.cwd))} · ${escapeHtml(session.status)} · ${when(session.updated_at)}</small></span>`;
+      button.onclick=()=>selectSession(session.session_id); children.appendChild(button);
     }
+    section.appendChild(children);
     root.appendChild(section);
   }
 }
@@ -86,16 +97,20 @@ function renderDetail() {
   const plan=session.plan||summary.plan||[]; $("plan-count").textContent=plan.length?`${plan.filter(x=>x.status==="completed").length}/${plan.length}`:"";
   $("current-work").textContent=(session.current_work||summary.current_work||{}).summary||"";
   $("plan").innerHTML=plan.length?plan.map(item=>`<div class="plan-item ${escapeHtml(item.status)}"><span class="plan-state ${escapeHtml(item.status)}">${escapeHtml(item.status||"pending")}</span><span class="plan-text">${escapeHtml(item.content||item.title||"")}</span></div>`).join(""):`<div class="plan-empty">No structured plan reported.</div>`;
-  $("messages").innerHTML=state.detail.messages.length?state.detail.messages.map(m=>`<article class="message ${m.role}"><div class="message-role">${escapeHtml(m.role)}</div><div class="message-text">${escapeHtml(m.text)}</div>${m.work_duration_ms?`<div class="message-meta">Worked ${Math.round(m.work_duration_ms/1000)}s</div>`:""}</article>`).join(""):`<div class="plan-empty">No persisted messages yet.</div>`;
+  const runs=state.detail.transcript.runs||[];$("run-count").textContent=runs.length?`${runs.length} / ${state.detail.transcript.runs_total}`:"";
+  $("messages").innerHTML=runs.length?runs.map(run=>renderRun(run,summary.status==="running")).join(""):`<div class="plan-empty">No persisted runs yet.</div>`;
+  const scrollToLatest=()=>{$("messages").scrollTop=$("messages").scrollHeight;};requestAnimationFrame(scrollToLatest);setTimeout(scrollToLatest,0);
   const tools=state.detail.transcript.tool_calls||[]; $("tool-count").textContent=tools.length; $("tool-calls").innerHTML=tools.map(t=>`<div class="tool-call"><strong>${escapeHtml(t.name)}</strong><pre>${escapeHtml(t.arguments)}</pre></div>`).join("")||`<div class="plan-empty">No recorded tool calls.</div>`;
   renderPermission(session.permission_request||summary.permission_request_detail||null);
-  populateConfig(config);
+  populateConfig(config,session.config_known,session.config_source,session.pending_config||{});
   $("stop-button").disabled=!summary.live; $("resume-button").disabled=summary.live;
   $("resume-button").classList.toggle("hidden", summary.live);
   $("message-input").disabled=!summary.live; $("composer").querySelector("button[type=submit]").disabled=!summary.live;
   $("session-facts").innerHTML=facts({Status:summary.status,Project:summary.cwd||"—",Owner:state.detail.owner_id,Resumable:String(Boolean(summary.resumable)),"Stop reason":summary.stop_reason||"—"});
-  $("transcript-facts").innerHTML=facts({Messages:state.detail.transcript.messages_total||0,"Tool calls":state.detail.transcript.tool_calls_total||0,Updated:when(state.detail.transcript.updated_at),Path:state.detail.transcript.transcript_path||"—"});
+  $("transcript-facts").innerHTML=facts({Runs:state.detail.transcript.runs_total||0,Messages:state.detail.transcript.messages_total||0,"Tool calls":state.detail.transcript.tool_calls_total||0,Updated:when(state.detail.transcript.updated_at),Path:state.detail.transcript.transcript_path||"—"});
 }
+function renderRun(run,isLive){const active=Boolean(run.active&&isLive);const entries=(run.entries||[]).map(renderEntry).join("");return `<section class="run-card ${active?"active-run":""}"><header><span>Run ${run.number}</span>${active?`<b class="live-run"><i></i>Active now</b>`:""}<time>${escapeHtml(dateTime(run.started_at))}</time></header><div class="run-timeline">${entries||`<div class="plan-empty">No recorded activity.</div>`}</div></section>`;}
+function renderEntry(entry){if(entry.kind==="message")return `<article class="timeline-entry message ${entry.role}"><div class="entry-marker"></div><div><div class="message-role">${entry.role==="user"?"Prompt":"Agent message"}</div><div class="message-text">${formatText(entry.text)}</div>${entry.work_duration_ms?`<div class="message-meta">Worked ${Math.round(entry.work_duration_ms/1000)}s</div>`:""}</div></article>`;if(entry.kind==="reasoning")return `<article class="timeline-entry reasoning"><div class="entry-marker"></div><div><div class="message-role">Reasoning</div><div class="message-text">${formatText(entry.text)}</div></div></article>`;if(entry.kind==="tool_call")return `<details class="timeline-entry activity"><summary><span class="entry-marker"></span><span>Tool · <strong>${escapeHtml(entry.name)}</strong></span></summary><pre>${escapeHtml(entry.arguments)}</pre></details>`;if(entry.kind==="tool_result")return `<details class="timeline-entry activity result"><summary><span class="entry-marker"></span><span>Result · <strong>${escapeHtml(entry.name)}</strong>${entry.truncated?" (tail)":""}</span></summary><pre>${escapeHtml(entry.text)}</pre></details>`;return "";}
 function facts(obj){return Object.entries(obj).map(([k,v])=>`<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join("");}
 function renderPermission(permission) {
   const card=$("permission-card"); if(!permission){card.classList.add("hidden");return;} card.classList.remove("hidden");
@@ -103,11 +118,19 @@ function renderPermission(permission) {
   const tc=permission.tool_call||{}; $("permission-title").textContent=tc.title||"Agent decision"; $("permission-input").textContent=JSON.stringify(tc.rawInput||{},null,2);
   const root=$("permission-options"); root.innerHTML=""; for(const option of permission.options||[]){const b=document.createElement("button");b.type="button";b.textContent=option.name||option.optionId;b.onclick=()=>act("permission",{option_id:option.optionId});root.appendChild(b);}
 }
-function populateConfig(config) {
-  const models=state.fleet?.models?.models||[], model=$("model-select"); model.innerHTML=`<option value="">Keep current</option>`+models.map(m=>`<option value="${escapeHtml(m.ref)}">${escapeHtml(m.ref)}</option>`).join(""); model.value=config.model||"";
-  const efforts=state.fleet?.models?.effort_options||[]; const effort=$("effort-select"); effort.innerHTML=`<option value="">Keep/default</option>`+efforts.map(e=>`<option value="${e}">${e}</option>`).join(""); effort.value=config.effort||"";
-  $("approval-select").value=config.tool_approval||""; $("work-mode-select").value=config.work_mode||"";
+function populateConfig(config,known,source,pending) {
+  state.originalConfig={...config};const unknown="Not reported by the current agent daemon";
+  const pendingText=Object.entries(pending||{}).map(([k,v])=>`${k}: ${v}`).join(" · ");
+  $("current-config").innerHTML=[['Model',config.model],['Effort',config.effort],['Approval',config.tool_approval],['Mode',config.work_mode]].map(([k,v])=>`<div><span>${k}</span><strong class="${v?"":"unknown"}">${escapeHtml(v||"Unknown")}</strong></div>`).join("")+(!known?`<p>${source==="persisted_pending"?"Showing persisted settings queued for reload.":unknown+". Choose only fields you want to change."}</p>`:"")+(pendingText?`<p class="pending-config">Queued: ${escapeHtml(pendingText)}</p>`:"");
+  const models=state.fleet?.models?.models||[], model=$("model-select");const refs=models.map(m=>m.ref);model.innerHTML=`<option value="">${config.model?"Select a different model":"Choose model…"}</option>`+(config.model&&!refs.includes(config.model)?`<option value="${escapeHtml(config.model)}">${escapeHtml(config.model)} (current)</option>`:"")+models.map(m=>`<option value="${escapeHtml(m.ref)}">${escapeHtml(m.ref)}${m.ref===config.model?" (current)":""}</option>`).join("");model.value=config.model||"";
+  setOptions($("effort-select"),state.fleet?.models?.effort_options||[],config.effort,"Choose effort…");
+  setOptions($("approval-select"),["ask","auto","yolo"],config.tool_approval,"Choose approval…");
+  setOptions($("work-mode-select"),["economy","balanced","delivery"],config.work_mode,"Choose work mode…");
+  updateConfigButton();
 }
+function setOptions(node,values,current,placeholder){node.innerHTML=`<option value="">${current?"Select a different value":placeholder}</option>`+values.map(v=>`<option value="${v}">${v}${v===current?" (current)":""}</option>`).join("");node.value=current||"";}
+function configChanges(){const map={model:"model-select",effort:"effort-select",tool_approval:"approval-select",work_mode:"work-mode-select"},out={};for(const [key,id] of Object.entries(map)){const value=$(id).value;if(value&&value!==state.originalConfig[key])out[key]=value;}return out;}
+function updateConfigButton(){$("apply-config").disabled=!Object.keys(configChanges()).length;}
 async function act(action, body={}) {
   if(!state.selected)return;
   try { const result=await api(`/api/sessions/${encodeURIComponent(state.selected)}/${action}`,{method:"POST",body:JSON.stringify(body)}); toast(result.note||`${action} succeeded`); await refreshFleet(); await loadDetail(); return result; }
@@ -123,14 +146,15 @@ async function eventStream() {
   }
 }
 function scheduleRefresh(event){clearTimeout(state.refreshTimer);state.refreshTimer=setTimeout(async()=>{await refreshFleet();if(state.selected && (!event.session_id||event.session_id===state.selected||(event.event||{}).session_id===state.selected))await loadDetail();},180);}
-async function authenticate(token){state.token=token;try{await api("/api/health");sessionStorage.setItem("reasonix-dashboard-token",token);history.replaceState(null,"",location.pathname);$("auth-screen").classList.add("hidden");$("app").classList.remove("hidden");await refreshFleet(false);eventStream();}catch(e){state.token="";$("auth-screen").classList.remove("hidden");$("app").classList.add("hidden");toast("Invalid or expired dashboard token",true);}}
+async function authenticate(token){state.token=token;try{const requested=sessionFromLocation();await api("/api/health");sessionStorage.setItem("reasonix-dashboard-token",token);history.replaceState(null,"",location.pathname);$("auth-screen").classList.add("hidden");$("app").classList.remove("hidden");await refreshFleet(false);if(requested&&[...(state.fleet?.orchestrators||[])].some(o=>o.sessions.some(s=>s.session_id===requested)))await selectSession(requested);eventStream();}catch(e){state.token="";$("auth-screen").classList.remove("hidden");$("app").classList.add("hidden");toast("Invalid or expired dashboard token",true);}}
 
 $("auth-form").onsubmit=e=>{e.preventDefault();authenticate($("token-input").value.trim());};
 $("search").oninput=renderFleet; $("status-filter").onchange=renderFleet; $("refresh").onclick=()=>refreshFleet().then(loadDetail);
 $("reload-detail").onclick=loadDetail;
 $("composer").onsubmit=e=>{e.preventDefault();const input=$("message-input"),message=input.value.trim();if(!message)return;act("send",{message,expect:$("send-expect").value}).then(()=>input.value="");};
 $("message-input").onkeydown=e=>{if((e.ctrlKey||e.metaKey)&&e.key==="Enter"){$("composer").requestSubmit();}};
-$("apply-config").onclick=()=>act("configure",{model:$("model-select").value,effort:$("effort-select").value,tool_approval:$("approval-select").value,work_mode:$("work-mode-select").value}).then(r=>{$("config-note").textContent=r.note||"Applied";});
+for(const id of ["model-select","effort-select","approval-select","work-mode-select"])$(id).onchange=updateConfigButton;
+$("apply-config").onclick=()=>act("configure",configChanges()).then(r=>{$("config-note").textContent=r.note||"Applied";});
 $("stop-button").onclick=()=>{if(confirm("Stop this agent process? Its persisted session remains resumable."))act("stop");};
 $("resume-button").onclick=()=>{const s=selectedSummary();const cwd=prompt("Resume working directory",s?.cwd||"");if(cwd!==null)act("resume",{cwd});};
 

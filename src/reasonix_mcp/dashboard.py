@@ -16,6 +16,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -42,8 +43,9 @@ DEFAULT_STATE_FILE = os.path.join(
 )
 MAX_BODY = 256_000
 AGENTD_LINE_LIMIT = 16 * 1024 * 1024
-MAX_TRANSCRIPT_MESSAGES = 120
+MAX_TRANSCRIPT_MESSAGES = 400
 MAX_TRANSCRIPT_TEXT = 12_000
+MAX_TOOL_RESULT_TEXT = 8_000
 PREVIEW_BYTES = 256_000
 _preview_cache: dict[str, tuple[int, int, dict]] = {}
 
@@ -171,11 +173,21 @@ def owner_for_session(session_id: str) -> str:
     return owner
 
 
-def _clean_task(text: str) -> str:
+def _clean_user_text(text: str) -> str:
+    text = re.sub(
+        r"\s*<capability-route\b[^>]*>.*?</capability-route>\s*",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
     marker = common.STATUS_PROMPT_MARKER
     if marker in text:
         text = text.split(marker, 1)[0]
-    return " ".join(text.strip().split())[:500]
+    return text.strip()
+
+
+def _clean_task(text: str) -> str:
+    return " ".join(_clean_user_text(text).split())[:500]
 
 
 def transcript_preview(session_id: str) -> dict:
@@ -226,6 +238,8 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
     tool_calls: deque[dict] = deque(maxlen=50)
     messages_total = 0
     tool_calls_total = 0
+    runs: list[dict] = []
+    current_run: dict | None = None
     if not os.path.isfile(path):
         return messages, {"exists": False, "transcript_path": path}
     try:
@@ -236,29 +250,73 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
                 except (ValueError, TypeError):
                     continue
                 role = str(row.get("role") or "")
+                if role == "user" and isinstance(row.get("content"), str):
+                    text = _clean_user_text(row["content"])
+                    if not text:
+                        continue
+                    current_run = {
+                        "started_at": row.get("createdAt"),
+                        "entries": [],
+                    }
+                    runs.append(current_run)
+                if current_run is None and role != "system":
+                    current_run = {"started_at": None, "entries": []}
+                    runs.append(current_run)
                 if role in ("user", "assistant") and isinstance(row.get("content"), str):
                     text = row["content"].strip()
                     if role == "user":
-                        text = _clean_task(text)
+                        text = _clean_user_text(text)
                     if text:
                         messages_total += 1
-                        messages.append({
+                        entry = {
+                            "kind": "message",
                             "role": role,
                             "text": text[-MAX_TRANSCRIPT_TEXT:],
                             "truncated": len(text) > MAX_TRANSCRIPT_TEXT,
                             "created_at": row.get("createdAt"),
                             "work_duration_ms": row.get("workDurationMs"),
-                        })
+                        }
+                        messages.append(entry)
+                        current_run["entries"].append(entry)
+                reasoning = row.get("reasoning_content")
+                if role == "assistant" and isinstance(reasoning, str) and reasoning.strip():
+                    entry = {
+                        "kind": "reasoning",
+                        "role": "assistant",
+                        "text": reasoning.strip()[-MAX_TRANSCRIPT_TEXT:],
+                        "truncated": len(reasoning.strip()) > MAX_TRANSCRIPT_TEXT,
+                        "work_duration_ms": row.get("workDurationMs"),
+                    }
+                    messages.append(entry)
+                    current_run["entries"].append(entry)
                 for call in row.get("tool_calls") or []:
                     if not isinstance(call, dict):
                         continue
                     tool_calls_total += 1
-                    tool_calls.append({
+                    entry = {
+                        "kind": "tool_call",
                         "name": str(call.get("name") or "tool"),
                         "arguments": str(call.get("arguments") or "")[:4000],
+                        "tool_call_id": str(call.get("id") or ""),
+                    }
+                    tool_calls.append(entry)
+                    current_run["entries"].append(entry)
+                if role == "tool" and isinstance(row.get("content"), str):
+                    content = row["content"]
+                    current_run["entries"].append({
+                        "kind": "tool_result",
+                        "name": str(row.get("name") or "tool"),
+                        "text": content[-MAX_TOOL_RESULT_TEXT:],
+                        "truncated": len(content) > MAX_TOOL_RESULT_TEXT,
+                        "tool_call_id": str(row.get("tool_call_id") or ""),
                     })
     except OSError as exc:
         raise DashboardError(f"cannot read transcript: {exc}", 500) from exc
+    kept_runs = runs[-30:]
+    kept_entries = sum(len(run["entries"]) for run in kept_runs)
+    for index, run in enumerate(kept_runs):
+        run["number"] = len(runs) - len(kept_runs) + index + 1
+        run["active"] = index == len(kept_runs) - 1
     return list(messages), {
         "exists": True,
         "transcript_path": path,
@@ -266,6 +324,9 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
         "messages_truncated": messages_total > MAX_TRANSCRIPT_MESSAGES,
         "tool_calls": list(tool_calls),
         "tool_calls_total": tool_calls_total,
+        "runs": list(reversed(kept_runs)),
+        "runs_total": len(runs),
+        "timeline_entries": kept_entries,
         "updated_at": os.path.getmtime(path),
     }
 
@@ -505,7 +566,10 @@ async def fleet_snapshot() -> dict:
                 item.setdefault("status", "previous")
                 item["resumable"] = bool(preview["transcript_path"])
             sessions.append(item)
-        sessions.sort(key=lambda item: (item.get("updated_at") or 0), reverse=True)
+        sessions.sort(
+            key=lambda item: (bool(item.get("live")), item.get("updated_at") or 0),
+            reverse=True,
+        )
         projects = sorted({item.get("cwd") for item in sessions if item.get("cwd")})
         groups.append({
             "owner_id": owner,
@@ -517,7 +581,20 @@ async def fleet_snapshot() -> dict:
                 "current": sum(bool(item.get("live")) for item in sessions),
                 "previous": sum(bool(item.get("historical")) for item in sessions),
             },
+            "latest_at": max((item.get("updated_at") or 0 for item in sessions), default=0),
+            "latest_active_at": max(
+                (item.get("updated_at") or 0 for item in sessions if item.get("live")),
+                default=0,
+            ),
         })
+    groups.sort(
+        key=lambda group: (
+            bool(group["counts"]["current"]),
+            group["latest_active_at"],
+            group["latest_at"],
+        ),
+        reverse=True,
+    )
     return {"orchestrators": groups, "models": common.available_models()}
 
 
@@ -547,6 +624,15 @@ async def api_session(request: Request) -> Response:
         cached = request.app.state.dashboard.permission_requests.get(session_id)
         if cached:
             live["permission_request"] = cached
+    persisted_config = common.read_session_config(session_id)
+    if live is not None:
+        reported_config = live.get("config")
+        live["config_known"] = isinstance(reported_config, dict) and bool(reported_config)
+        live["config_source"] = "agent" if live["config_known"] else (
+            "persisted_pending" if persisted_config else "unavailable"
+        )
+        if not live["config_known"]:
+            live["config"] = persisted_config
     return JSONResponse({
         "session_id": session_id,
         "owner_id": owner,
@@ -555,6 +641,8 @@ async def api_session(request: Request) -> Response:
             "status": "previous",
             "resumable": transcript["exists"],
             "config": common.read_session_config(session_id),
+            "config_known": bool(persisted_config),
+            "config_source": "persisted",
         },
         "messages": messages,
         "transcript": transcript,
