@@ -125,6 +125,11 @@ def main() -> None:
             "message", "reasoning", "tool_call", "tool_result", "message"
         ], entries
         assert messages[-1]["text"] == "Implemented **successfully**."
+        missing_messages, missing_transcript = dashboard.transcript_messages("missing")
+        assert missing_messages == []
+        assert missing_transcript["runs"] == []
+        assert missing_transcript["tool_calls"] == []
+        json.dumps({"messages": missing_messages, "transcript": missing_transcript})
         try:
             dashboard.owner_for_session("session-two")
             raise AssertionError("unknown session was accepted")

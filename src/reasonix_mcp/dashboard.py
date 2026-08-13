@@ -241,7 +241,18 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
     runs: list[dict] = []
     current_run: dict | None = None
     if not os.path.isfile(path):
-        return messages, {"exists": False, "transcript_path": path}
+        return [], {
+            "exists": False,
+            "transcript_path": path,
+            "messages_total": 0,
+            "messages_truncated": False,
+            "tool_calls": [],
+            "tool_calls_total": 0,
+            "runs": [],
+            "runs_total": 0,
+            "timeline_entries": 0,
+            "updated_at": None,
+        }
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
