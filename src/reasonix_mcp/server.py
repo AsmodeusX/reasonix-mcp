@@ -121,6 +121,7 @@ AGENTD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agentd
 DASHBOARD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.py")
 DASHBOARD_STATE = os.path.join(os.path.dirname(common.agentd_sock_path()), "dashboard.json")
 DASHBOARD_LOCK = os.path.join(os.path.dirname(common.agentd_sock_path()), "dashboard.lock")
+DASHBOARD_PORT = int(os.environ.get("REASONIX_MCP_DASHBOARD_PORT", "8746"))
 MCP_RESTART_EXIT_CODE = 75
 
 _agentd_reader: asyncio.StreamReader | None = None
@@ -1070,6 +1071,7 @@ async def _reasonix_dashboard_locked(open_browser: bool) -> dict:
     health = await asyncio.to_thread(_dashboard_health, state)
     if (
         health
+        and int(state.get("port") or 0) == DASHBOARD_PORT
         and state.get("source_signature") == expected_signature
         and health.get("source_signature") == expected_signature
     ):
@@ -1085,7 +1087,6 @@ async def _reasonix_dashboard_locked(open_browser: bool) -> dict:
 
     old_pid = int(state.get("pid") or 0)
     verified_old_process = _is_dashboard_process(old_pid)
-    preserved_port = int(state.get("port") or 0) if verified_old_process else 0
     preserved_token = str(state.get("token") or "") if verified_old_process else ""
     if verified_old_process:
         with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -1109,7 +1110,7 @@ async def _reasonix_dashboard_locked(open_browser: bool) -> dict:
             [
                 sys.executable,
                 DASHBOARD_SCRIPT,
-                "--port", str(preserved_port),
+                "--port", str(DASHBOARD_PORT),
                 *(["--token", preserved_token] if preserved_token else []),
                 "--state-file", DASHBOARD_STATE,
             ],

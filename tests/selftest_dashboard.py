@@ -8,6 +8,7 @@ import contextlib
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import time
@@ -20,6 +21,12 @@ sys.path.insert(0, PACKAGE)
 
 import common  # noqa: E402
 import dashboard  # noqa: E402
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def request(url: str, token: str = "") -> tuple[int, dict, dict]:
@@ -93,6 +100,7 @@ def main() -> None:
     scratch = tempfile.mkdtemp(prefix="rxmcp-dashboard-")
     old_home = os.environ.get("REASONIX_HOME")
     old_sock = os.environ.get("REASONIX_MCP_AGENTD_SOCK")
+    old_dashboard_port = os.environ.get("REASONIX_MCP_DASHBOARD_PORT")
     dashboard_pid = 0
     try:
         reasonix_home = os.path.join(scratch, "home")
@@ -142,6 +150,7 @@ def main() -> None:
         shutil.rmtree(os.path.join(reasonix_home, "orchestrators"), ignore_errors=True)
         shutil.rmtree(os.path.join(reasonix_home, "sessions"), ignore_errors=True)
 
+        os.environ["REASONIX_MCP_DASHBOARD_PORT"] = str(free_port())
         import server as mcp_server  # noqa: E402
 
         first, second = asyncio.run(concurrent_start(mcp_server))
@@ -198,6 +207,10 @@ def main() -> None:
             os.environ.pop("REASONIX_MCP_AGENTD_SOCK", None)
         else:
             os.environ["REASONIX_MCP_AGENTD_SOCK"] = old_sock
+        if old_dashboard_port is None:
+            os.environ.pop("REASONIX_MCP_DASHBOARD_PORT", None)
+        else:
+            os.environ["REASONIX_MCP_DASHBOARD_PORT"] = old_dashboard_port
         shutil.rmtree(scratch, ignore_errors=True)
 if __name__ == "__main__":
     main()
