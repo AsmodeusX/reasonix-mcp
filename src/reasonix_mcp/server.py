@@ -14,18 +14,24 @@ Tools:
   reasonix_spawn / reasonix_resume / reasonix_send / reasonix_poll
   reasonix_watch / reasonix_wait / reasonix_list / reasonix_models / reasonix_transcript
   reasonix_respond_permission / reasonix_stop / reasonix_restart_agentd /
-  reasonix_restart_mcp_server / reasonix_configure
+  reasonix_restart_mcp_server / reasonix_configure / reasonix_dashboard
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
+import hashlib
 import itertools
 import json
 import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+import webbrowser
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver import Context
@@ -88,6 +94,9 @@ Lifecycle controls:
   its live agents are stopped; force=true terminates live agents and affects
   every orchestrator connected to that daemon. Use it after agentd or
   acp_bridge changes. Use reasonix_restart_mcp_server after server.py changes.
+- reasonix_dashboard() opens a loopback-only authenticated fleet UI. It sees
+  current and previous sessions across local orchestrators without consuming
+  their watch queues; actions are owner-scoped by persisted session metadata.
 When launcher.py is configured, Python source changes restart this MCP
 front-end automatically and replay its MCP handshake. An in-flight watch/wait
 is completed with server_restarted=true so the orchestrator can immediately
@@ -109,6 +118,9 @@ mcp = MCPServer("reasonix", instructions=MCP_INSTRUCTIONS)
 
 AGENT_EVENT_METHOD = "reasonix/agent_event"
 AGENTD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agentd.py")
+DASHBOARD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.py")
+DASHBOARD_STATE = os.path.join(os.path.dirname(common.agentd_sock_path()), "dashboard.json")
+DASHBOARD_LOCK = os.path.join(os.path.dirname(common.agentd_sock_path()), "dashboard.lock")
 MCP_RESTART_EXIT_CODE = 75
 
 _agentd_reader: asyncio.StreamReader | None = None
@@ -993,6 +1005,160 @@ async def reasonix_stop(session_id: str, ctx: Context | None = None) -> dict:
     _capture_relay_ctx(ctx)
     _require_owned(session_id)
     return await _rpc("stop", {"session_id": session_id})
+
+
+def _dashboard_source_signature() -> str:
+    digest = hashlib.sha256()
+    package_dir = os.path.dirname(DASHBOARD_SCRIPT)
+    for path in [
+        DASHBOARD_SCRIPT,
+        os.path.join(package_dir, "static", "dashboard.html"),
+        os.path.join(package_dir, "static", "dashboard.css"),
+        os.path.join(package_dir, "static", "dashboard.js"),
+    ]:
+        digest.update(os.path.basename(path).encode())
+        try:
+            with open(path, "rb") as fh:
+                digest.update(fh.read())
+        except OSError:
+            digest.update(b"missing")
+    return digest.hexdigest()
+
+
+def _read_dashboard_state() -> dict:
+    try:
+        with open(DASHBOARD_STATE, encoding="utf-8") as fh:
+            state = json.load(fh)
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _dashboard_health(state: dict) -> dict | None:
+    token = str(state.get("token") or "")
+    host = str(state.get("host") or "127.0.0.1")
+    port = int(state.get("port") or 0)
+    if not token or not port:
+        return None
+    host_url = f"[{host}]" if ":" in host else host
+    request = urllib.request.Request(
+        f"http://{host_url}:{port}/api/health",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=1.0) as response:
+            value = json.load(response)
+        return value if isinstance(value, dict) and value.get("ok") else None
+    except (OSError, ValueError, TypeError, urllib.error.URLError):
+        return None
+
+
+def _is_dashboard_process(pid: int) -> bool:
+    if pid <= 1:
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            command = fh.read().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        return False
+    return os.path.abspath(DASHBOARD_SCRIPT) in command
+
+
+async def _reasonix_dashboard_locked(open_browser: bool) -> dict:
+    expected_signature = _dashboard_source_signature()
+    state = _read_dashboard_state()
+    health = await asyncio.to_thread(_dashboard_health, state)
+    if (
+        health
+        and state.get("source_signature") == expected_signature
+        and health.get("source_signature") == expected_signature
+    ):
+        if open_browser:
+            await asyncio.to_thread(webbrowser.open, str(state["url"]))
+        return {
+            "running": True,
+            "started": False,
+            "url": state["url"],
+            "pid": health.get("pid") or state.get("pid"),
+            "non_consuming_observer": True,
+        }
+
+    old_pid = int(state.get("pid") or 0)
+    if _is_dashboard_process(old_pid):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(old_pid, 15)
+        for _ in range(30):
+            if not _is_dashboard_process(old_pid):
+                break
+            await asyncio.sleep(0.1)
+        if _is_dashboard_process(old_pid):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(old_pid, 9)
+    with contextlib.suppress(OSError):
+        if _read_dashboard_state().get("pid") == state.get("pid"):
+            os.unlink(DASHBOARD_STATE)
+
+    runtime_dir = os.path.dirname(DASHBOARD_STATE)
+    os.makedirs(runtime_dir, exist_ok=True)
+    log = open(os.path.join(runtime_dir, "dashboard.log"), "ab")
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                DASHBOARD_SCRIPT,
+                "--port", "0",
+                "--state-file", DASHBOARD_STATE,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+            env=dict(os.environ),
+        )
+    finally:
+        log.close()
+    for _ in range(100):
+        state = _read_dashboard_state()
+        if state.get("pid") == process.pid:
+            health = await asyncio.to_thread(_dashboard_health, state)
+            if health and health.get("source_signature") == expected_signature:
+                if open_browser:
+                    await asyncio.to_thread(webbrowser.open, str(state["url"]))
+                return {
+                    "running": True,
+                    "started": True,
+                    "url": state["url"],
+                    "pid": process.pid,
+                    "non_consuming_observer": True,
+                }
+        if process.poll() is not None:
+            break
+        await asyncio.sleep(0.1)
+    raise RuntimeError(
+        "Reasonix dashboard failed to start; inspect ~/.reasonix-mcp/dashboard.log"
+    )
+
+
+@mcp.tool()
+async def reasonix_dashboard(open_browser: bool = True) -> dict:
+    """Open or return the local authenticated Reasonix fleet dashboard.
+
+    The dashboard shows current and previous agents grouped by orchestrator,
+    streams non-consuming live state updates, and can steer, stop, resume,
+    reconfigure, or answer a pending permission request. It binds only to
+    loopback and derives session ownership server-side. It never takes over an
+    orchestrator's reasonix_watch call or consumes its terminal delivery.
+    Concurrent calls from multiple orchestrators safely reuse one process.
+    """
+    os.makedirs(os.path.dirname(DASHBOARD_LOCK), exist_ok=True)
+    lock_fd = os.open(DASHBOARD_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        await asyncio.to_thread(fcntl.flock, lock_fd, fcntl.LOCK_EX)
+        return await _reasonix_dashboard_locked(open_browser)
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 @mcp.tool()

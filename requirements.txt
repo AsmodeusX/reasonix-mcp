@@ -3,3 +3,7 @@
 # (mcp.server.mcpserver) and touches the connection's outbound channel for
 # notification relay — mcp 1.x does not provide these.
 mcp==2.0.0
+# Dashboard HTTP/SSE runtime. These are also transitive MCP dependencies today,
+# but pin them explicitly because the dashboard imports them directly.
+starlette==1.6.0
+uvicorn==0.52.1

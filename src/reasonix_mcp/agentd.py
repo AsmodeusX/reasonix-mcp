@@ -1041,6 +1041,7 @@ class Agentd:
     def list(self, params: dict | None = None) -> dict:
         params = params or {}
         include_task = bool(params.get("include_task", False))
+        include_permission_detail = bool(params.get("include_permission_detail", False))
         pending_only = bool(params.get("pending_only", False))
         owner_id = str(params.get("owner_id") or "")
         with self._lock:
@@ -1073,7 +1074,11 @@ class Agentd:
                 ),
                 "stop_reason": a.stop_reason,
                 "transcript_path": getattr(a, "transcript_path", None),
-                "permission_request": a._pending_permission is not None,
+                "permission_request": (
+                    dict(a._pending_permission)
+                    if include_permission_detail and a._pending_permission is not None
+                    else a._pending_permission is not None
+                ),
                 "plan": list(getattr(a, "plan_entries", []) or []),
                 "current_work": (
                     dict(getattr(a, "current_work", None))

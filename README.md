@@ -105,6 +105,36 @@ client and verify the server is listed.
 | `reasonix_stop(session_id)` | Cancel + close + kill the agent (tombstone: poll keeps reporting `exited`). |
 | `reasonix_restart_agentd(force?)` | Explicitly reload the detached daemon. Source changes already queue a safe automatic reload; `force=true` may terminate live agents. |
 | `reasonix_restart_mcp_server()` | Explicitly restart this orchestrator's MCP server through `launcher.py`; source changes are watched automatically. |
+| `reasonix_dashboard(open_browser?)` | Open or reuse the authenticated local fleet UI for current and previous agents across orchestrators. Supports live steering, stop/resume, configuration, and permission responses. |
+
+## Local fleet dashboard
+
+Call `reasonix_dashboard()` from any connected MCP client. It opens a dark
+three-pane fleet UI on a random `127.0.0.1` port and returns the same URL for
+manual opening when the environment has no desktop browser. The URL carries a
+random 256-bit token in its fragment; runtime state is stored mode `0600` in
+`~/.reasonix-mcp/dashboard.json`. The service refuses non-loopback binds and
+authenticates every API, event stream, and action.
+
+The sidebar groups current and previous sessions by orchestrator. Selecting an
+agent shows its persisted conversation, tool calls, plan, and current work.
+For a live agent, the user can steer or follow up, stop it, switch model,
+effort, work mode, or approval policy, and answer pending permission or agent
+questions. Stopped and historical sessions can be resumed from the UI.
+
+Dashboard observation is deliberately separate from orchestration delivery:
+it opens one read-only event socket per owner and never calls `reasonix_watch`,
+`reasonix_wait`, or `reasonix_poll` to refresh state. Watching the UI therefore
+does not supersede a CLI watch, consume terminal output, or add transcript data
+to an orchestrator's context. Session ownership is resolved from server-side
+owner sidecars; the browser cannot nominate an owner for an action. Multiple
+CLI orchestrators can keep running while one dashboard observes all of their
+local fleets.
+
+Only one healthy dashboard is reused. Calling `reasonix_dashboard()` after its
+HTML, CSS, JavaScript, or backend source changes replaces that verified
+dashboard process and starts the current code; agentd and every agent remain
+untouched.
 
 ### Completion and decision delivery
 
