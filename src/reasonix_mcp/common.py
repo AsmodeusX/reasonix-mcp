@@ -202,6 +202,37 @@ def session_config_path(session_id: str) -> str:
     )
 
 
+def session_runtime_override_path(session_id: str) -> str:
+    return os.path.join(
+        reasonix_home(), "sessions", f"{session_id}.orchestrator-runtime.json"
+    )
+
+
+def read_session_runtime_override(session_id: str) -> dict:
+    try:
+        with open(session_runtime_override_path(session_id), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_session_runtime_override(session_id: str, data: dict) -> None:
+    path = session_runtime_override_path(session_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def clear_session_runtime_override(session_id: str) -> None:
+    try:
+        os.unlink(session_runtime_override_path(session_id))
+    except FileNotFoundError:
+        pass
+
+
 def read_session_config(session_id: str) -> dict[str, str]:
     try:
         with open(session_config_path(session_id), encoding="utf-8") as fh:

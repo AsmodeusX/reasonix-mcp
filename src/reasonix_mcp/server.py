@@ -25,6 +25,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver import Context
@@ -336,6 +337,8 @@ async def _relay_agent_event(event: dict) -> None:
             file=sys.stderr, flush=True,
         )
         return
+    if event.get("event") == "permission_request" and await _resolve_legacy_yolo_event(event):
+        return
     print(
         f"reasonix-mcp notification relay: event={event.get('event')} "
         f"session={event.get('session_id')}",
@@ -379,6 +382,66 @@ async def _relay_agent_event(event: dict) -> None:
         pass  # best-effort push; wait/poll remain authoritative
 
 
+def _allow_once_option(permission: dict) -> str | None:
+    tool_call = permission.get("tool_call") or {}
+    if str(tool_call.get("kind") or "").lower() == "other":
+        return None
+    ranked: list[tuple[int, str]] = []
+    for option in permission.get("options") or []:
+        if not isinstance(option, dict) or not option.get("optionId"):
+            continue
+        option_id = str(option["optionId"])
+        values = {
+            str(value).lower().replace("-", "_").replace(" ", "_")
+            for value in (option_id, option.get("name") or "")
+        }
+        if "allow_once" in values or "approve_once" in values:
+            rank = 0
+        elif any(
+            ("allow" in value or "approve" in value) and "once" in value
+            for value in values
+        ):
+            rank = 1
+        elif values & {"allow", "approve", "yes"}:
+            rank = 2
+        else:
+            continue
+        ranked.append((rank, option_id))
+    return min(ranked)[1] if ranked else None
+
+
+async def _resolve_legacy_yolo_event(event: dict) -> bool:
+    """Auto-answer a tool gate while a stale daemon cannot configure ACP."""
+    session_id = str(event.get("session_id") or "")
+    override = common.read_session_runtime_override(session_id)
+    if override.get("tool_approval") != "yolo":
+        return False
+    try:
+        state = await _rpc("ping", {})
+    except Exception:
+        return False
+    if state.get("code_signature") != override.get("daemon_code_signature"):
+        common.clear_session_runtime_override(session_id)
+        return False
+    option_id = _allow_once_option(event.get("permission_request") or {})
+    if option_id is None:
+        return False
+    try:
+        await _rpc(
+            "respond_permission",
+            {"session_id": session_id, "option_id": option_id},
+        )
+    except Exception:
+        return False
+    print(
+        "reasonix-mcp legacy YOLO auto-resolved tool gate: "
+        f"session={session_id} option={option_id}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return True
+
+
 def _schedule_elicitation(event: dict) -> None:
     session_id = str(event.get("session_id") or "")
     if not session_id or _mcp_session is None:
@@ -397,6 +460,109 @@ def _cancel_resolved_elicitation(session_id: str, result: dict) -> None:
     elicitation = _elicitation_tasks.get(session_id)
     if elicitation is not None and not elicitation.done():
         elicitation.cancel()
+
+
+async def _configure_stale_agentd(
+    session_id: str, updates: dict[str, str]
+) -> dict:
+    """Persist configuration and emulate YOLO when agentd predates configure."""
+    if updates.get("work_mode") not in (None, "economy", "balanced", "delivery"):
+        raise ValueError("work_mode must be one of: economy, balanced, delivery")
+    if updates.get("tool_approval") not in (None, "ask", "auto", "yolo"):
+        raise ValueError("tool_approval must be one of: ask, auto, yolo")
+    durable = dict(updates)
+    if "model" in durable and "effort" not in durable:
+        durable["effort"] = ""
+    common.write_session_config(session_id, durable)
+
+    listing, state = await asyncio.gather(_rpc("list", {}), _rpc("ping", {}))
+    existing = next(
+        (
+            item for item in listing.get("sessions", [])
+            if item.get("session_id") == session_id
+        ),
+        None,
+    )
+    if existing is None:
+        raise ValueError(f"unknown session_id {session_id!r}")
+    status = str(existing.get("status") or "exited")
+    if status == "exited":
+        common.clear_session_runtime_override(session_id)
+        return {
+            "session_id": session_id,
+            "status": status,
+            "queued": True,
+            "applies": "on_resume",
+            "requested": updates,
+            "compatibility_fallback": "stale_agentd",
+            "note": "configuration saved; it applies when this session is resumed on the updated daemon",
+        }
+
+    permission_resolution = None
+    runtime_emulation = updates.get("tool_approval") == "yolo"
+    if runtime_emulation:
+        common.write_session_runtime_override(session_id, {
+            "tool_approval": "yolo",
+            "daemon_code_signature": state.get("code_signature"),
+            "created_at": time.time(),
+        })
+        # The permission event may have arrived before this MCP server loaded
+        # or before configure was called. Poll's permission state is durable.
+        detailed = await _rpc("poll", {"session_id": session_id, "detail": True})
+        option_id = _allow_once_option(detailed.get("permission_request") or {})
+        if option_id is not None:
+            try:
+                await _rpc(
+                    "respond_permission",
+                    {"session_id": session_id, "option_id": option_id},
+                )
+            except ValueError as exc:
+                if "no pending permission request" not in str(exc):
+                    raise
+            else:
+                permission_resolution = option_id
+    elif "tool_approval" in updates:
+        common.clear_session_runtime_override(session_id)
+
+    waiting = [key for key in updates if key != "tool_approval" or not runtime_emulation]
+    note = (
+        "running agentd predates live configuration; YOLO is being emulated "
+        "for tool gates and the durable option will apply after its safe reload"
+        if runtime_emulation
+        else "configuration saved but cannot affect this live ACP process until the shared agentd safely reloads"
+    )
+    result = {
+        "session_id": session_id,
+        "status": status,
+        "queued": True,
+        "applies": "after_agentd_reload",
+        "requested": updates,
+        "waiting_options": waiting,
+        "runtime_emulation": "yolo" if runtime_emulation else None,
+        "permission_resolution": permission_resolution,
+        "permission_still_pending": bool(
+            detailed.get("permission_request") if runtime_emulation else existing.get("permission_request")
+        ) and permission_resolution is None,
+        "compatibility_fallback": "stale_agentd",
+        "daemon_code_update_available": bool(state.get("code_update_available")),
+        "note": note,
+    }
+    return result
+
+
+async def _configure_with_compat(
+    session_id: str, updates: dict[str, str]
+) -> dict:
+    try:
+        result = await _rpc("configure", {"session_id": session_id, **updates})
+    except ValueError as exc:
+        if "unknown method 'configure'" not in str(exc):
+            raise
+        result = await _configure_stale_agentd(session_id, updates)
+    else:
+        common.clear_session_runtime_override(session_id)
+    _cancel_resolved_elicitation(session_id, result)
+    return result
 
 
 async def _elicit_agent_decision(event: dict) -> None:
@@ -606,10 +772,7 @@ async def reasonix_resume(
             }.items() if value
         }
         if updates:
-            config_change = await _rpc(
-                "configure", {"session_id": session_id, **updates}
-            )
-            _cancel_resolved_elicitation(session_id, config_change)
+            config_change = await _configure_with_compat(session_id, updates)
             result["config_change"] = config_change
         return result
     result = await _rpc("resume", {
@@ -643,15 +806,17 @@ async def reasonix_configure(
     """
     _capture_relay_ctx(ctx)
     _require_owned(session_id)
-    result = await _rpc("configure", {
-        "session_id": session_id,
-        "model": model,
-        "effort": effort,
-        "work_mode": work_mode,
-        "tool_approval": tool_approval,
-    })
-    _cancel_resolved_elicitation(session_id, result)
-    return result
+    updates = {
+        key: value for key, value in {
+            "model": model,
+            "effort": effort,
+            "work_mode": work_mode,
+            "tool_approval": tool_approval,
+        }.items() if value
+    }
+    if not updates:
+        raise ValueError("provide at least one of: model, effort, work_mode, tool_approval")
+    return await _configure_with_compat(session_id, updates)
 
 
 @mcp.tool()

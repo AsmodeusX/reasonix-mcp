@@ -237,6 +237,11 @@ pending selects its non-persistent `allow_once` option and auto-allows further
 tool gates for the remainder of that turn. It never answers an agent's explicit
 question (`kind="other"`). Changing to `auto` leaves an existing decision
 pending because automatic policy is not equivalent to unconditional approval.
+During a rolling update, an already-running older shared agentd may not yet
+have the `configure` RPC because other orchestrators still have active agents.
+The hot-reloaded MCP front-end transparently persists all requested options;
+it emulates `yolo` tool approvals immediately and reports other options as
+waiting for the safe daemon reload instead of returning `unknown method`.
 
 | Option | Values |
 | --- | --- |
