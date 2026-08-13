@@ -132,6 +132,7 @@ DASHBOARD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "das
 DASHBOARD_STATE = os.path.join(os.path.dirname(common.agentd_sock_path()), "dashboard.json")
 DASHBOARD_LOCK = os.path.join(os.path.dirname(common.agentd_sock_path()), "dashboard.lock")
 DASHBOARD_PORT = int(os.environ.get("REASONIX_MCP_DASHBOARD_PORT", "8746"))
+DASHBOARD_PASSWORD = os.environ.get("REASONIX_MCP_DASHBOARD_PASSWORD", "CHANGEME")
 ROUTINED_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "routined.py")
 ROUTINED_START_LOCK = os.path.join(
     os.path.dirname(common.agentd_sock_path()), "routined-start.lock"
@@ -1263,15 +1264,17 @@ def _read_dashboard_state() -> dict:
 
 
 def _dashboard_health(state: dict) -> dict | None:
-    token = str(state.get("token") or "")
+    # The token fallback exists only to identify and replace a dashboard from
+    # before password authentication was introduced.
+    password = str(state.get("password") or state.get("token") or "")
     host = str(state.get("host") or "127.0.0.1")
     port = int(state.get("port") or 0)
-    if not token or not port:
+    if not password or not port:
         return None
     host_url = f"[{host}]" if ":" in host else host
     request = urllib.request.Request(
         f"http://{host_url}:{port}/api/health",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={"Authorization": f"Bearer {password}"},
     )
     try:
         with urllib.request.urlopen(request, timeout=1.0) as response:
@@ -1314,7 +1317,12 @@ async def _reasonix_dashboard_locked(open_browser: bool) -> dict:
 
     old_pid = int(state.get("pid") or 0)
     verified_old_process = _is_dashboard_process(old_pid)
-    preserved_token = str(state.get("token") or "") if verified_old_process else ""
+    preserved_password = str(state.get("password") or "") if verified_old_process else ""
+    password = (
+        os.environ.get("REASONIX_MCP_DASHBOARD_PASSWORD")
+        or preserved_password
+        or DASHBOARD_PASSWORD
+    )
     if verified_old_process:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.kill(old_pid, 15)
@@ -1338,7 +1346,7 @@ async def _reasonix_dashboard_locked(open_browser: bool) -> dict:
                 sys.executable,
                 DASHBOARD_SCRIPT,
                 "--port", str(DASHBOARD_PORT),
-                *(["--token", preserved_token] if preserved_token else []),
+                "--password", password,
                 "--state-file", DASHBOARD_STATE,
             ],
             stdin=subprocess.DEVNULL,
@@ -1381,6 +1389,8 @@ async def reasonix_dashboard(open_browser: bool = True) -> dict:
     loopback and derives session ownership server-side. It never takes over an
     orchestrator's reasonix_watch call or consumes its terminal delivery.
     Concurrent calls from multiple orchestrators safely reuse one process.
+    Login defaults to CHANGEME; set REASONIX_MCP_DASHBOARD_PASSWORD before
+    starting the MCP client to configure it. Credentials are not put in URLs.
     """
     os.makedirs(os.path.dirname(DASHBOARD_LOCK), exist_ok=True)
     lock_fd = os.open(DASHBOARD_LOCK, os.O_RDWR | os.O_CREAT, 0o600)

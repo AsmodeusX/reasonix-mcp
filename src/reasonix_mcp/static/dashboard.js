@@ -1,13 +1,10 @@
-const state = { token: "", fleet: null, routines: [], selected: null, selectedRoutine: null, detail: null, refreshTimer: null, collapsedOwners: new Set(), originalConfig: {}, timelineSession: null };
+const state = { password: "", fleet: null, routines: [], selected: null, selectedRoutine: null, detail: null, refreshTimer: null, collapsedOwners: new Set(), originalConfig: {}, timelineSession: null };
 const $ = id => document.getElementById(id);
 
-function tokenFromLocation() {
-  const hash = new URLSearchParams(location.hash.replace(/^#/, ""));
-  return hash.get("token") || sessionStorage.getItem("reasonix-dashboard-token") || "";
-}
+function savedPassword() { return sessionStorage.getItem("reasonix-dashboard-password") || ""; }
 function sessionFromLocation() { return new URLSearchParams(location.hash.replace(/^#/, "")).get("session") || ""; }
 function headers(json=false) {
-  const h = { Authorization: `Bearer ${state.token}` };
+  const h = { Authorization: `Bearer ${state.password}` };
   if (json) h["Content-Type"] = "application/json";
   return h;
 }
@@ -146,7 +143,7 @@ async function act(action, body={}) {
   catch(e){toast(e.message,true);throw e;}
 }
 async function eventStream() {
-  while(state.token){
+  while(state.password){
     try {
       const response=await fetch("/api/events",{headers:headers(),cache:"no-store"}); if(!response.ok)throw new Error("event stream rejected");
       const reader=response.body.getReader(), decoder=new TextDecoder(); let buffer="";
@@ -159,9 +156,9 @@ function setRoutineScheduleFields(){const kind=$("routine-schedule").value;docum
 function openRoutineForm(r=null){const owners=state.fleet?.orchestrators||[],models=state.fleet?.models?.models||[],efforts=state.fleet?.models?.effort_options||[];$("routine-form-title").textContent=r?"Edit loop agent":"New loop agent";$("routine-edit-id").value=r?.routine_id||"";$("routine-name").value=r?.name||"";$("routine-owner").innerHTML=owners.map(o=>`<option value="${escapeHtml(o.owner_id)}">${escapeHtml(o.label)}</option>`).join("");$("routine-owner").value=r?.owner_id||owners[0]?.owner_id||"";$("routine-owner").disabled=Boolean(r);$("routine-cwd").value=r?.cwd||"";$("routine-instructions").value=r?.prompt||"";$("routine-schedule").value=r?.schedule_kind||"daily";$("routine-daily").value=r?.daily_at||"09:00";$("routine-interval").value=r?.interval_minutes||1440;$("routine-timezone").value=r?.timezone||Intl.DateTimeFormat().resolvedOptions().timeZone||"UTC";$("routine-overlap").value=r?.overlap_policy||"skip";$("routine-delegation").value=r?.delegation||"allowed";$("routine-model").innerHTML=models.map(m=>`<option value="${escapeHtml(m.ref)}">${escapeHtml(m.ref)}</option>`).join("");$("routine-model").value=r?.model||state.fleet?.models?.default||models[0]?.ref||"";$("routine-effort").innerHTML=efforts.map(v=>`<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join("");$("routine-effort").value=r?.effort||"max";$("routine-approval").value=r?.tool_approval||"auto";$("routine-mode").value=r?.work_mode||"balanced";$("routine-enabled").checked=r?.enabled??true;$("routine-immediate").checked=false;$("run-now-label").classList.toggle("hidden",Boolean(r));setRoutineScheduleFields();$("routine-dialog").showModal();}
 function routineFormData(){return {name:$("routine-name").value.trim(),owner_id:$("routine-owner").value,cwd:$("routine-cwd").value.trim(),prompt:$("routine-instructions").value.trim(),schedule_kind:$("routine-schedule").value,daily_at:$("routine-daily").value,interval_minutes:Number($("routine-interval").value),timezone:$("routine-timezone").value.trim(),overlap_policy:$("routine-overlap").value,delegation:$("routine-delegation").value,model:$("routine-model").value,effort:$("routine-effort").value,tool_approval:$("routine-approval").value,work_mode:$("routine-mode").value,enabled:$("routine-enabled").checked,run_immediately:$("routine-immediate").checked};}
 async function routineAction(action,body={}){const id=state.selectedRoutine;if(!id)return;try{const result=await api(`/api/routines/${encodeURIComponent(id)}/${action}`,{method:"POST",body:JSON.stringify(body)});toast(`${action} succeeded`);await refreshFleet();return result;}catch(e){toast(e.message,true);throw e;}}
-async function authenticate(token){state.token=token;try{const requested=sessionFromLocation();await api("/api/health");sessionStorage.setItem("reasonix-dashboard-token",token);history.replaceState(null,"",location.pathname);$("auth-screen").classList.add("hidden");$("app").classList.remove("hidden");await refreshFleet(false);if(requested&&[...(state.fleet?.orchestrators||[])].some(o=>o.sessions.some(s=>s.session_id===requested)))await selectSession(requested);eventStream();}catch(e){state.token="";$("auth-screen").classList.remove("hidden");$("app").classList.add("hidden");toast("Invalid or expired dashboard token",true);}}
+async function authenticate(password){state.password=password;try{const requested=sessionFromLocation();await api("/api/health");sessionStorage.setItem("reasonix-dashboard-password",password);$("auth-screen").classList.add("hidden");$("app").classList.remove("hidden");await refreshFleet(false);if(requested&&[...(state.fleet?.orchestrators||[])].some(o=>o.sessions.some(s=>s.session_id===requested)))await selectSession(requested);eventStream();}catch(e){state.password="";sessionStorage.removeItem("reasonix-dashboard-password");$("auth-screen").classList.remove("hidden");$("app").classList.add("hidden");toast("Invalid dashboard password",true);}}
 
-$("auth-form").onsubmit=e=>{e.preventDefault();authenticate($("token-input").value.trim());};
+$("auth-form").onsubmit=e=>{e.preventDefault();authenticate($("password-input").value);};
 $("search").oninput=renderFleet; $("status-filter").onchange=renderFleet; $("refresh").onclick=()=>refreshFleet().then(loadDetail);
 $("reload-detail").onclick=loadDetail;
 $("composer").onsubmit=e=>{e.preventDefault();const input=$("message-input"),message=input.value.trim();if(!message)return;act("send",{message,expect:$("send-expect").value}).then(()=>input.value="");};
@@ -174,4 +171,4 @@ $("new-routine").onclick=()=>openRoutineForm();$("routine-edit").onclick=()=>ope
 $("routine-form").onsubmit=async e=>{e.preventDefault();const id=$("routine-edit-id").value,data=routineFormData();try{let saved;if(id){delete data.owner_id;delete data.run_immediately;saved=await api(`/api/routines/${encodeURIComponent(id)}/configure`,{method:"POST",body:JSON.stringify(data)});}else saved=await api("/api/routines",{method:"POST",body:JSON.stringify(data)});$("routine-dialog").close();state.selectedRoutine=saved.routine_id;state.selected=null;await refreshFleet();renderRoutineDetail();toast(id?"Routine updated":"Routine created");}catch(err){toast(err.message,true);}};
 $("routine-run").onclick=()=>routineAction("run");$("routine-stop").onclick=()=>{if(confirm("Stop the active routine parent agent?"))routineAction("stop");};$("routine-toggle").onclick=()=>{const r=selectedRoutine();routineAction("configure",{enabled:!r.enabled});};$("routine-delete").onclick=()=>{if(confirm("Delete this routine and its run history?"))routineAction("delete").then(()=>{state.selectedRoutine=null;$("routine-view").classList.add("hidden");$("empty").classList.remove("hidden");});};
 
-const initial=tokenFromLocation(); if(initial)authenticate(initial); else $("auth-screen").classList.remove("hidden");
+const initial=savedPassword(); if(initial)authenticate(initial); else $("auth-screen").classList.remove("hidden");

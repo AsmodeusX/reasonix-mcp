@@ -29,8 +29,8 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def request(url: str, token: str = "") -> tuple[int, dict, dict]:
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+def request(url: str, password: str = "") -> tuple[int, dict, dict]:
+    headers = {"Authorization": f"Bearer {password}"} if password else {}
     req = urllib.request.Request(url, headers=headers)
     try:
         response = urllib.request.urlopen(req, timeout=2)
@@ -69,7 +69,7 @@ async def observer_check(sock_path: str, owner: str) -> None:
             await writer.wait_closed()
 
     server = await asyncio.start_unix_server(handle, sock_path)
-    state = dashboard.DashboardState("token")
+    state = dashboard.DashboardState("test-password")
     queue: asyncio.Queue = asyncio.Queue()
     state.subscribers.add(queue)
     task = asyncio.create_task(state.observe(owner))
@@ -101,6 +101,7 @@ def main() -> None:
     old_home = os.environ.get("REASONIX_HOME")
     old_sock = os.environ.get("REASONIX_MCP_AGENTD_SOCK")
     old_dashboard_port = os.environ.get("REASONIX_MCP_DASHBOARD_PORT")
+    old_dashboard_password = os.environ.get("REASONIX_MCP_DASHBOARD_PASSWORD")
     dashboard_pid = 0
     routined_pid = 0
     try:
@@ -109,6 +110,7 @@ def main() -> None:
         os.environ["REASONIX_HOME"] = reasonix_home
         os.environ["REASONIX_MCP_AGENTD_SOCK"] = sock_path
         os.environ["REASONIX_MCP_DASHBOARD_PORT"] = str(free_port())
+        os.environ["REASONIX_MCP_DASHBOARD_PASSWORD"] = "CHANGEME"
         # dashboard is imported above so pin its scheduler constants to this
         # test's runtime before the app lifespan starts it.
         dashboard.routined.STATE_PATH = os.path.join(scratch, "routined.json")
@@ -175,7 +177,7 @@ def main() -> None:
         ]
 
         async def timeline_change_check() -> None:
-            state = dashboard.DashboardState("token")
+            state = dashboard.DashboardState("test-password")
             queue: asyncio.Queue = asyncio.Queue()
             state.subscribers.add(queue)
             await state.sync_timeline_files()
@@ -222,9 +224,11 @@ def main() -> None:
         dashboard_pid = int(replaced["pid"])
         with open(state_file, encoding="utf-8") as fh:
             runtime = json.load(fh)
-        token = runtime["token"]
-        base = runtime["url"].split("/#", 1)[0]
-        status, body, headers = request(base + "/api/health", token)
+        password = runtime["password"]
+        assert password == "CHANGEME"
+        assert "#" not in runtime["url"] and "CHANGEME" not in runtime["url"]
+        base = runtime["url"].rstrip("/")
+        status, body, headers = request(base + "/api/health", password)
         assert body["ok"] is True
         assert body["source_signature"] == dashboard.dashboard_signature()
         headers = {key.lower(): value for key, value in headers.items()}
@@ -234,7 +238,7 @@ def main() -> None:
         assert status == 401 and body["error"] == "unauthorized", (status, body)
         stream_request = urllib.request.Request(
             base + "/api/events",
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {password}"},
         )
         with urllib.request.urlopen(stream_request, timeout=2) as stream:
             assert stream.readline() == b"event: ready\n"
@@ -273,6 +277,10 @@ def main() -> None:
             os.environ.pop("REASONIX_MCP_DASHBOARD_PORT", None)
         else:
             os.environ["REASONIX_MCP_DASHBOARD_PORT"] = old_dashboard_port
+        if old_dashboard_password is None:
+            os.environ.pop("REASONIX_MCP_DASHBOARD_PASSWORD", None)
+        else:
+            os.environ["REASONIX_MCP_DASHBOARD_PASSWORD"] = old_dashboard_password
         shutil.rmtree(scratch, ignore_errors=True)
 if __name__ == "__main__":
     main()

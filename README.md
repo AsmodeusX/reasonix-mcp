@@ -116,11 +116,15 @@ client and verify the server is listed.
 ## Local fleet dashboard
 
 Call `reasonix_dashboard()` from any connected MCP client. It opens a dark
-three-pane fleet UI at `http://127.0.0.1:8746` and returns the authenticated
-URL for manual opening when the environment has no desktop browser. Override
+three-pane fleet UI at `http://127.0.0.1:8746` and returns the dashboard
+URL for manual opening when the environment has no desktop browser. Log in
+with the default password `CHANGEME`. Set
+`REASONIX_MCP_DASHBOARD_PASSWORD` before launching the MCP client to choose a
+different password. Override
 the fixed port with `REASONIX_MCP_DASHBOARD_PORT` when 8746 is reserved by
-another local service. The URL carries a
-random 256-bit token in its fragment; runtime state is stored mode `0600` in
+another local service. Credentials are never included in the URL. The browser
+retains an accepted password only in tab-scoped session storage; runtime state
+is stored mode `0600` in
 `~/.reasonix-mcp/dashboard.json`. The service refuses non-loopback binds and
 authenticates every API, event stream, and action.
 
@@ -152,7 +156,7 @@ local fleets.
 Only one healthy dashboard is reused. Calling `reasonix_dashboard()` after its
 HTML, CSS, JavaScript, or backend source changes replaces that verified
 dashboard process and starts the current code; agentd and every agent remain
-untouched. The replacement preserves port 8746 and its authentication token,
+untouched. The replacement preserves port 8746 and its configured password,
 so already-open browser tabs reconnect to the upgraded dashboard.
 
 ## Loop agents and routines

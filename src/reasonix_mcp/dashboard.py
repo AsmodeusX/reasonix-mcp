@@ -50,6 +50,7 @@ MAX_TRANSCRIPT_TEXT = 12_000
 MAX_TOOL_RESULT_TEXT = 8_000
 PREVIEW_BYTES = 256_000
 _preview_cache: dict[str, tuple[int, int, dict]] = {}
+DEFAULT_PASSWORD = os.environ.get("REASONIX_MCP_DASHBOARD_PASSWORD", "CHANGEME")
 
 
 def dashboard_signature() -> str:
@@ -446,8 +447,8 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
 
 
 class DashboardState:
-    def __init__(self, token: str):
-        self.token = token
+    def __init__(self, password: str):
+        self.password = password
         self.subscribers: set[asyncio.Queue] = set()
         self.observers: dict[str, asyncio.Task] = {}
         self.permission_requests: dict[str, dict] = {}
@@ -626,7 +627,7 @@ def allow_once_option(permission: dict) -> str | None:
 def authenticated(request: Request) -> bool:
     header = request.headers.get("authorization", "")
     return header.startswith("Bearer ") and secrets.compare_digest(
-        header[7:], request.app.state.dashboard.token
+        header[7:], request.app.state.dashboard.password
     )
 
 
@@ -1034,8 +1035,8 @@ async def error_handler(_request: Request, exc: Exception) -> Response:
     return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
 
 
-def create_app(token: str) -> Starlette:
-    dashboard = DashboardState(token)
+def create_app(password: str) -> Starlette:
+    dashboard = DashboardState(password)
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):
@@ -1103,30 +1104,32 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Reasonix local fleet dashboard")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8746)
-    parser.add_argument("--token", default="")
+    parser.add_argument("--password", default=DEFAULT_PASSWORD)
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE)
     parser.add_argument("--open", action="store_true", dest="open_browser")
     args = parser.parse_args()
     if args.host not in ("127.0.0.1", "::1", "localhost"):
         parser.error("non-loopback binding is disabled; use a local reverse proxy with authentication")
-    token = args.token or secrets.token_urlsafe(32)
+    password = args.password
+    if not password:
+        parser.error("dashboard password cannot be empty")
     if args.port == 0:
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         probe.bind(("127.0.0.1", 0))
         args.port = probe.getsockname()[1]
         probe.close()
     host = "127.0.0.1" if args.host == "localhost" else args.host
-    url = f"http://{host}:{args.port}/#token={token}"
+    url = f"http://{host}:{args.port}/"
     write_state(args.state_file, {
         "pid": os.getpid(), "host": host, "port": args.port,
-        "token": token, "url": url, "started_at": time.time(),
+        "password": password, "url": url, "started_at": time.time(),
         "source_signature": dashboard_signature(),
     })
     print(f"Reasonix dashboard: {url}", flush=True)
     if args.open_browser:
         webbrowser.open(url)
     try:
-        uvicorn.run(create_app(token), host=host, port=args.port, log_level="warning")
+        uvicorn.run(create_app(password), host=host, port=args.port, log_level="warning")
     finally:
         with contextlib.suppress(OSError, ValueError, TypeError):
             with open(args.state_file, encoding="utf-8") as fh:
