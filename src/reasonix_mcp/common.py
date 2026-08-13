@@ -9,6 +9,7 @@ summaries, and poll shaping.
 from __future__ import annotations
 
 import json
+import fcntl
 import hashlib
 import os
 import threading
@@ -199,6 +200,85 @@ def session_owner_path(session_id: str) -> str:
 def session_config_path(session_id: str) -> str:
     return os.path.join(
         reasonix_home(), "sessions", f"{session_id}.orchestrator-config.json"
+    )
+
+
+def session_timeline_path(session_id: str) -> str:
+    return os.path.join(
+        reasonix_home(), "sessions", f"{session_id}.orchestrator-timeline.jsonl"
+    )
+
+
+def session_transcript_size(session_id: str) -> int:
+    path = os.path.join(reasonix_home(), "sessions", f"{session_id}.jsonl")
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def record_orchestrator_message(
+    session_id: str,
+    owner_id: str,
+    message: str,
+    delivered: str,
+    transcript_offset: int | None = None,
+) -> dict:
+    """Persist an accepted orchestrator message for dashboard chronology.
+
+    Mid-turn ACP steering is not consistently written to Reasonix's own JSONL.
+    Record the transcript byte boundary so the dashboard can merge the message
+    before agent activity that was persisted after the steer.
+    """
+    if transcript_offset is None:
+        transcript_offset = session_transcript_size(session_id)
+    created_at = int(time.time() * 1000)
+    event = {
+        "event_id": hashlib.sha256(
+            f"{session_id}\0{owner_id}\0{created_at}\0{time.time_ns()}".encode()
+        ).hexdigest()[:24],
+        "type": "orchestrator_message",
+        "session_id": session_id,
+        "owner_id": owner_id,
+        "message": message,
+        "delivered": delivered,
+        "created_at": created_at,
+        "transcript_offset": transcript_offset,
+    }
+    path = session_timeline_path(session_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        fh.write(json.dumps(event, separators=(",", ":")) + "\n")
+        fh.flush()
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    return event
+
+
+def read_orchestrator_timeline(session_id: str, owner_id: str) -> list[dict]:
+    events: list[dict] = []
+    try:
+        with open(session_timeline_path(session_id), encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    event = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if (
+                    isinstance(event, dict)
+                    and event.get("owner_id") == owner_id
+                    and event.get("session_id") == session_id
+                ):
+                    events.append(event)
+    except OSError:
+        pass
+    return sorted(
+        events,
+        key=lambda event: (
+            int(event.get("transcript_offset") or 0),
+            int(event.get("created_at") or 0),
+        ),
     )
 
 

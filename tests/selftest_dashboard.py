@@ -107,6 +107,8 @@ def main() -> None:
         sock_path = os.path.join(scratch, "agentd.sock")
         os.environ["REASONIX_HOME"] = reasonix_home
         os.environ["REASONIX_MCP_AGENTD_SOCK"] = sock_path
+        os.environ["REASONIX_MCP_DASHBOARD_PORT"] = str(free_port())
+        import server as mcp_server  # noqa: E402
 
         common.write_session_owner("session-one", "owner-one")
         common.save_owner_sessions("owner-one", {"session-one"})
@@ -122,17 +124,66 @@ def main() -> None:
                     {"id": "call-1", "name": "read_file", "arguments": '{"path":"a"}'}
                 ]},
                 {"role": "tool", "name": "read_file", "tool_call_id": "call-1", "content": "contents"},
-                {"role": "assistant", "content": "Implemented **successfully**."},
             ]:
                 fh.write(json.dumps(row) + "\n")
+        event = common.record_orchestrator_message(
+            "session-one", "owner-one", "Focus on the parser", "steered"
+        )
+        assert os.stat(common.session_timeline_path("session-one")).st_mode & 0o777 == 0o600
+        assert event["transcript_offset"] == os.path.getsize(transcript_path)
+        with open(transcript_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "role": "assistant", "content": "Implemented **successfully**."
+            }) + "\n")
         assert dashboard.owner_for_session("session-one") == "owner-one"
         assert dashboard.transcript_preview("session-one")["task"] == "Build the requested feature"
         messages, transcript = dashboard.transcript_messages("session-one")
         entries = transcript["runs"][0]["entries"]
         assert [entry["kind"] for entry in entries] == [
-            "message", "reasoning", "tool_call", "tool_result", "message"
+            "message", "reasoning", "tool_call", "tool_result",
+            "orchestrator_message", "message",
         ], entries
+        assert entries[-2]["text"] == "Focus on the parser"
         assert messages[-1]["text"] == "Implemented **successfully**."
+        original_rpc = mcp_server._rpc
+        original_owner = mcp_server._owner_id
+        original_owned = mcp_server._owned_sessions
+
+        async def accepted_steer(_method: str, _params: dict, **_kwargs) -> dict:
+            return {"session_id": "session-one", "delivered": "steered"}
+
+        mcp_server._rpc = accepted_steer
+        mcp_server._owner_id = "owner-one"
+        mcp_server._owned_sessions = {"session-one"}
+        try:
+            send_result = asyncio.run(mcp_server.reasonix_send(
+                "session-one", "Second steer", expect="steer"
+            ))
+        finally:
+            mcp_server._rpc = original_rpc
+            mcp_server._owner_id = original_owner
+            mcp_server._owned_sessions = original_owned
+        assert send_result["timeline_recorded"] is True
+        timeline = common.read_orchestrator_timeline("session-one", "owner-one")
+        assert [event["message"] for event in timeline] == [
+            "Focus on the parser", "Second steer"
+        ]
+
+        async def timeline_change_check() -> None:
+            state = dashboard.DashboardState("token")
+            queue: asyncio.Queue = asyncio.Queue()
+            state.subscribers.add(queue)
+            await state.sync_timeline_files()
+            common.record_orchestrator_message(
+                "session-one", "owner-one", "Third steer", "steered"
+            )
+            await state.sync_timeline_files()
+            changed = queue.get_nowait()
+            assert changed == {
+                "type": "timeline_changed", "session_id": "session-one"
+            }
+
+        asyncio.run(timeline_change_check())
         missing_messages, missing_transcript = dashboard.transcript_messages("missing")
         assert missing_messages == []
         assert missing_transcript["runs"] == []
@@ -149,9 +200,6 @@ def main() -> None:
             os.unlink(sock_path)
         shutil.rmtree(os.path.join(reasonix_home, "orchestrators"), ignore_errors=True)
         shutil.rmtree(os.path.join(reasonix_home, "sessions"), ignore_errors=True)
-
-        os.environ["REASONIX_MCP_DASHBOARD_PORT"] = str(free_port())
-        import server as mcp_server  # noqa: E402
 
         first, second = asyncio.run(concurrent_start(mcp_server))
         assert sorted((first["started"], second["started"])) == [False, True]

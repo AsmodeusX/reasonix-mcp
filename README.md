@@ -122,7 +122,11 @@ The sidebar groups current and previous sessions by orchestrator. Selecting an
 agent shows its persisted runs, agent messages, reasoning blocks, tool calls
 and results, plan, and current work. Orchestrators are collapsible preview
 buttons; active runs are the default view and fleets/runs are ordered newest
-first. The selected run timeline opens at its latest activity.
+first. The selected run timeline opens at its latest activity. Accepted
+mid-turn steering messages are persisted in an owner-scoped orchestration
+timeline and merged at their transcript byte boundary, so the guidance appears
+between the agent events that happened before and after it even when Reasonix
+does not write the steer into its own JSONL.
 For a live agent, the user can steer or follow up, stop it, switch model,
 effort, work mode, or approval policy, and answer pending permission or agent
 questions. The control panel shows the values reported by the agent separately

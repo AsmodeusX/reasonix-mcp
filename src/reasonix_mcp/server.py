@@ -843,7 +843,23 @@ async def reasonix_send(
     """
     _capture_relay_ctx(ctx)
     _require_owned(session_id)
-    return await _rpc("send", {"session_id": session_id, "message": message, "expect": expect})
+    transcript_offset = common.session_transcript_size(session_id)
+    result = await _rpc(
+        "send", {"session_id": session_id, "message": message, "expect": expect}
+    )
+    if result.get("delivered") == "steered":
+        try:
+            common.record_orchestrator_message(
+                session_id, _owner_id, message, result["delivered"], transcript_offset
+            )
+        except OSError as exc:
+            # Delivery already succeeded. Never turn an audit-write failure
+            # into a retry that would steer the child twice.
+            result["timeline_recorded"] = False
+            result["timeline_record_error"] = str(exc)
+        else:
+            result["timeline_recorded"] = True
+    return result
 
 
 @mcp.tool()
@@ -1013,6 +1029,7 @@ def _dashboard_source_signature() -> str:
     package_dir = os.path.dirname(DASHBOARD_SCRIPT)
     for path in [
         DASHBOARD_SCRIPT,
+        os.path.join(package_dir, "common.py"),
         os.path.join(package_dir, "static", "dashboard.html"),
         os.path.join(package_dir, "static", "dashboard.css"),
         os.path.join(package_dir, "static", "dashboard.js"),

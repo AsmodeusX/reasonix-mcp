@@ -54,6 +54,7 @@ def dashboard_signature() -> str:
     digest = hashlib.sha256()
     for path in [
         __file__,
+        common.__file__,
         os.path.join(STATIC_DIR, "dashboard.html"),
         os.path.join(STATIC_DIR, "dashboard.css"),
         os.path.join(STATIC_DIR, "dashboard.js"),
@@ -240,7 +241,10 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
     tool_calls_total = 0
     runs: list[dict] = []
     current_run: dict | None = None
-    if not os.path.isfile(path):
+    owner_id = common.read_session_owner(session_id) or ""
+    external_events = common.read_orchestrator_timeline(session_id, owner_id)
+    transcript_exists = os.path.isfile(path)
+    if not transcript_exists and not external_events:
         return [], {
             "exists": False,
             "transcript_path": path,
@@ -253,11 +257,44 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
             "timeline_entries": 0,
             "updated_at": None,
         }
+
+    def append_external(event: dict) -> None:
+        nonlocal current_run
+        if current_run is None:
+            current_run = {
+                "started_at": event.get("created_at"),
+                "entries": [],
+            }
+            runs.append(current_run)
+        current_run["entries"].append({
+            "kind": "orchestrator_message",
+            "role": "orchestrator",
+            "text": str(event.get("message") or "")[-MAX_TRANSCRIPT_TEXT:],
+            "truncated": len(str(event.get("message") or "")) > MAX_TRANSCRIPT_TEXT,
+            "created_at": event.get("created_at"),
+            "delivered": str(event.get("delivered") or "steered"),
+            "event_id": str(event.get("event_id") or ""),
+        })
+
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
+        event_index = 0
+        byte_offset = 0
+        if transcript_exists:
+            transcript_fh = open(path, "rb")
+        else:
+            transcript_fh = contextlib.nullcontext([])
+        with transcript_fh as fh:
+            for raw_line in fh:
+                while (
+                    event_index < len(external_events)
+                    and int(external_events[event_index].get("transcript_offset") or 0)
+                    <= byte_offset
+                ):
+                    append_external(external_events[event_index])
+                    event_index += 1
+                byte_offset += len(raw_line)
                 try:
-                    row = json.loads(line)
+                    row = json.loads(raw_line.decode("utf-8", errors="replace"))
                 except (ValueError, TypeError):
                     continue
                 role = str(row.get("role") or "")
@@ -321,24 +358,63 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
                         "truncated": len(content) > MAX_TOOL_RESULT_TEXT,
                         "tool_call_id": str(row.get("tool_call_id") or ""),
                     })
+        while event_index < len(external_events):
+            append_external(external_events[event_index])
+            event_index += 1
     except OSError as exc:
         raise DashboardError(f"cannot read transcript: {exc}", 500) from exc
+
+    # Some Reasonix versions also persist a synthetic user row for a steer.
+    # Prefer that native row and suppress the owner-side audit duplicate.
+    native_user_texts = [
+        entry.get("text", "")
+        for run in runs
+        for entry in run["entries"]
+        if entry.get("kind") == "message" and entry.get("role") == "user"
+    ]
+    for run in runs:
+        run["entries"] = [
+            entry
+            for entry in run["entries"]
+            if not (
+                entry.get("kind") == "orchestrator_message"
+                and any(
+                    entry.get("text") == text
+                    or (
+                        entry.get("text") in text
+                        and "steer" in text.lower()
+                    )
+                    for text in native_user_texts
+                )
+            )
+        ]
+    orchestrator_messages_total = sum(
+        entry.get("kind") == "orchestrator_message"
+        for run in runs
+        for entry in run["entries"]
+    )
     kept_runs = runs[-30:]
     kept_entries = sum(len(run["entries"]) for run in kept_runs)
     for index, run in enumerate(kept_runs):
         run["number"] = len(runs) - len(kept_runs) + index + 1
         run["active"] = index == len(kept_runs) - 1
     return list(messages), {
-        "exists": True,
+        "exists": transcript_exists,
         "transcript_path": path,
-        "messages_total": messages_total,
-        "messages_truncated": messages_total > MAX_TRANSCRIPT_MESSAGES,
+        "messages_total": messages_total + orchestrator_messages_total,
+        "messages_truncated": (
+            messages_total + orchestrator_messages_total > MAX_TRANSCRIPT_MESSAGES
+        ),
         "tool_calls": list(tool_calls),
         "tool_calls_total": tool_calls_total,
         "runs": list(reversed(kept_runs)),
         "runs_total": len(runs),
         "timeline_entries": kept_entries,
-        "updated_at": os.path.getmtime(path),
+        "updated_at": max(
+            os.path.getmtime(path) if transcript_exists else 0,
+            os.path.getmtime(common.session_timeline_path(session_id))
+            if external_events else 0,
+        ) or None,
     }
 
 
@@ -348,6 +424,7 @@ class DashboardState:
         self.subscribers: set[asyncio.Queue] = set()
         self.observers: dict[str, asyncio.Task] = {}
         self.permission_requests: dict[str, dict] = {}
+        self.timeline_files: dict[str, tuple[int, int]] = {}
         self.closed = False
 
     async def publish(self, event: dict) -> None:
@@ -367,7 +444,29 @@ class DashboardState:
                     self.observers[owner] = asyncio.create_task(self.observe(owner))
             for owner in set(self.observers) - owners:
                 self.observers.pop(owner).cancel()
+            await self.sync_timeline_files()
             await asyncio.sleep(3)
+
+    async def sync_timeline_files(self) -> None:
+        current: dict[str, tuple[int, int]] = {}
+        suffix = ".orchestrator-timeline.jsonl"
+        for path in glob.glob(os.path.join(
+            common.reasonix_home(), "sessions", f"*{suffix}"
+        )):
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            session_id = os.path.basename(path)[:-len(suffix)]
+            fingerprint = (stat.st_mtime_ns, stat.st_size)
+            current[session_id] = fingerprint
+            previous = self.timeline_files.get(session_id)
+            if previous is not None and previous != fingerprint:
+                await self.publish({
+                    "type": "timeline_changed",
+                    "session_id": session_id,
+                })
+        self.timeline_files = current
 
     async def observe(self, owner_id: str) -> None:
         while not self.closed:
@@ -710,11 +809,22 @@ async def api_action(request: Request) -> Response:
         message = str(data.get("message") or "").strip()
         if not message:
             raise DashboardError("message is required")
+        transcript_offset = common.session_transcript_size(session_id)
         result = await agentd_rpc(owner, "send", {
             "session_id": session_id,
             "message": message,
             "expect": str(data.get("expect") or "any"),
         })
+        if result.get("delivered") == "steered":
+            try:
+                common.record_orchestrator_message(
+                    session_id, owner, message, result["delivered"], transcript_offset
+                )
+            except OSError as exc:
+                result["timeline_recorded"] = False
+                result["timeline_record_error"] = str(exc)
+            else:
+                result["timeline_recorded"] = True
     elif action == "configure":
         updates = {
             key: str(data.get(key) or "").strip()
