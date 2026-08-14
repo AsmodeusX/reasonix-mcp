@@ -158,9 +158,12 @@ other successful session IDs remain usable.
 
 ## Local fleet dashboard
 
-Call `reasonix_dashboard()` from any connected MCP client. It opens a dark
-three-pane fleet UI at `http://127.0.0.1:8746` and returns the dashboard
-URL for manual opening when the environment has no desktop browser. Log in
+The dashboard starts automatically with the first Reasonix MCP server and is
+reused by additional orchestrators. Call `reasonix_dashboard()` to ensure it is
+current and open it in a browser. The dark three-pane fleet UI is fixed at
+`http://127.0.0.1:8746`; the tool returns that URL when the environment has no
+desktop browser. Set `REASONIX_MCP_DASHBOARD_AUTOSTART=0` only when automatic
+startup is not wanted. Log in
 with the default password `CHANGEME`. Set
 `REASONIX_MCP_DASHBOARD_PASSWORD` before launching the MCP client to choose a
 different password. Override

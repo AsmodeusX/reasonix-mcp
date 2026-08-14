@@ -29,6 +29,9 @@ def scratch_env(scratch: str, real_home: str | None = None) -> dict:
     env = dict(os.environ)
     env["REASONIX_HOME"] = scratch
     env["REASONIX_MCP_AGENTD_SOCK"] = os.path.join(scratch, "agentd.sock")
+    # Most isolated protocol tests do not exercise the machine-wide browser UI
+    # and may run concurrently on one host/port.
+    env["REASONIX_MCP_DASHBOARD_AUTOSTART"] = "0"
     return env
 
 

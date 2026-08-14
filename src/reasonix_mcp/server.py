@@ -1657,7 +1657,10 @@ async def _reasonix_dashboard_locked(open_browser: bool) -> dict:
 
     old_pid = int(state.get("pid") or 0)
     verified_old_process = _is_dashboard_process(old_pid)
-    preserved_password = str(state.get("password") or "") if verified_old_process else ""
+    # The state file is mode 0600 and is the durable dashboard credential.
+    # Preserve it across process/IDE restarts unless the environment explicitly
+    # supplies a replacement.
+    preserved_password = str(state.get("password") or "")
     password = (
         os.environ.get("REASONIX_MCP_DASHBOARD_PASSWORD")
         or preserved_password
@@ -1719,19 +1722,7 @@ async def _reasonix_dashboard_locked(open_browser: bool) -> dict:
     )
 
 
-@mcp.tool()
-async def reasonix_dashboard(open_browser: bool = True) -> dict:
-    """Open or return the local authenticated Reasonix fleet dashboard.
-
-    The dashboard shows current and previous agents grouped by orchestrator,
-    streams non-consuming live state updates, and can steer, stop, resume,
-    reconfigure, or answer a pending permission request. It binds only to
-    loopback and derives session ownership server-side. It never takes over an
-    orchestrator's reasonix_watch call or consumes its terminal delivery.
-    Concurrent calls from multiple orchestrators safely reuse one process.
-    Login defaults to CHANGEME; set REASONIX_MCP_DASHBOARD_PASSWORD before
-    starting the MCP client to configure it. Credentials are not put in URLs.
-    """
+async def _ensure_dashboard_running(open_browser: bool = False) -> dict:
     os.makedirs(os.path.dirname(DASHBOARD_LOCK), exist_ok=True)
     lock_fd = os.open(DASHBOARD_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
     try:
@@ -1741,6 +1732,41 @@ async def reasonix_dashboard(open_browser: bool = True) -> dict:
         with contextlib.suppress(OSError):
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
+
+
+async def _auto_start_dashboard() -> None:
+    """Best-effort dashboard startup for every MCP process lifecycle."""
+    if os.environ.get("REASONIX_MCP_DASHBOARD_AUTOSTART", "1").strip().lower() in (
+        "0", "false", "no", "off",
+    ):
+        return
+    try:
+        await _ensure_dashboard_running(False)
+    except Exception as exc:
+        # Never prevent MCP initialization because the optional browser UI
+        # could not bind. A later MCP restart or reasonix_dashboard call retries.
+        print(
+            f"reasonix-mcp: dashboard auto-start failed: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+@mcp.tool()
+async def reasonix_dashboard(open_browser: bool = True) -> dict:
+    """Open or return the local authenticated Reasonix fleet dashboard.
+
+    The dashboard auto-starts with the MCP server. This tool ensures it is
+    current and optionally opens it. It shows current and previous agents
+    grouped by orchestrator, streams non-consuming live state updates, and can
+    steer, stop, resume, reconfigure, or answer a pending permission request.
+    It binds only to loopback and derives session ownership server-side. It
+    never takes over an orchestrator's reasonix_watch call or consumes its
+    terminal delivery. Concurrent orchestrators safely reuse one process.
+    Login defaults to CHANGEME; set REASONIX_MCP_DASHBOARD_PASSWORD before
+    starting the MCP client to configure it. Credentials are not put in URLs.
+    """
+    return await _ensure_dashboard_running(open_browser)
 
 
 @mcp.tool()
@@ -1830,8 +1856,18 @@ async def _exit_after_mcp_restart() -> None:
     os._exit(MCP_RESTART_EXIT_CODE)
 
 
+async def _run_stdio() -> None:
+    dashboard_task = asyncio.create_task(_auto_start_dashboard())
+    try:
+        await mcp.run_stdio_async()
+    finally:
+        if not dashboard_task.done():
+            dashboard_task.cancel()
+        await asyncio.gather(dashboard_task, return_exceptions=True)
+
+
 def main() -> None:
-    asyncio.run(mcp.run_stdio_async())
+    asyncio.run(_run_stdio())
 
 
 if __name__ == "__main__":
