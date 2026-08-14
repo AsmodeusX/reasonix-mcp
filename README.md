@@ -92,6 +92,7 @@ client and verify the server is listed.
 | Tool | Purpose |
 | --- | --- |
 | `reasonix_spawn(task, cwd?, model?, work_mode?, tool_approval?, effort?, keep_alive?, idle_timeout?)` | Start an agent in the daemon on `task`; returns `session_id` + sandbox posture. Completed agents can be cleaned up after the idle grace period when cleanup is enabled, unless `keep_alive=true`. |
+| `reasonix_spawn_fleet(path)` | Validate an assigned-fleet JSON file and spawn all agents in one call. Returns ordered agent/session mappings and `session_ids` ready for one `reasonix_watch` call. |
 | `reasonix_resume(session_id, cwd?, model?, effort?, work_mode?, tool_approval?, keep_alive?, idle_timeout?)` | Revive a stopped/crashed session from its persisted transcript, optionally changing its model/options. Idempotent for live processes. |
 | `reasonix_models()` | List selectable models: `provider/model` refs, default, per-model `supported_efforts`, and `price` hints where configured. |
 | `reasonix_send(session_id, message, expect?)` | Forced steer: queue as mid-turn guidance, or start a new turn if idle. Never dropped. `expect="steer"` refuses to start a new turn. |
@@ -114,6 +115,46 @@ client and verify the server is listed.
 | `reasonix_routine_run(routine_id)` | Queue an immediate run while honoring its skip/queue overlap policy. |
 | `reasonix_routine_stop(routine_id)` | Stop the current parent agent without disabling future scheduled runs. |
 | `reasonix_routine_delete(routine_id)` | Delete an inactive routine and its scheduler run history. Agent transcripts remain in Reasonix. |
+
+## Assigned fleets
+
+Use `reasonix_spawn_fleet(path)` when an orchestrator has already divided work
+among several agents. The complete file is validated before any process starts.
+Shared defaults use the same options as `reasonix_spawn`; each agent can
+override them:
+
+```json
+{
+  "name": "oracle audit",
+  "parallelism": 4,
+  "defaults": {
+    "cwd": "/home/user/project",
+    "model": "codex/gpt-5.6-sol",
+    "effort": "high",
+    "tool_approval": "yolo"
+  },
+  "agents": [
+    {"name": "compile", "task": "Repair and verify compile failures."},
+    {"name": "traps", "task": "Classify and repair trap mismatches."},
+    {
+      "name": "harness",
+      "task": "Investigate harness setup failures.",
+      "model": "opencode-go/deepseek-v4-flash",
+      "effort": "max",
+      "tool_approval": "ask"
+    }
+  ]
+}
+```
+
+`agents` may instead be an object mapping names to task strings or assignment
+objects. `tasks` is accepted as an alias, and a root array is accepted for
+small files. Relative `cwd` values resolve relative to the JSON file. Fleet
+size is capped at 64 so all returned IDs fit one `reasonix_watch`; startup
+parallelism defaults to 8 and can be set from 1 through 16. Predictable schema,
+path, and configuration errors reject the whole file before spawning. A
+provider/process failure during startup is returned on that agent while the
+other successful session IDs remain usable.
 
 ## Local fleet dashboard
 

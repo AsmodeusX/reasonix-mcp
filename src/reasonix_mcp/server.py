@@ -11,7 +11,7 @@ server restarts**: close the MCP host, come back, and reasonix_list still shows
 the fleet running; reasonix_resume revives sessions whose process died.
 
 Tools:
-  reasonix_spawn / reasonix_resume / reasonix_send / reasonix_poll
+  reasonix_spawn / reasonix_spawn_fleet / reasonix_resume / reasonix_send / reasonix_poll
   reasonix_watch / reasonix_wait / reasonix_list / reasonix_models / reasonix_transcript
   reasonix_respond_permission / reasonix_stop / reasonix_restart_agentd /
   reasonix_restart_mcp_server / reasonix_configure / reasonix_dashboard
@@ -44,8 +44,9 @@ import routined
 import routines
 
 MCP_INSTRUCTIONS = """Reasonix is an agent-orchestration MCP server backed by a
-detached agent daemon. Use reasonix_spawn once per child task and retain each
-session_id. Agents keep running even if this MCP server (or the MCP host —
+detached agent daemon. Use reasonix_spawn for one child or reasonix_spawn_fleet
+to create an assigned fleet from JSON; retain the returned session_ids. Agents
+keep running even if this MCP server (or the MCP host —
 Claude Code, Codex, …) restarts — reasonix_list shows the fleet, reasonix_resume revives a session
 whose process died. Resume is idempotent if recovery races a live process;
 optional model/session changes still follow reasonix_configure semantics. For
@@ -156,6 +157,12 @@ _rpc_default_timeout = 600.0
 _owner_id = common.orchestrator_owner_id()
 _owner_explicit = bool(os.environ.get("REASONIX_MCP_ORCHESTRATOR_ID", "").strip())
 _owned_sessions = common.load_owner_sessions(_owner_id)
+
+FLEET_FILE_LIMIT = 2 * 1024 * 1024
+FLEET_SPAWN_FIELDS = {
+    "cwd", "model", "work_mode", "tool_approval", "effort",
+    "keep_alive", "idle_timeout",
+}
 
 
 async def _start_agentd(sock: str) -> None:
@@ -828,6 +835,179 @@ async def _ensure_routined() -> dict:
         os.close(lock_fd)
 
 
+def _fleet_agents(value: object) -> list[dict]:
+    if isinstance(value, dict):
+        agents = []
+        for name, assignment in value.items():
+            if isinstance(assignment, str):
+                agents.append({"name": name, "task": assignment})
+            elif isinstance(assignment, dict):
+                item = dict(assignment)
+                item.setdefault("name", name)
+                agents.append(item)
+            else:
+                raise ValueError(
+                    f"agent {name!r} must be a task string or an object"
+                )
+        return agents
+    if not isinstance(value, list):
+        raise ValueError("agents must be a JSON array or name-to-assignment object")
+    agents = []
+    for index, assignment in enumerate(value, 1):
+        if isinstance(assignment, str):
+            agents.append({"name": f"agent-{index}", "task": assignment})
+        elif isinstance(assignment, dict):
+            agents.append(dict(assignment))
+        else:
+            raise ValueError(f"agent {index} must be a task string or an object")
+    return agents
+
+
+def load_fleet_file(path: str) -> dict:
+    """Load and fully validate an assigned fleet without spawning anything."""
+    source = os.path.abspath(os.path.expanduser(path))
+    try:
+        size = os.path.getsize(source)
+    except OSError as exc:
+        raise ValueError(f"cannot read fleet file {source!r}: {exc}") from exc
+    if size > FLEET_FILE_LIMIT:
+        raise ValueError(
+            f"fleet file is too large ({size} bytes; maximum {FLEET_FILE_LIMIT})"
+        )
+    try:
+        with open(source, encoding="utf-8") as fh:
+            document = json.load(fh)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid fleet JSON in {source!r}: {exc}") from exc
+
+    if isinstance(document, list):
+        document = {"agents": document}
+    if not isinstance(document, dict):
+        raise ValueError("fleet JSON root must be an object or an agent array")
+    unknown_root = set(document) - {
+        "name", "defaults", "agents", "tasks", "parallelism",
+    }
+    if unknown_root:
+        raise ValueError(f"unknown fleet fields: {sorted(unknown_root)}")
+    if "agents" in document and "tasks" in document:
+        raise ValueError("use either agents or tasks, not both")
+    assignments = document.get("agents", document.get("tasks"))
+    if assignments is None:
+        raise ValueError("fleet JSON must contain agents (or tasks)")
+    agents = _fleet_agents(assignments)
+    if not agents:
+        raise ValueError("fleet must contain at least one agent")
+    if len(agents) > common.MAX_WATCH_SESSIONS:
+        raise ValueError(
+            f"fleet has {len(agents)} agents; maximum is {common.MAX_WATCH_SESSIONS}"
+        )
+
+    defaults = document.get("defaults") or {}
+    if not isinstance(defaults, dict):
+        raise ValueError("defaults must be an object")
+    unknown_defaults = set(defaults) - FLEET_SPAWN_FIELDS
+    if unknown_defaults:
+        raise ValueError(f"unknown default fields: {sorted(unknown_defaults)}")
+    base = {
+        "cwd": "",
+        "model": common.DEFAULT_MODEL,
+        "work_mode": common.DEFAULT_WORK_MODE,
+        "tool_approval": common.DEFAULT_TOOL_APPROVAL,
+        "effort": common.DEFAULT_EFFORT,
+        "keep_alive": False,
+        "idle_timeout": common.DEFAULT_IDLE_TIMEOUT,
+        **defaults,
+    }
+    source_dir = os.path.dirname(source)
+    normalized = []
+    names: set[str] = set()
+    for index, assignment in enumerate(agents, 1):
+        unknown = set(assignment) - (FLEET_SPAWN_FIELDS | {"name", "task"})
+        if unknown:
+            raise ValueError(f"agent {index} has unknown fields: {sorted(unknown)}")
+        name = assignment.get("name") or f"agent-{index}"
+        task = assignment.get("task")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"agent {index} name must be a non-empty string")
+        name = name.strip()
+        if len(name) > 128:
+            raise ValueError(f"agent {index} name exceeds 128 characters")
+        if name in names:
+            raise ValueError(f"duplicate agent name: {name!r}")
+        names.add(name)
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError(f"agent {name!r} task must be a non-empty string")
+        config = {**base, **{key: assignment[key] for key in FLEET_SPAWN_FIELDS
+                             if key in assignment}}
+        for key in ("cwd", "model", "work_mode", "tool_approval", "effort"):
+            if not isinstance(config[key], str):
+                raise ValueError(f"agent {name!r} {key} must be a string")
+        if config["work_mode"] and config["work_mode"] not in (
+            "economy", "balanced", "delivery"
+        ):
+            raise ValueError(
+                f"agent {name!r} work_mode must be economy, balanced, or delivery"
+            )
+        if config["tool_approval"] not in ("ask", "auto", "yolo"):
+            raise ValueError(
+                f"agent {name!r} tool_approval must be ask, auto, or yolo"
+            )
+        if not isinstance(config["keep_alive"], bool):
+            raise ValueError(f"agent {name!r} keep_alive must be a boolean")
+        try:
+            config["idle_timeout"] = float(config["idle_timeout"])
+        except (TypeError, ValueError):
+            raise ValueError(f"agent {name!r} idle_timeout must be a number") from None
+        if not -1 <= config["idle_timeout"] <= 86400:
+            raise ValueError(
+                f"agent {name!r} idle_timeout must be -1 or between 0 and 86400"
+            )
+        if config["cwd"] and not os.path.isabs(config["cwd"]):
+            config["cwd"] = os.path.abspath(os.path.join(source_dir, config["cwd"]))
+        cwd = config["cwd"] or os.getcwd()
+        if not os.path.isdir(cwd):
+            raise ValueError(f"agent {name!r} cwd is not a directory: {cwd!r}")
+        if not common.cwd_allowed(cwd):
+            raise ValueError(
+                f"agent {name!r} cwd {cwd!r} is outside the allowed spawn roots"
+            )
+        normalized.append({"name": name, "task": task, **config})
+
+    try:
+        parallelism = int(document.get("parallelism", min(8, len(normalized))))
+    except (TypeError, ValueError):
+        raise ValueError("parallelism must be an integer") from None
+    if not 1 <= parallelism <= 16:
+        raise ValueError("parallelism must be between 1 and 16")
+    fleet_name = document.get("name") or os.path.splitext(os.path.basename(source))[0]
+    if not isinstance(fleet_name, str) or not fleet_name.strip():
+        raise ValueError("fleet name must be a non-empty string")
+    return {
+        "name": fleet_name.strip(), "source": source,
+        "parallelism": parallelism, "agents": normalized,
+    }
+
+
+async def _spawn_agent(
+    *, task: str, cwd: str, model: str, work_mode: str,
+    tool_approval: str, effort: str, keep_alive: bool, idle_timeout: float,
+) -> dict:
+    result = await _rpc("spawn", {
+        "task": task, "cwd": cwd, "model": model,
+        "work_mode": work_mode, "tool_approval": tool_approval, "effort": effort,
+        "keep_alive": keep_alive, "idle_timeout": idle_timeout,
+    })
+    _remember_session(result.get("session_id", ""))
+    session_id = str(result.get("session_id") or "")
+    effective = result.get("config") if isinstance(result.get("config"), dict) else {}
+    if session_id:
+        common.write_session_config(session_id, effective or {
+            "model": model, "effort": effort,
+            "work_mode": work_mode or "balanced", "tool_approval": tool_approval,
+        }, replace=True)
+    return result
+
+
 @mcp.tool()
 async def reasonix_spawn(
     task: str,
@@ -860,24 +1040,73 @@ async def reasonix_spawn(
     e.g. an effort option.
     """
     _capture_relay_ctx(ctx)
-    result = await _rpc("spawn", {
-        "task": task, "cwd": cwd, "model": model,
-        "work_mode": work_mode, "tool_approval": tool_approval, "effort": effort,
-        "keep_alive": keep_alive, "idle_timeout": idle_timeout,
-    })
-    _remember_session(result.get("session_id", ""))
-    # Persist at the MCP boundary too. This remains effective when a shared
-    # pre-upgrade daemon accepts spawn but does not write configuration
-    # sidecars itself. Prefer its effective values because unsupported options
-    # may have been skipped.
-    session_id = str(result.get("session_id") or "")
-    effective = result.get("config") if isinstance(result.get("config"), dict) else {}
-    if session_id:
-        common.write_session_config(session_id, effective or {
-            "model": model, "effort": effort,
-            "work_mode": work_mode or "balanced", "tool_approval": tool_approval,
-        }, replace=True)
-    return result
+    return await _spawn_agent(
+        task=task, cwd=cwd, model=model, work_mode=work_mode,
+        tool_approval=tool_approval, effort=effort, keep_alive=keep_alive,
+        idle_timeout=idle_timeout,
+    )
+
+
+@mcp.tool()
+async def reasonix_spawn_fleet(path: str, ctx: Context | None = None) -> dict:
+    """Spawn an assigned fleet from a JSON file in one tool call.
+
+    Canonical shape: {"name": "audit", "defaults": {spawn options...},
+    "agents": [{"name": "compile", "task": "...", per-agent options...}]}.
+    Defaults may include model and effort (plus cwd, work_mode, tool_approval,
+    keep_alive, and idle_timeout); any agent may override any default.
+    `agents` may also be a name-to-task/object mapping; `tasks` is accepted as
+    an alias; a root array is accepted for compact files. Relative cwd values
+    resolve beside the JSON file. The complete file is validated before any
+    process starts. Returns all successful session_ids ready for one
+    reasonix_watch call plus per-agent runtime failures, if any.
+    """
+    _capture_relay_ctx(ctx)
+    fleet = load_fleet_file(path)
+    semaphore = asyncio.Semaphore(fleet["parallelism"])
+
+    async def spawn_one(index: int, assignment: dict) -> dict:
+        async with semaphore:
+            try:
+                result = await _spawn_agent(**{
+                    key: assignment[key]
+                    for key in ("task", *FLEET_SPAWN_FIELDS)
+                })
+            except Exception as exc:
+                return {
+                    "index": index, "name": assignment["name"],
+                    "status": "failed", "error": str(exc),
+                }
+        compact = {
+            "index": index, "name": assignment["name"],
+            "session_id": result.get("session_id"),
+            "status": result.get("status", "running"),
+            "cwd": result.get("cwd", assignment["cwd"] or os.getcwd()),
+            "config": result.get("config", {}),
+        }
+        for key in ("skipped_options", "skipped_options_note"):
+            if result.get(key):
+                compact[key] = result[key]
+        return compact
+
+    results = await asyncio.gather(*(
+        spawn_one(index, assignment)
+        for index, assignment in enumerate(fleet["agents"], 1)
+    ))
+    session_ids = [
+        item["session_id"] for item in results if item.get("session_id")
+    ]
+    failures = [item for item in results if item.get("status") == "failed"]
+    return {
+        "fleet": fleet["name"], "source": fleet["source"],
+        "requested": len(results), "spawned": len(session_ids),
+        "failed": len(failures), "session_ids": session_ids,
+        "agents": results,
+        "watch_note": (
+            "Call reasonix_watch once with session_ids, remove terminal ids, "
+            "then watch the remaining fleet."
+        ),
+    }
 
 
 @mcp.tool()
