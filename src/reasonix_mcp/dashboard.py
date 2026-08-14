@@ -789,10 +789,16 @@ def resolved_session_config(
     required = {"model", "effort", "work_mode", "tool_approval"}
     if required <= persisted.keys():
         return persisted, True, "persisted"
-    defaults = common.default_session_config()
+    metadata = common.read_acp_session_config(session_id)
+    recovered = {**metadata, **persisted}
+    if required <= recovered.keys():
+        config = common.write_session_config(session_id, recovered, replace=True)
+        return config, True, "session_metadata"
     if persisted:
-        return {**defaults, **persisted}, False, "persisted_partial"
-    return defaults, False, "legacy_defaults"
+        return persisted, False, "persisted_partial"
+    if metadata:
+        return metadata, False, "session_metadata_partial"
+    return {}, False, "unavailable"
 
 
 async def api_routines(request: Request) -> Response:
@@ -901,7 +907,7 @@ async def api_session(request: Request) -> Response:
         cached = request.app.state.dashboard.permission_requests.get(session_id)
         if cached:
             live["permission_request"] = cached
-    persisted_config = common.read_session_config(session_id)
+    historical_config = resolved_session_config(session_id, None)
     if live is not None:
         live["task"] = live.get("task") or preview.get("task") or f"Session {session_id[:8]}"
         live["cwd"] = live.get("cwd") or preview.get("cwd") or ""
@@ -917,9 +923,9 @@ async def api_session(request: Request) -> Response:
             "task": preview.get("task") or f"Session {session_id[:8]}",
             "cwd": preview.get("cwd") or "",
             "resumable": transcript["exists"],
-            "config": common.read_session_config(session_id),
-            "config_known": bool(persisted_config),
-            "config_source": "persisted",
+            "config": historical_config[0],
+            "config_known": historical_config[1],
+            "config_source": historical_config[2],
         },
         "messages": messages,
         "transcript": transcript,

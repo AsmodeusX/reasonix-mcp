@@ -199,15 +199,28 @@ def main() -> None:
         legacy_config, legacy_known, legacy_source = dashboard.resolved_session_config(
             "legacy-session", {}
         )
-        assert legacy_known is False and legacy_source == "legacy_defaults"
-        assert legacy_config == common.default_session_config()
-        common.write_session_config("legacy-session", {"model": "chosen/model"})
+        assert legacy_known is False and legacy_source == "unavailable"
+        assert legacy_config == {}
+        with open(common.session_acp_path("legacy-session"), "w", encoding="utf-8") as fh:
+            json.dump({
+                "model": "codex/gpt-5.6-sol", "effortOverride": "high",
+                "runtimeProfile": "balanced", "toolApprovalMode": "yolo",
+            }, fh)
+        recovered_config, recovered_known, recovered_source = (
+            dashboard.resolved_session_config("legacy-session", {})
+        )
+        assert recovered_known is True and recovered_source == "session_metadata"
+        assert recovered_config == {
+            "model": "codex/gpt-5.6-sol", "effort": "high",
+            "work_mode": "balanced", "tool_approval": "yolo",
+        }
+        assert common.read_session_config("legacy-session") == recovered_config
+        common.write_session_config("partial-session", {"model": "chosen/model"})
         partial_config, partial_known, partial_source = dashboard.resolved_session_config(
-            "legacy-session", {}
+            "partial-session", {}
         )
         assert partial_known is False and partial_source == "persisted_partial"
-        assert partial_config["model"] == "chosen/model"
-        assert partial_config["effort"] == common.DEFAULT_EFFORT
+        assert partial_config == {"model": "chosen/model"}
         reported = {
             "model": "reported/model", "effort": "high",
             "work_mode": "delivery", "tool_approval": "ask",

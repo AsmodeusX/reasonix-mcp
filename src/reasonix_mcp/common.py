@@ -203,6 +203,10 @@ def session_config_path(session_id: str) -> str:
     )
 
 
+def session_acp_path(session_id: str) -> str:
+    return os.path.join(reasonix_home(), "sessions", f"{session_id}.acp.json")
+
+
 def session_timeline_path(session_id: str) -> str:
     return os.path.join(
         reasonix_home(), "sessions", f"{session_id}.orchestrator-timeline.jsonl"
@@ -326,14 +330,29 @@ def read_session_config(session_id: str) -> dict[str, str]:
     }
 
 
-def default_session_config() -> dict[str, str]:
-    """Concrete spawn defaults for legacy sessions that predate sidecars."""
-    return {
-        "model": DEFAULT_MODEL,
-        "effort": DEFAULT_EFFORT,
-        "work_mode": DEFAULT_WORK_MODE or "balanced",
-        "tool_approval": DEFAULT_TOOL_APPROVAL,
+def read_acp_session_config(session_id: str) -> dict[str, str]:
+    """Recover effective values persisted by Reasonix itself.
+
+    Older agentd versions did not write orchestrator config sidecars, but the
+    Reasonix ACP session record still contains the selected values.
+    """
+    try:
+        with open(session_acp_path(session_id), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return {}
+    aliases = {
+        "model": ("model",),
+        "effort": ("effortOverride", "effort"),
+        "work_mode": ("runtimeProfile", "workMode", "work_mode"),
+        "tool_approval": ("toolApprovalMode", "toolApproval", "tool_approval"),
     }
+    result = {}
+    for target, candidates in aliases.items():
+        value = next((data.get(key) for key in candidates if data.get(key)), None)
+        if value is not None:
+            result[target] = str(value)
+    return result
 
 
 def write_session_config(
