@@ -590,6 +590,8 @@ async def _configure_with_compat(
         result = await _configure_stale_agentd(session_id, updates)
     else:
         common.clear_session_runtime_override(session_id)
+        config = result.get("config") if isinstance(result.get("config"), dict) else {}
+        common.write_session_config(session_id, config or updates)
     _cancel_resolved_elicitation(session_id, result)
     return result
 
@@ -805,6 +807,17 @@ async def reasonix_spawn(
         "keep_alive": keep_alive, "idle_timeout": idle_timeout,
     })
     _remember_session(result.get("session_id", ""))
+    # Persist at the MCP boundary too. This remains effective when a shared
+    # pre-upgrade daemon accepts spawn but does not write configuration
+    # sidecars itself. Prefer its effective values because unsupported options
+    # may have been skipped.
+    session_id = str(result.get("session_id") or "")
+    effective = result.get("config") if isinstance(result.get("config"), dict) else {}
+    if session_id:
+        common.write_session_config(session_id, effective or {
+            "model": model, "effort": effort,
+            "work_mode": work_mode or "balanced", "tool_approval": tool_approval,
+        }, replace=True)
     return result
 
 

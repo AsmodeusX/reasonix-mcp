@@ -196,6 +196,28 @@ def main() -> None:
         assert missing_transcript["runs"] == []
         assert missing_transcript["tool_calls"] == []
         json.dumps({"messages": missing_messages, "transcript": missing_transcript})
+        legacy_config, legacy_known, legacy_source = dashboard.resolved_session_config(
+            "legacy-session", {}
+        )
+        assert legacy_known is False and legacy_source == "legacy_defaults"
+        assert legacy_config == common.default_session_config()
+        common.write_session_config("legacy-session", {"model": "chosen/model"})
+        partial_config, partial_known, partial_source = dashboard.resolved_session_config(
+            "legacy-session", {}
+        )
+        assert partial_known is False and partial_source == "persisted_partial"
+        assert partial_config["model"] == "chosen/model"
+        assert partial_config["effort"] == common.DEFAULT_EFFORT
+        reported = {
+            "model": "reported/model", "effort": "high",
+            "work_mode": "delivery", "tool_approval": "ask",
+        }
+        verified_config, verified_known, verified_source = dashboard.resolved_session_config(
+            "legacy-session", reported
+        )
+        assert verified_known is True and verified_source == "agent"
+        assert verified_config == reported
+        assert common.read_session_config("legacy-session") == reported
         try:
             dashboard.owner_for_session("session-two")
             raise AssertionError("unknown session was accepted")

@@ -326,6 +326,16 @@ def read_session_config(session_id: str) -> dict[str, str]:
     }
 
 
+def default_session_config() -> dict[str, str]:
+    """Concrete spawn defaults for legacy sessions that predate sidecars."""
+    return {
+        "model": DEFAULT_MODEL,
+        "effort": DEFAULT_EFFORT,
+        "work_mode": DEFAULT_WORK_MODE or "balanced",
+        "tool_approval": DEFAULT_TOOL_APPROVAL,
+    }
+
+
 def write_session_config(
     session_id: str,
     updates: dict[str, str],

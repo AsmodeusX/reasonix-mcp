@@ -778,6 +778,23 @@ def dashboard_routine(value: dict) -> dict:
     return result
 
 
+def resolved_session_config(
+    session_id: str, reported_config: object
+) -> tuple[dict, bool, str]:
+    """Resolve verified config while making legacy estimates explicit."""
+    persisted = common.read_session_config(session_id)
+    if isinstance(reported_config, dict) and reported_config:
+        config = common.write_session_config(session_id, reported_config, replace=True)
+        return config, True, "agent"
+    required = {"model", "effort", "work_mode", "tool_approval"}
+    if required <= persisted.keys():
+        return persisted, True, "persisted"
+    defaults = common.default_session_config()
+    if persisted:
+        return {**defaults, **persisted}, False, "persisted_partial"
+    return defaults, False, "legacy_defaults"
+
+
 async def api_routines(request: Request) -> Response:
     await require_auth(request)
     if request.method == "GET":
@@ -889,12 +906,8 @@ async def api_session(request: Request) -> Response:
         live["task"] = live.get("task") or preview.get("task") or f"Session {session_id[:8]}"
         live["cwd"] = live.get("cwd") or preview.get("cwd") or ""
         reported_config = live.get("config")
-        live["config_known"] = isinstance(reported_config, dict) and bool(reported_config)
-        live["config_source"] = "agent" if live["config_known"] else (
-            "persisted_pending" if persisted_config else "unavailable"
-        )
-        if not live["config_known"]:
-            live["config"] = persisted_config
+        config, known, source = resolved_session_config(session_id, reported_config)
+        live["config"], live["config_known"], live["config_source"] = config, known, source
     return JSONResponse({
         "session_id": session_id,
         "owner_id": owner,
@@ -917,6 +930,8 @@ async def configure_compat(owner: str, session_id: str, updates: dict) -> dict:
     try:
         result = await agentd_rpc(owner, "configure", {"session_id": session_id, **updates})
         common.clear_session_runtime_override(session_id)
+        config = result.get("config") if isinstance(result.get("config"), dict) else {}
+        common.write_session_config(session_id, config or updates)
         return result
     except DashboardError as exc:
         if "unknown method 'configure'" not in str(exc):

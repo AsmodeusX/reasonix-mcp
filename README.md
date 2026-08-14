@@ -146,7 +146,11 @@ For a live agent, the user can steer or follow up, stop it, switch model,
 effort, work mode, or approval policy, and answer pending permission or agent
 questions. The control panel shows the values reported by the agent separately
 from queued changes; an old daemon that cannot report them says `Unknown`
-instead of presenting a placeholder as current state. Stopped and historical
+only when no useful fallback exists. Sessions created before configuration
+sidecars existed show the concrete spawn defaults in amber with a clear
+"estimated legacy defaults" note; recorded changes override individual
+estimates. New spawns persist their effective settings at both the MCP and
+daemon boundaries, so they remain verified across upgrades. Stopped and historical
 sessions can be resumed from the UI.
 
 Dashboard observation is deliberately separate from orchestration delivery:

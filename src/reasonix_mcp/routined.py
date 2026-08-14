@@ -196,6 +196,13 @@ async def launch(value: dict, run: dict) -> None:
             "tool_approval": value["tool_approval"],
             "keep_alive": False, "idle_timeout": 30,
         })
+        common.write_session_config(
+            result["session_id"], result.get("config") or {
+                "model": value["model"], "effort": value["effort"],
+                "work_mode": value["work_mode"],
+                "tool_approval": value["tool_approval"],
+            }, replace=True,
+        )
         update_run(value["routine_id"], run["run_id"], {
             "status": "running", "started_at": time.time(),
             "session_id": result["session_id"], "config": result.get("config") or {},
