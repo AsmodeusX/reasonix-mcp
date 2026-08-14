@@ -117,6 +117,8 @@ decision-blocked agents are clear and terminal output has been delivered by
 watch or poll. Manual restart tools remain available for explicit control.
 The orchestrator status protocol is injected once per persisted child session;
 follow-up and resumed turns do not duplicate it.
+Child response language uses Reasonix's native language setting. Its automatic
+language detection defaults to English through REASONIX_MCP_DEFAULT_LANGUAGE.
 Keep orchestration state in the parent agent. Completed agents can be
 cleaned up after a configured idle grace period (disabled by default) unless
 spawned with keep_alive=true;
@@ -846,7 +848,8 @@ async def reasonix_spawn(
     reasonix_send to steer mid-turn, reasonix_stop when done.
 
     Defaults: model=opencode-go/deepseek-v4-flash, effort=max,
-    tool_approval=yolo (env-overridable REASONIX_MCP_DEFAULT_*). Completed
+    tool_approval=yolo (env-overridable REASONIX_MCP_DEFAULT_*). Native Reasonix
+    language auto-detection defaults to English. Completed
     agents are cleaned up after an idle grace period; set keep_alive=true for
     an interactive session that needs follow-up turns. work_mode:
     economy|balanced|delivery; effort values are model-advertised and can

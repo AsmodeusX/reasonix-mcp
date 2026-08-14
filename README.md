@@ -332,7 +332,8 @@ Spawned agents run at **`effort = max`** on **`opencode-go/deepseek-v4-flash`**
 with **`tool_approval = yolo`** by default (the user's requested defaults). All
 spawn options are per-call overridable, and the defaults themselves are
 env-overridable (`REASONIX_MCP_DEFAULT_MODEL`, `REASONIX_MCP_DEFAULT_EFFORT`,
-`REASONIX_MCP_DEFAULT_WORK_MODE`, `REASONIX_MCP_DEFAULT_TOOL_APPROVAL`).
+`REASONIX_MCP_DEFAULT_WORK_MODE`, `REASONIX_MCP_DEFAULT_TOOL_APPROVAL`,
+`REASONIX_MCP_DEFAULT_LANGUAGE`).
 
 **Model selection**: pass `reasonix_spawn(model="<provider>/<model>", ...)` to
 pick the agent's model per call — `reasonix_models()` lists the valid refs and
@@ -409,6 +410,13 @@ this server receive a small status contract asking them to keep that plan curren
 It is injected exactly once per persisted session: follow-up turns do not
 repeat it, and resume detects it in session history. Explicit task restrictions
 on tools take precedence.
+
+Reasonix MCP defaults native language auto-detection to English by passing
+`REASONIX_LANG=en` to each child. Set `REASONIX_MCP_DEFAULT_LANGUAGE` to
+`auto|en|zh` before starting agentd to change that default. An explicit
+top-level `language` in Reasonix config remains authoritative; visible
+reasoning is controlled separately by `[agent].reasoning_language`. The MCP
+does not inject a competing language prompt.
 
 `turns` in detailed poll results gives completed turns as `[{text, stop_reason}]` —
 clean turn boundaries (full_text alone concatenates turns).

@@ -44,6 +44,7 @@ DEFAULT_MODEL = os.environ.get("REASONIX_MCP_DEFAULT_MODEL", "opencode-go/deepse
 DEFAULT_EFFORT = os.environ.get("REASONIX_MCP_DEFAULT_EFFORT", "max")
 DEFAULT_WORK_MODE = os.environ.get("REASONIX_MCP_DEFAULT_WORK_MODE", "")  # "" = follow config (balanced)
 DEFAULT_TOOL_APPROVAL = os.environ.get("REASONIX_MCP_DEFAULT_TOOL_APPROVAL", "yolo")
+DEFAULT_LANGUAGE = os.environ.get("REASONIX_MCP_DEFAULT_LANGUAGE", "en").strip() or "en"
 # Completed agents can be retained briefly so an orchestrator can poll the
 # final turn or send a quick follow-up. -1 disables cleanup; keep_alive=true
 # also disables it per spawn for interactive sessions.
@@ -66,6 +67,16 @@ tool sequence, use the native plan tool for non-trivial work:
 Keep the plan factual and concise. This is machine-readable progress state;
 you do not need to narrate it in every response.
 """.strip()
+
+
+def normalize_language(language: object) -> str:
+    value = str(language or DEFAULT_LANGUAGE).strip().lower()
+    aliases = {"english": "en", "chinese": "zh", "zh-cn": "zh"}
+    value = aliases.get(value, value)
+    if value not in ("auto", "en", "zh"):
+        raise ValueError("language must be one of: auto, en, zh")
+    return value
+
 
 # Spawn cwd confinement: agents may only root at the caller's project dir (and
 # subdirs) plus the [sandbox] allow_write dirs. Escapes with

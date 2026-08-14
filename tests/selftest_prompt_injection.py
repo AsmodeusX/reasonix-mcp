@@ -62,6 +62,33 @@ def main() -> None:
         with open(os.path.join(session_dir, f"{legacy_id}.jsonl"), "w", encoding="utf-8") as transcript:
             transcript.write(json.dumps({"role": "user", "content": common.STATUS_PROMPT_MARKER}) + "\n")
         assert not common.transcript_has_status_protocol(legacy_id)
+        assert common.normalize_language("") == "en"
+        assert common.normalize_language("English") == "en"
+        assert common.normalize_language("Chinese") == "zh"
+
+        captured: list[dict] = []
+
+        class FakeNativeAgent(FakeAgent):
+            def __init__(self, **kwargs):
+                super().__init__()
+                captured.append(kwargs)
+                self.session_id = f"native-language-{len(captured)}"
+                self.config_values = {}
+                self.spawn_notes = {}
+                self.status = "idle"
+                self.active_turn = False
+                self.on_event = None
+
+        original_agent = agentd.acp_bridge.ReasonixAgent
+        agentd.acp_bridge.ReasonixAgent = FakeNativeAgent
+        try:
+            daemon.spawn({"task": "Use native default", "cwd": ROOT})
+            daemon.spawn({"task": "Use native default again", "cwd": ROOT})
+        finally:
+            agentd.acp_bridge.ReasonixAgent = original_agent
+        assert [item["extra_env"] for item in captured] == [
+            {"REASONIX_LANG": "en"}, {"REASONIX_LANG": "en"},
+        ]
     finally:
         if old_home is None:
             os.environ.pop("REASONIX_HOME", None)

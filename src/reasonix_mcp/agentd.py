@@ -426,6 +426,10 @@ class Agentd:
             raise AgentdError("idle_timeout must be -1 (disabled) or between 0 and 86400 seconds") from None
         if idle_timeout < -1 or idle_timeout > 86400:
             raise AgentdError("idle_timeout must be -1 (disabled) or between 0 and 86400 seconds")
+        try:
+            language = common.normalize_language(common.DEFAULT_LANGUAGE)
+        except ValueError as exc:
+            raise AgentdError(str(exc)) from exc
 
         agent = acp_bridge.ReasonixAgent(
             cwd=cwd,
@@ -433,6 +437,7 @@ class Agentd:
             work_mode=work_mode,
             tool_approval=tool_approval,
             effort=params.get("effort", common.DEFAULT_EFFORT),
+            extra_env={"REASONIX_LANG": language},
         )
         agent.task = task
         agent.cwd = cwd
@@ -532,6 +537,10 @@ class Agentd:
         if "model" in requested_config and "effort" not in requested_config:
             saved_config.pop("effort", None)
         saved_config.update(requested_config)
+        try:
+            language = common.normalize_language(common.DEFAULT_LANGUAGE)
+        except ValueError as exc:
+            raise AgentdError(str(exc)) from exc
         agent = acp_bridge.ReasonixAgent(
             cwd=cwd,
             resume_session_id=session_id,
@@ -539,6 +548,7 @@ class Agentd:
             effort=saved_config.get("effort", ""),
             work_mode=saved_config.get("work_mode", ""),
             tool_approval=saved_config.get("tool_approval", ""),
+            extra_env={"REASONIX_LANG": language},
         )
         agent.status_protocol_injected = common.transcript_has_status_protocol(session_id)
         agent.task = getattr(existing, "task", None) or f"resumed {session_id}"
