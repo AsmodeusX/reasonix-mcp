@@ -766,6 +766,30 @@ def check_pending_permission_is_durable() -> None:
     assert result["transcript_path"] == agent.transcript_path
 
 
+def check_list_permission_detail_does_not_hide_fleet() -> None:
+    daemon = Agentd()
+    agent = watch_agent("permission-list")
+    agent.task = "Needs a decision"
+    agent.cwd = ROOT
+    agent.transcript_path = "/tmp/permission-list.jsonl"
+    agent._pending_permission = (23, {
+        "toolCall": {"kind": "execute", "title": "Run command"},
+        "options": [{"optionId": "allow_once", "name": "Allow once"}],
+    })
+    daemon._registry[agent.session_id] = agent
+    result = daemon.list({
+        "owner_id": agent.owner_id,
+        "include_permission_detail": True,
+    })
+    assert len(result["sessions"]) == 1, result
+    permission = result["sessions"][0]["permission_request"]
+    assert permission == {
+        "request_id": 23,
+        "tool_call": {"kind": "execute", "title": "Run command"},
+        "options": [{"optionId": "allow_once", "name": "Allow once"}],
+    }, permission
+
+
 async def main() -> None:
     await check_connection_probe_serialization()
     await check_old_reader_isolation()
@@ -782,6 +806,7 @@ async def main() -> None:
     await check_configure_persisted_session_without_tombstone()
     await check_server_compacts_legacy_daemon_poll()
     check_pending_permission_is_durable()
+    check_list_permission_detail_does_not_hide_fleet()
     daemon = Agentd()
     agent = SimpleNamespace(
         session_id="agent-watch",

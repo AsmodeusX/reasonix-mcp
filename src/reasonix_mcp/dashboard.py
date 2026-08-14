@@ -775,7 +775,10 @@ async def fleet_snapshot() -> dict:
         try:
             listing = await agentd_rpc(owner, "list", {
                 "include_task": False,
-                "include_permission_detail": True,
+                # Older daemons serialize their internal permission tuple
+                # incorrectly when detail is requested, hiding the owner's
+                # entire fleet. Observer events/cache provide detail on demand.
+                "include_permission_detail": False,
             })
             live_by_owner[owner] = {
                 str(item["session_id"]): item for item in listing.get("sessions", [])
@@ -985,7 +988,7 @@ async def api_session(request: Request) -> Response:
             # Detail view needs the complete prompt before an ACP transcript
             # exists. Fleet snapshots intentionally keep using previews.
             "include_task": True,
-            "include_permission_detail": True,
+            "include_permission_detail": False,
         })
         live = next(
             (item for item in listing.get("sessions", []) if item.get("session_id") == session_id),

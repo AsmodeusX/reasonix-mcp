@@ -1088,6 +1088,16 @@ class Agentd:
             ):
                 continue
             persisted = os.path.join(common.reasonix_home(), "sessions", f"{sid}.jsonl")
+            pending_permission = getattr(a, "_pending_permission", None)
+            if include_permission_detail and pending_permission is not None:
+                request_id, request_params = pending_permission
+                permission_request: bool | dict = {
+                    "request_id": request_id,
+                    "tool_call": request_params.get("toolCall", {}),
+                    "options": request_params.get("options", []),
+                }
+            else:
+                permission_request = pending_permission is not None
             session = {
                 "session_id": sid,
                 "status": status,
@@ -1098,11 +1108,7 @@ class Agentd:
                 ),
                 "stop_reason": a.stop_reason,
                 "transcript_path": getattr(a, "transcript_path", None),
-                "permission_request": (
-                    dict(a._pending_permission)
-                    if include_permission_detail and a._pending_permission is not None
-                    else a._pending_permission is not None
-                ),
+                "permission_request": permission_request,
                 "plan": list(getattr(a, "plan_entries", []) or []),
                 "current_work": (
                     dict(getattr(a, "current_work", None))
