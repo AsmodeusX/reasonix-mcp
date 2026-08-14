@@ -25,6 +25,7 @@ import argparse
 import asyncio
 from collections import OrderedDict
 from collections.abc import Iterable
+import fcntl
 import json
 import os
 import signal
@@ -39,6 +40,19 @@ import common
 
 SOURCE_WATCH_INTERVAL = 0.5
 AUTO_RESTART_IDLE_GRACE = 3.0
+
+
+def acquire_instance_lock(sock_path: str) -> int | None:
+    """Hold one daemon per socket path for the daemon's entire lifetime."""
+    lock_path = f"{sock_path}.lock"
+    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        return None
+    return lock_fd
 
 
 class AgentdError(Exception):
@@ -1408,12 +1422,22 @@ def main() -> None:
     # One `reasonix acp` process per agent is deliberate: a crashed session's
     # process can be killed without taking the fleet down (blast-radius).
     args = ap.parse_args()
+    instance_lock = acquire_instance_lock(args.sock)
+    if instance_lock is None:
+        print(
+            f"reasonix agentd: another daemon already owns {args.sock}; exiting",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
     agentd = Agentd()
     try:
         asyncio.run(agentd.serve(args.sock))
     except KeyboardInterrupt:
         pass
-    if agentd._auto_restart_requested:
+    should_restart = agentd._auto_restart_requested
+    os.close(instance_lock)
+    if should_restart:
         subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "--sock", args.sock],
             stdin=subprocess.DEVNULL,

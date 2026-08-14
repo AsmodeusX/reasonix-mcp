@@ -50,6 +50,9 @@ MAX_TRANSCRIPT_TEXT = 12_000
 MAX_TOOL_RESULT_TEXT = 8_000
 PREVIEW_BYTES = 256_000
 _preview_cache: dict[str, tuple[int, int, dict]] = {}
+_transcript_cache: dict[
+    str, tuple[tuple[int, int, int, int], tuple[list[dict], dict]]
+] = {}
 DEFAULT_PASSWORD = os.environ.get("REASONIX_MCP_DASHBOARD_PASSWORD", "CHANGEME")
 
 
@@ -209,6 +212,13 @@ def _clean_user_text(text: str) -> str:
         text,
         flags=re.DOTALL | re.IGNORECASE,
     )
+    text = re.sub(
+        r"\s*<(?:reasoning|response)-language\b[^>]*>.*?"
+        r"</(?:reasoning|response)-language>\s*",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
     marker = common.STATUS_PROMPT_MARKER
     if marker in text:
         text = text.split(marker, 1)[0]
@@ -219,16 +229,33 @@ def _clean_task(text: str) -> str:
     return " ".join(_clean_user_text(text).split())[:500]
 
 
+def checkpoint_initial_prompt(session_id: str) -> tuple[str, float | None]:
+    """Recover the original task while ACP has not written its transcript yet."""
+    path = os.path.join(
+        common.reasonix_home(), "sessions", f"{session_id}.ckpt", "turn-0.json"
+    )
+    try:
+        stat = os.stat(path)
+        with open(path, encoding="utf-8") as fh:
+            prompt = json.load(fh).get("prompt")
+    except (OSError, ValueError, TypeError):
+        return "", None
+    if not isinstance(prompt, str):
+        return "", stat.st_mtime
+    return _clean_user_text(prompt)[:MAX_TRANSCRIPT_TEXT], stat.st_mtime
+
+
 def transcript_preview(session_id: str) -> dict:
     path = os.path.join(common.reasonix_home(), "sessions", f"{session_id}.jsonl")
     try:
         stat = os.stat(path)
     except OSError:
         stat = None
+    checkpoint_prompt, checkpoint_updated = checkpoint_initial_prompt(session_id)
     result = {
         "transcript_path": path if stat else None,
-        "updated_at": stat.st_mtime if stat else None,
-        "task": "",
+        "updated_at": stat.st_mtime if stat else checkpoint_updated,
+        "task": _clean_task(checkpoint_prompt),
         "cwd": "",
     }
     if stat is None:
@@ -263,8 +290,25 @@ def transcript_preview(session_id: str) -> dict:
 
 def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
     path = os.path.join(common.reasonix_home(), "sessions", f"{session_id}.jsonl")
+    timeline_path = common.session_timeline_path(session_id)
+    try:
+        transcript_stat = os.stat(path)
+    except OSError:
+        transcript_stat = None
+    try:
+        timeline_stat = os.stat(timeline_path)
+    except OSError:
+        timeline_stat = None
+    fingerprint = (
+        transcript_stat.st_mtime_ns if transcript_stat else 0,
+        transcript_stat.st_size if transcript_stat else 0,
+        timeline_stat.st_mtime_ns if timeline_stat else 0,
+        timeline_stat.st_size if timeline_stat else 0,
+    )
+    cached = _transcript_cache.get(session_id)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
     messages: deque[dict] = deque(maxlen=MAX_TRANSCRIPT_MESSAGES)
-    tool_calls: deque[dict] = deque(maxlen=50)
     messages_total = 0
     tool_calls_total = 0
     runs: list[dict] = []
@@ -278,7 +322,6 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
             "transcript_path": path,
             "messages_total": 0,
             "messages_truncated": False,
-            "tool_calls": [],
             "tool_calls_total": 0,
             "runs": [],
             "runs_total": 0,
@@ -375,7 +418,6 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
                         "arguments": str(call.get("arguments") or "")[:4000],
                         "tool_call_id": str(call.get("id") or ""),
                     }
-                    tool_calls.append(entry)
                     current_run["entries"].append(entry)
                 if role == "tool" and isinstance(row.get("content"), str):
                     content = row["content"]
@@ -426,16 +468,15 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
     for index, run in enumerate(kept_runs):
         run["number"] = len(runs) - len(kept_runs) + index + 1
         run["active"] = index == len(kept_runs) - 1
-    return list(messages), {
+    result = list(messages), {
         "exists": transcript_exists,
         "transcript_path": path,
         "messages_total": messages_total + orchestrator_messages_total,
         "messages_truncated": (
             messages_total + orchestrator_messages_total > MAX_TRANSCRIPT_MESSAGES
         ),
-        "tool_calls": list(tool_calls),
         "tool_calls_total": tool_calls_total,
-        "runs": list(reversed(kept_runs)),
+        "runs": list(kept_runs),
         "runs_total": len(runs),
         "timeline_entries": kept_entries,
         "updated_at": max(
@@ -444,6 +485,43 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
             if external_events else 0,
         ) or None,
     }
+    if len(_transcript_cache) > 256:
+        _transcript_cache.clear()
+    _transcript_cache[session_id] = (fingerprint, result)
+    return result
+
+
+def transcript_with_initial_prompt(
+    transcript: dict, session: dict, *, is_live: bool
+) -> dict:
+    """Show a task immediately, before the ACP transcript has been persisted.
+
+    The synthetic entry is used only while there are no real runs, so the first
+    persisted user message replaces it instead of appearing twice.
+    """
+    if transcript.get("runs"):
+        return transcript
+    task = _clean_user_text(str(session.get("task") or ""))
+    if not task:
+        return transcript
+    result = dict(transcript)
+    result.update({
+        "runs": [{
+            "number": 1,
+            "active": bool(is_live and session.get("status") == "running"),
+            "started_at": session.get("created_at") or session.get("updated_at"),
+            "entries": [{
+                "kind": "message",
+                "role": "user",
+                "text": task,
+                "synthetic": True,
+            }],
+        }],
+        "runs_total": 1,
+        "timeline_entries": 1,
+        "synthetic_initial_prompt": True,
+    })
+    return result
 
 
 class DashboardState:
@@ -452,7 +530,7 @@ class DashboardState:
         self.subscribers: set[asyncio.Queue] = set()
         self.observers: dict[str, asyncio.Task] = {}
         self.permission_requests: dict[str, dict] = {}
-        self.timeline_files: dict[str, tuple[int, int]] = {}
+        self.timeline_files: dict[str, tuple[int, int, int]] = {}
         self.routine_files: dict[str, tuple[int, int]] = {}
         self.closed = False
 
@@ -480,7 +558,7 @@ class DashboardState:
                 self.observers.pop(owner).cancel()
             await self.sync_timeline_files()
             await self.sync_routine_files()
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
 
     async def sync_routine_files(self) -> None:
         current: dict[str, tuple[int, int]] = {}
@@ -502,17 +580,27 @@ class DashboardState:
         self.routine_files = current
 
     async def sync_timeline_files(self) -> None:
-        current: dict[str, tuple[int, int]] = {}
-        suffix = ".orchestrator-timeline.jsonl"
-        for path in glob.glob(os.path.join(
-            common.reasonix_home(), "sessions", f"*{suffix}"
-        )):
+        files: dict[str, list[os.stat_result]] = defaultdict(list)
+        session_dir = os.path.join(common.reasonix_home(), "sessions")
+        for path in glob.glob(os.path.join(session_dir, "*.jsonl")):
+            name = os.path.basename(path)
+            if name.endswith(".orchestrator-timeline.jsonl"):
+                session_id = name.removesuffix(".orchestrator-timeline.jsonl")
+            elif name.endswith(".events.jsonl"):
+                session_id = name.removesuffix(".events.jsonl")
+            else:
+                session_id = name.removesuffix(".jsonl")
             try:
-                stat = os.stat(path)
+                files[session_id].append(os.stat(path))
             except OSError:
                 continue
-            session_id = os.path.basename(path)[:-len(suffix)]
-            fingerprint = (stat.st_mtime_ns, stat.st_size)
+        current: dict[str, tuple[int, int, int]] = {}
+        for session_id, stats in files.items():
+            fingerprint = (
+                max(stat.st_mtime_ns for stat in stats),
+                sum(stat.st_size for stat in stats),
+                len(stats),
+            )
             current[session_id] = fingerprint
             previous = self.timeline_files.get(session_id)
             if previous is not None and previous != fingerprint:
@@ -894,7 +982,9 @@ async def api_session(request: Request) -> Response:
     live = None
     try:
         listing = await agentd_rpc(owner, "list", {
-            "include_task": False,
+            # Detail view needs the complete prompt before an ACP transcript
+            # exists. Fleet snapshots intentionally keep using previews.
+            "include_task": True,
             "include_permission_detail": True,
         })
         live = next(
@@ -908,25 +998,33 @@ async def api_session(request: Request) -> Response:
         if cached:
             live["permission_request"] = cached
     historical_config = resolved_session_config(session_id, None)
+    checkpoint_prompt, _ = checkpoint_initial_prompt(session_id)
     if live is not None:
-        live["task"] = live.get("task") or preview.get("task") or f"Session {session_id[:8]}"
+        live["task"] = _clean_user_text(str(
+            live.get("task") or checkpoint_prompt or preview.get("task")
+            or f"Session {session_id[:8]}"
+        ))
         live["cwd"] = live.get("cwd") or preview.get("cwd") or ""
         reported_config = live.get("config")
         config, known, source = resolved_session_config(session_id, reported_config)
         live["config"], live["config_known"], live["config_source"] = config, known, source
+    session = live or {
+        "session_id": session_id,
+        "status": "previous",
+        "task": checkpoint_prompt or preview.get("task") or f"Session {session_id[:8]}",
+        "cwd": preview.get("cwd") or "",
+        "resumable": transcript["exists"],
+        "config": historical_config[0],
+        "config_known": historical_config[1],
+        "config_source": historical_config[2],
+    }
+    transcript = transcript_with_initial_prompt(
+        transcript, session, is_live=live is not None
+    )
     return JSONResponse({
         "session_id": session_id,
         "owner_id": owner,
-        "session": live or {
-            "session_id": session_id,
-            "status": "previous",
-            "task": preview.get("task") or f"Session {session_id[:8]}",
-            "cwd": preview.get("cwd") or "",
-            "resumable": transcript["exists"],
-            "config": historical_config[0],
-            "config_known": historical_config[1],
-            "config_source": historical_config[2],
-        },
+        "session": session,
         "messages": messages,
         "transcript": transcript,
     })

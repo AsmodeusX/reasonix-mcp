@@ -71,7 +71,7 @@
           </div>
         </header>
 
-        <div class="content-scroll">
+        <div id="session-content" class="content-scroll">
           <section id="permission-card" class="permission-card hidden">
             <div><span class="pulse"></span><strong>Decision required</strong></div>
             <h3 id="permission-title"></h3>
@@ -79,41 +79,36 @@
             <div id="permission-options" class="permission-options"></div>
           </section>
 
-          <section class="panel plan-panel">
-            <div class="panel-heading">
-              <h2>To-dos <span id="plan-count" class="count"></span></h2>
-              <span id="current-work" class="current-work"></span>
-            </div>
-            <div id="plan" class="plan"></div>
-          </section>
-
           <section class="panel conversation-panel">
             <div class="panel-heading">
-              <h2>Runs <span id="run-count" class="count"></span></h2>
-              <button id="reload-detail" class="text-button">Reload transcript</button>
+              <h2>Conversation <span id="run-count" class="count"></span></h2>
+              <span class="auto-update"><i></i>Auto-updating</span>
             </div>
             <div id="messages" class="messages"></div>
           </section>
-
-          <section class="panel tools-panel">
-            <details>
-              <summary>Recent tool calls <span id="tool-count" class="count"></span></summary>
-              <div id="tool-calls" class="tool-calls"></div>
-            </details>
-          </section>
         </div>
 
-        <form id="composer" class="composer">
-          <textarea id="message-input" rows="2" placeholder="Message Reasonix… (Ctrl/⌘ + Enter to send)"></textarea>
-          <div class="composer-row">
-            <select id="send-expect" title="Delivery mode">
-              <option value="any">Steer or follow up</option>
-              <option value="steer">Steer only</option>
-              <option value="new_turn">New turn only</option>
-            </select>
-            <button type="submit" class="send-button">Send ↑</button>
-          </div>
-        </form>
+        <div class="interaction-dock">
+          <details id="plan-dock" class="plan-dock">
+            <summary>
+              <strong>To-dos <span id="plan-count" class="count">0/0</span></strong>
+              <span id="current-work" class="current-work">No active goal</span>
+              <span class="dock-caret">⌄</span>
+            </summary>
+            <div id="plan" class="plan"></div>
+          </details>
+          <form id="composer" class="composer">
+            <textarea id="message-input" rows="2" placeholder="Message Reasonix… (Ctrl/⌘ + Enter to send)"></textarea>
+            <div class="composer-row">
+              <select id="send-expect" title="Delivery mode">
+                <option value="any">Steer or follow up</option>
+                <option value="steer">Steer only</option>
+                <option value="new_turn">New turn only</option>
+              </select>
+              <button type="submit" class="send-button">Send ↑</button>
+            </div>
+          </form>
+        </div>
       </section>
 
       <section id="routine-view" class="routine-view hidden">

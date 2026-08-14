@@ -117,6 +117,13 @@ def main() -> None:
         dashboard.routined.PROCESS_LOCK = os.path.join(scratch, "routined.lock")
         import server as mcp_server  # noqa: E402
 
+        with open(os.path.join(dashboard.STATIC_DIR, "dashboard.html"), encoding="utf-8") as fh:
+            dashboard_html = fh.read()
+        assert "Recent tool calls" not in dashboard_html
+        assert "Auto-updating" in dashboard_html
+        assert dashboard_html.index('id="plan-dock"') < dashboard_html.index('id="composer"')
+        assert "open" not in dashboard_html.split('id="plan-dock"', 1)[1].split(">", 1)[0]
+
         common.write_session_owner("session-one", "owner-one")
         common.save_owner_sessions("owner-one", {"session-one"})
         transcript_path = os.path.join(reasonix_home, "sessions", "session-one.jsonl")
@@ -152,6 +159,23 @@ def main() -> None:
         ], entries
         assert entries[-2]["text"] == "Focus on the parser"
         assert messages[-1]["text"] == "Implemented **successfully**."
+        assert "tool_calls" not in transcript
+
+        common.write_session_owner("ordered-session", "owner-one")
+        ordered_path = os.path.join(reasonix_home, "sessions", "ordered-session.jsonl")
+        with open(ordered_path, "w", encoding="utf-8") as fh:
+            for row in [
+                {"role": "user", "createdAt": 1000, "content": "First run"},
+                {"role": "assistant", "content": "First answer"},
+                {"role": "user", "createdAt": 2000, "content": "Second run"},
+                {"role": "assistant", "content": "Second answer"},
+            ]:
+                fh.write(json.dumps(row) + "\n")
+        _, ordered = dashboard.transcript_messages("ordered-session")
+        assert [run["entries"][0]["text"] for run in ordered["runs"]] == [
+            "First run", "Second run",
+        ]
+        assert ordered["runs"][-1]["active"] is True
         original_rpc = mcp_server._rpc
         original_owner = mcp_server._owner_id
         original_owned = mcp_server._owned_sessions
@@ -189,13 +213,56 @@ def main() -> None:
             assert changed == {
                 "type": "timeline_changed", "session_id": "session-one"
             }
+            with open(transcript_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "role": "assistant", "content": "Live transcript update",
+                }) + "\n")
+            await state.sync_timeline_files()
+            assert queue.get_nowait() == {
+                "type": "timeline_changed", "session_id": "session-one"
+            }
 
         asyncio.run(timeline_change_check())
         missing_messages, missing_transcript = dashboard.transcript_messages("missing")
         assert missing_messages == []
         assert missing_transcript["runs"] == []
-        assert missing_transcript["tool_calls"] == []
+        assert "tool_calls" not in missing_transcript
         json.dumps({"messages": missing_messages, "transcript": missing_transcript})
+        initial = dashboard.transcript_with_initial_prompt(
+            missing_transcript,
+            {
+                "task": "Initial full prompt",
+                "status": "running",
+                "created_at": 1_786_000_123,
+            },
+            is_live=True,
+        )
+        assert initial["synthetic_initial_prompt"] is True
+        assert initial["runs"][0]["active"] is True
+        assert initial["runs"][0]["entries"][0]["text"] == "Initial full prompt"
+        persisted = dashboard.transcript_with_initial_prompt(
+            transcript, {"task": "Must not duplicate"}, is_live=True
+        )
+        assert persisted is transcript
+        checkpoint_dir = os.path.join(
+            reasonix_home, "sessions", "checkpoint-session.ckpt"
+        )
+        os.makedirs(checkpoint_dir)
+        with open(os.path.join(checkpoint_dir, "turn-0.json"), "w", encoding="utf-8") as fh:
+            json.dump({
+                "prompt": (
+                    "<response-language>Use English.</response-language>\n"
+                    "Checkpoint-only initial prompt\n"
+                    f"{common.STATUS_PROMPT_MARKER}\ninternal instructions"
+                )
+            }, fh)
+        recovered_prompt, recovered_at = dashboard.checkpoint_initial_prompt(
+            "checkpoint-session"
+        )
+        assert recovered_prompt == "Checkpoint-only initial prompt"
+        assert recovered_at is not None
+        checkpoint_preview = dashboard.transcript_preview("checkpoint-session")
+        assert checkpoint_preview["task"] == "Checkpoint-only initial prompt"
         legacy_config, legacy_known, legacy_source = dashboard.resolved_session_config(
             "legacy-session", {}
         )
