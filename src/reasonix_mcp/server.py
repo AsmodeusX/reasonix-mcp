@@ -237,6 +237,10 @@ async def _read_agentd(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     except (ConnectionError, asyncio.IncompleteReadError):
         pass
     finally:
+        # Detach the dead transport before waking its callers.  A caller may
+        # immediately retry when its future receives -32001; it must never be
+        # allowed to select this writer again during that reconnect.
+        _discard_agentd_connection(writer, reader=reader)
         # Fail only requests sent through this connection. An old reader can
         # finish after a replacement is already carrying new RPCs.
         for rid, fut in list(_pending.items()):
@@ -251,13 +255,25 @@ async def _read_agentd(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                         "message": "agentd connection closed; agents may still be running",
                     }
                 })
-        # An old reader can finish after a replacement connection is already
-        # installed. Do not let it clear the replacement writer.
-        if _agentd_reader is reader:
-            _agentd_reader = None
-        if _agentd_writer is writer:
-            _agentd_writer = None
-            _agentd_cancel_supported = None
+
+
+def _discard_agentd_connection(
+    writer: asyncio.StreamWriter,
+    *,
+    reader: asyncio.StreamReader | None = None,
+) -> None:
+    """Detach one failed daemon transport without touching its replacement."""
+    global _agentd_reader, _agentd_writer, _agentd_cancel_supported
+    if _agentd_writer is writer:
+        _agentd_reader = None
+        _agentd_writer = None
+        _agentd_cancel_supported = None
+    elif reader is not None and _agentd_reader is reader:
+        _agentd_reader = None
+    try:
+        writer.close()
+    except Exception:
+        pass
 
 
 _DISCONNECT_RETRY_METHODS = {
@@ -267,18 +283,44 @@ _CONSUMING_RETRY_METHODS = {"poll", "watch"}
 _next_request_token = itertools.count(1)
 
 
+def _is_agentd_disconnect(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        isinstance(exc, (ConnectionError, asyncio.IncompleteReadError))
+        or "agentd connection closed" in message
+        or "agentd connection failed" in message
+    )
+
+
 async def _rpc(
     method: str,
     params: dict,
     timeout: float | None = _rpc_default_timeout,
     *,
-    _retry_disconnect: bool = True,
+    _retry_disconnect: int | bool = 2,
 ) -> dict:
     params = dict(params)
     params.setdefault("owner_id", _owner_id)
     if method in _CONSUMING_RETRY_METHODS and "_request_token" not in params:
         params["_request_token"] = f"{os.getpid()}-{next(_next_request_token)}"
-    await _ensure_agentd()
+    try:
+        await _ensure_agentd()
+    except Exception as exc:
+        # A newly opened connection can disappear during its capability ping.
+        # That failure occurs before this request gets a writer, so recover it
+        # here rather than leaking the probe's -32001 to a retry-safe caller.
+        if (
+            _retry_disconnect
+            and method in _DISCONNECT_RETRY_METHODS
+            and _is_agentd_disconnect(exc)
+        ):
+            return await _rpc(
+                method,
+                params,
+                timeout=timeout,
+                _retry_disconnect=int(_retry_disconnect) - 1,
+            )
+        raise
     rid = next(_next_id)
     fut = asyncio.get_running_loop().create_future()
     _pending[rid] = fut
@@ -299,6 +341,14 @@ async def _rpc(
     except Exception as e:
         _pending.pop(rid, None)
         _pending_writers.pop(rid, None)
+        if _retry_disconnect and method in _DISCONNECT_RETRY_METHODS:
+            _discard_agentd_connection(writer)
+            return await _rpc(
+                method,
+                params,
+                timeout=timeout,
+                _retry_disconnect=int(_retry_disconnect) - 1,
+            )
         raise RuntimeError(f"agentd connection failed: {e}") from e
     try:
         msg = await asyncio.wait_for(fut, timeout=timeout)
@@ -319,7 +369,13 @@ async def _rpc(
             and _retry_disconnect
             and method in _DISCONNECT_RETRY_METHODS
         ):
-            return await _rpc(method, params, timeout=timeout, _retry_disconnect=False)
+            _discard_agentd_connection(writer)
+            return await _rpc(
+                method,
+                params,
+                timeout=timeout,
+                _retry_disconnect=int(_retry_disconnect) - 1,
+            )
         raise ValueError(err.get("message", "agentd error"))
     return msg.get("result", {})
 

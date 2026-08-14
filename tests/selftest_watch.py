@@ -63,15 +63,19 @@ class ResetReader:
 
 
 class RetryWriter(RecordingWriter):
-    def __init__(self) -> None:
+    def __init__(self, *, disconnect: bool = False, write_failure: bool = False) -> None:
         super().__init__()
         self.calls = 0
         self.tokens: list[str] = []
+        self.disconnect = disconnect
+        self.write_failure = write_failure
 
     def write(self, data: bytes) -> None:
+        if self.write_failure:
+            raise BrokenPipeError("test transport closed before write")
         super().write(data)
         frame = self.frames[-1]
-        if frame.get("method") != "poll" or "id" not in frame:
+        if frame.get("method") not in ("list", "poll") or "id" not in frame:
             return
         self.calls += 1
         self.tokens.append(str((frame.get("params") or {}).get("_request_token")))
@@ -80,7 +84,7 @@ class RetryWriter(RecordingWriter):
         def respond() -> None:
             future = mcp_server._pending.pop(rid)
             mcp_server._pending_writers.pop(rid, None)
-            if self.calls == 1:
+            if self.disconnect:
                 future.set_result({
                     "error": {"code": -32001, "message": "connection replaced"}
                 })
@@ -183,18 +187,72 @@ async def check_read_retry() -> None:
     original_ensure = mcp_server._ensure_agentd
     original_writer = mcp_server._agentd_writer
     original_supported = mcp_server._agentd_cancel_supported
-    writer = RetryWriter()
+    failed_writer = RetryWriter(disconnect=True)
+    replacement_writer = RetryWriter()
+    writers = iter((failed_writer, replacement_writer))
 
     async def connected() -> None:
-        mcp_server._agentd_writer = writer
+        mcp_server._agentd_writer = next(writers)
 
     mcp_server._ensure_agentd = connected
     mcp_server._agentd_cancel_supported = True
     try:
         result = await mcp_server._rpc("poll", {"session_id": "retry-me"})
         assert result == {"status": "running", "retried": True}, result
-        assert writer.calls == 2, writer.calls
-        assert writer.tokens[0] and writer.tokens[0] == writer.tokens[1], writer.tokens
+        assert failed_writer.closed, "failed read transport was not discarded"
+        assert failed_writer.calls == replacement_writer.calls == 1
+        assert failed_writer.tokens[0], failed_writer.tokens
+        assert failed_writer.tokens == replacement_writer.tokens
+    finally:
+        mcp_server._ensure_agentd = original_ensure
+        mcp_server._agentd_writer = original_writer
+        mcp_server._agentd_cancel_supported = original_supported
+
+
+async def check_write_retry() -> None:
+    original_ensure = mcp_server._ensure_agentd
+    original_writer = mcp_server._agentd_writer
+    original_supported = mcp_server._agentd_cancel_supported
+    failed_writer = RetryWriter(write_failure=True)
+    replacement_writer = RetryWriter()
+    writers = iter((failed_writer, replacement_writer))
+
+    async def connected() -> None:
+        mcp_server._agentd_writer = next(writers)
+
+    mcp_server._ensure_agentd = connected
+    mcp_server._agentd_cancel_supported = True
+    try:
+        result = await mcp_server._rpc("list", {})
+        assert result == {"status": "running", "retried": True}, result
+        assert failed_writer.closed, "failed write transport was not discarded"
+        assert replacement_writer.calls == 1
+    finally:
+        mcp_server._ensure_agentd = original_ensure
+        mcp_server._agentd_writer = original_writer
+        mcp_server._agentd_cancel_supported = original_supported
+
+
+async def check_probe_disconnect_retry() -> None:
+    original_ensure = mcp_server._ensure_agentd
+    original_writer = mcp_server._agentd_writer
+    original_supported = mcp_server._agentd_cancel_supported
+    replacement_writer = RetryWriter()
+    attempts = 0
+
+    async def connected() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ValueError("agentd connection closed; agents may still be running")
+        mcp_server._agentd_writer = replacement_writer
+
+    mcp_server._ensure_agentd = connected
+    mcp_server._agentd_cancel_supported = True
+    try:
+        result = await mcp_server._rpc("list", {})
+        assert result == {"status": "running", "retried": True}, result
+        assert attempts == 2
     finally:
         mcp_server._ensure_agentd = original_ensure
         mcp_server._agentd_writer = original_writer
@@ -712,6 +770,8 @@ async def main() -> None:
     await check_connection_probe_serialization()
     await check_old_reader_isolation()
     await check_read_retry()
+    await check_write_retry()
+    await check_probe_disconnect_retry()
     await check_targeted_watch_wakeups()
     await check_poll_does_not_steal_watch_terminal()
     check_resume_is_idempotent_for_live_agent()
