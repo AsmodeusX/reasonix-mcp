@@ -1664,17 +1664,24 @@ async def reasonix_watch(
 async def reasonix_list(
     include_task: bool = False,
     pending_only: bool = False,
+    detail: bool = False,
     ctx: Context | None = None,
 ) -> dict:
-    """List sessions with a compact task preview by default.
+    """List sessions as a compact fleet inventory by default.
 
     Set include_task=true only when the full original orchestration prompt is
     needed; it can be thousands of words. Set pending_only=true to recover
     only running, decision-blocked, or not-yet-collected terminal sessions.
+    Set detail=true only to inspect plans, current work, configuration, health,
+    and transcript paths for every session; prefer reasonix_poll for one agent.
     """
     _capture_relay_ctx(ctx)
     result = await _rpc(
-        "list", {"include_task": include_task, "pending_only": pending_only}
+        "list", {
+            "include_task": include_task,
+            "pending_only": pending_only,
+            "detail": detail,
+        }
     )
     for session in result.get("sessions", []):
         if session.get("session_id") not in _owned_sessions:
@@ -1688,6 +1695,37 @@ async def reasonix_list(
         session for session in result.get("sessions", [])
         if session.get("session_id") in _owned_sessions
     ]
+    if not detail:
+        # Keep the MCP response compact even when connected to an older daemon
+        # that predates server-side list shaping. Plans and current_work can
+        # dominate a large fleet response and belong in poll, not inventory.
+        allowed = {
+            "session_id", "status", "cwd", "task", "stop_reason",
+            "permission_request", "process_alive", "resumable",
+            "recovered_from_disk", "pending_config", "pending_config_error",
+        }
+        compact_sessions = []
+        for session in result["sessions"]:
+            compact = {key: value for key, value in session.items() if key in allowed}
+            if session.get("status") in ("blocked", "stalled") and session.get("health"):
+                compact["health"] = session["health"]
+            if session.get("error_text"):
+                compact["error_text"] = common.task_preview(session["error_text"], 240)
+            compact_sessions.append(compact)
+        result["sessions"] = compact_sessions
+        counts: dict[str, int] = {}
+        for session in compact_sessions:
+            status = str(session.get("status") or "unknown")
+            counts[status] = counts.get(status, 0) + 1
+        result.update({
+            "count": len(compact_sessions),
+            "counts": counts,
+            "detail_available": True,
+            "detail_note": (
+                "Set detail=true only for fleet-wide diagnostics; use poll for "
+                "one agent's plan/current work."
+            ),
+        })
     return result
 
 
@@ -2126,7 +2164,9 @@ async def reasonix_restart_agentd(force: bool = False, ctx: Context | None = Non
     checkpointed: list[str] = []
     recoverable_before = set(_recoverable_owned_sessions())
     try:
-        listing = await _rpc("list", {"include_task": True}, timeout=5.0)
+        listing = await _rpc(
+            "list", {"include_task": True, "detail": True}, timeout=5.0
+        )
         for item in listing.get("sessions", []):
             status = item.get("status")
             if status not in ("running", "blocked", "stalled") and not (

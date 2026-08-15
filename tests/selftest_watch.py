@@ -407,6 +407,45 @@ async def check_runtime_stall_is_actionable() -> None:
     ), stalled
 
 
+async def check_mcp_list_compacts_old_daemon_results() -> None:
+    original_rpc = mcp_server._rpc
+    original_owned = mcp_server._owned_sessions
+    original_checkpoint = mcp_server._checkpoint_agent_state
+    session_id = "legacy-list-session"
+    large_session = {
+        "session_id": session_id,
+        "status": "running",
+        "cwd": "/tmp/project",
+        "task": "short task",
+        "permission_request": False,
+        "process_alive": True,
+        "resumable": False,
+        "plan": [{"status": "pending", "content": "P" * 5000} for _ in range(12)],
+        "current_work": {"plan_step": {"content": "P" * 5000}},
+        "config": {"model": "provider/model"},
+        "transcript_path": "/tmp/large.jsonl",
+    }
+
+    async def legacy_list(_method: str, _params: dict, **_kwargs) -> dict:
+        return {"sessions": [dict(large_session)]}
+
+    mcp_server._rpc = legacy_list
+    mcp_server._owned_sessions = {session_id}
+    mcp_server._checkpoint_agent_state = lambda *_args, **_kwargs: None
+    try:
+        compact = await mcp_server.reasonix_list()
+        assert compact["count"] == 1 and compact["counts"] == {"running": 1}
+        assert len(json.dumps(compact)) < 2000, len(json.dumps(compact))
+        assert not ({"plan", "current_work", "config", "transcript_path"}
+                    & compact["sessions"][0].keys())
+        detailed = await mcp_server.reasonix_list(detail=True)
+        assert detailed["sessions"][0]["plan"] == large_session["plan"]
+    finally:
+        mcp_server._rpc = original_rpc
+        mcp_server._owned_sessions = original_owned
+        mcp_server._checkpoint_agent_state = original_checkpoint
+
+
 async def check_targeted_watch_wakeups() -> None:
     daemon = Agentd()
     first_agent = watch_agent("targeted-first")
@@ -819,6 +858,14 @@ def check_list_permission_detail_does_not_hide_fleet() -> None:
     agent.task = "Needs a decision"
     agent.cwd = ROOT
     agent.transcript_path = "/tmp/permission-list.jsonl"
+    agent.plan_entries = [
+        {"status": "pending", "content": "P" * 4000} for _ in range(12)
+    ]
+    agent.current_work = {
+        "summary": "working",
+        "plan_step": {"content": "P" * 4000, "status": "in_progress"},
+    }
+    agent.config_values = {"model": "provider/model", "effort": "high"}
     agent._pending_permission = (23, {
         "toolCall": {"kind": "execute", "title": "Run command"},
         "options": [{"optionId": "allow_once", "name": "Allow once"}],
@@ -835,10 +882,26 @@ def check_list_permission_detail_does_not_hide_fleet() -> None:
         "tool_call": {"kind": "execute", "title": "Run command"},
         "options": [{"optionId": "allow_once", "name": "Allow once"}],
     }, permission
+    compact_session = result["sessions"][0]
+    assert result["count"] == 1 and result["counts"] == {"running": 1}, result
+    assert not ({"plan", "current_work", "config", "transcript_path"} & compact_session.keys())
+    assert len(json.dumps(result)) < 2000, len(json.dumps(result))
+
+    detailed = daemon.list({
+        "owner_id": agent.owner_id,
+        "detail": True,
+    })
+    detailed_session = detailed["sessions"][0]
+    assert detailed_session["plan"] == agent.plan_entries
+    assert detailed_session["current_work"] == agent.current_work
+    assert detailed_session["config"] == agent.config_values
+    assert detailed_session["transcript_path"] == agent.transcript_path
+    assert len(json.dumps(detailed)) > 40_000
 
 
 async def main() -> None:
     await check_runtime_stall_is_actionable()
+    await check_mcp_list_compacts_old_daemon_results()
     await check_connection_probe_serialization()
     await check_old_reader_isolation()
     await check_read_retry()

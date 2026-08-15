@@ -112,18 +112,20 @@ def test_durable_discovery() -> None:
                 "cwd": "/tmp/project",
                 "task": "original task",
                 "stop_reason": "agentd_lost_process",
-                "transcript_path": os.path.join(session_dir, f"{sid}.jsonl"),
                 "permission_request": False,
-                "plan": [],
-                "current_work": None,
-                "config": {"model": "test/model"},
-                "pending_config": {},
-                "pending_config_error": None,
                 "process_alive": False,
                 "resumable": True,
                 "recovered_from_disk": True,
                 "error_text": "agent process is not owned by the current daemon; resume it from the persisted transcript",
             }]
+            assert listed["counts"] == {"orphaned": 1}
+            detailed = agentd.Agentd().list({
+                "owner_id": owner, "pending_only": True, "detail": True,
+            })["sessions"][0]
+            assert detailed["transcript_path"] == os.path.join(
+                session_dir, f"{sid}.jsonl"
+            )
+            assert detailed["config"] == {"model": "test/model"}
         finally:
             if old_home is None:
                 os.environ.pop("REASONIX_HOME", None)

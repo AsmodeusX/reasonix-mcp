@@ -1269,6 +1269,7 @@ class Agentd:
     def list(self, params: dict | None = None) -> dict:
         params = params or {}
         include_task = bool(params.get("include_task", False))
+        detail = bool(params.get("detail", False))
         include_permission_detail = bool(params.get("include_permission_detail", False))
         pending_only = bool(params.get("pending_only", False))
         owner_id = str(params.get("owner_id") or "")
@@ -1302,7 +1303,7 @@ class Agentd:
                 }
             else:
                 permission_request = pending_permission is not None
-            session = {
+            session: dict = {
                 "session_id": sid,
                 "status": status,
                 "cwd": getattr(a, "cwd", None),
@@ -1310,24 +1311,35 @@ class Agentd:
                     getattr(a, "task", None)
                     if include_task else common.task_preview(getattr(a, "task", None))
                 ),
-                "stop_reason": a.stop_reason,
-                "transcript_path": getattr(a, "transcript_path", None),
                 "permission_request": permission_request,
-                "plan": list(getattr(a, "plan_entries", []) or []),
-                "current_work": (
-                    dict(getattr(a, "current_work", None))
-                    if getattr(a, "current_work", None) else None
-                ),
-                "config": dict(getattr(a, "config_values", {}) or {}),
-                "pending_config": dict(getattr(a, "pending_config", {}) or {}),
-                "pending_config_error": getattr(a, "pending_config_error", None),
-                "health": dict(getattr(a, "runtime_health", {}) or {}),
                 "process_alive": status not in ("exited", "orphaned"),
                 "resumable": status in ("idle", "exited", "orphaned") and os.path.isfile(persisted),
             }
+            if a.stop_reason:
+                session["stop_reason"] = a.stop_reason
+            if status in ("blocked", "stalled"):
+                session["health"] = dict(getattr(a, "runtime_health", {}) or {})
+            pending_config = dict(getattr(a, "pending_config", {}) or {})
+            pending_config_error = getattr(a, "pending_config_error", None)
+            if pending_config:
+                session["pending_config"] = pending_config
+            if pending_config_error:
+                session["pending_config_error"] = pending_config_error
+            if detail:
+                session.update({
+                    "transcript_path": getattr(a, "transcript_path", None),
+                    "plan": list(getattr(a, "plan_entries", []) or []),
+                    "current_work": (
+                        dict(getattr(a, "current_work", None))
+                        if getattr(a, "current_work", None) else None
+                    ),
+                    "config": dict(getattr(a, "config_values", {}) or {}),
+                    "health": dict(getattr(a, "runtime_health", {}) or {}),
+                })
             if getattr(a, "last_error", None) is not None:
-                session["error"] = a.last_error
-                session["error_text"] = a.last_error_text
+                if detail:
+                    session["error"] = a.last_error
+                session["error_text"] = common.task_preview(a.last_error_text, 240)
             sessions.append(session)
         live_ids = {sid for sid, _ in items}
         for sid in sorted(common.load_owner_sessions(owner_id) - live_ids):
@@ -1341,19 +1353,13 @@ class Agentd:
                 continue
             metadata = common.read_acp_session_metadata(sid)
             task = lifecycle.get("task") or metadata.get("title") or f"Session {sid[:8]}"
-            sessions.append({
+            session = {
                 "session_id": sid,
                 "status": "orphaned",
                 "cwd": lifecycle.get("cwd") or metadata.get("cwd"),
                 "task": task if include_task else common.task_preview(task),
                 "stop_reason": "agentd_lost_process",
-                "transcript_path": persisted,
                 "permission_request": False,
-                "plan": [],
-                "current_work": None,
-                "config": common.read_session_config(sid) or common.read_acp_session_config(sid),
-                "pending_config": {},
-                "pending_config_error": None,
                 "process_alive": False,
                 "resumable": True,
                 "recovered_from_disk": True,
@@ -1361,8 +1367,37 @@ class Agentd:
                     "agent process is not owned by the current daemon; "
                     "resume it from the persisted transcript"
                 ),
-            })
-        return {"sessions": sessions}
+            }
+            if detail:
+                session.update({
+                    "transcript_path": persisted,
+                    "plan": [],
+                    "current_work": None,
+                    "config": (
+                        common.read_session_config(sid)
+                        or common.read_acp_session_config(sid)
+                    ),
+                    "pending_config": {},
+                    "pending_config_error": None,
+                    "health": {},
+                })
+            sessions.append(session)
+        counts: dict[str, int] = {}
+        for session in sessions:
+            value = str(session.get("status") or "unknown")
+            counts[value] = counts.get(value, 0) + 1
+        result = {
+            "count": len(sessions),
+            "counts": counts,
+            "sessions": sessions,
+        }
+        if not detail:
+            result["detail_available"] = True
+            result["detail_note"] = (
+                "Set detail=true only for fleet-wide diagnostics; use poll for "
+                "one agent's plan/current work."
+            )
+        return result
 
     def models(self, params: dict | None = None) -> dict:
         return common.available_models()

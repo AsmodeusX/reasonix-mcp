@@ -995,6 +995,7 @@ async def api_session(request: Request) -> Response:
             # Detail view needs the complete prompt before an ACP transcript
             # exists. Fleet snapshots intentionally keep using previews.
             "include_task": True,
+            "detail": True,
             "include_permission_detail": False,
         })
         live = next(
