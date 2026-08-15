@@ -12,7 +12,7 @@ the fleet running; reasonix_resume revives sessions whose process died.
 
 Tools:
   reasonix_spawn / reasonix_spawn_fleet / reasonix_resume / reasonix_resume_fleet /
-  reasonix_send / reasonix_poll
+  reasonix_send / reasonix_broadcast / reasonix_poll
   reasonix_watch / reasonix_wait / reasonix_list / reasonix_models / reasonix_transcript
   reasonix_respond_permission / reasonix_stop / reasonix_restart_agentd /
   reasonix_restart_mcp_server / reasonix_configure / reasonix_dashboard
@@ -66,7 +66,8 @@ commands Reasonix classifies as
 permission-requiring; it does not pause every shell command. Explicit agent
 questions always require a response. Use reasonix_send with
 expect=steer to redirect an active turn, expect=new_turn to start work only
-when idle. reasonix_transcript summarizes what an agent actually did (tool
+when idle. Use reasonix_broadcast for one shared instruction to selected agent
+ids; delivery is independent per agent and partial failures are reported. reasonix_transcript summarizes what an agent actually did (tool
 calls, files touched) for rebasing decisions. reasonix_watch is the primary
 model-visible wake-up mechanism. Custom reasonix/agent_event notifications are
 diagnostic decoration;
@@ -1359,6 +1360,97 @@ async def reasonix_send(
         else:
             result["timeline_recorded"] = True
     return result
+
+
+@mcp.tool()
+async def reasonix_broadcast(
+    session_ids: list[str],
+    message: str,
+    expect: str = "any",
+    parallelism: int = 8,
+    ctx: Context | None = None,
+) -> dict:
+    """Send one message to selected agents in a single call.
+
+    Each delivery follows reasonix_send semantics independently: expect=any
+    steers active turns and starts a new turn for idle agents; expect=steer
+    targets active turns only; expect=new_turn targets idle agents only. The
+    operation is not atomic, so one failure does not roll back successful
+    deliveries. Results are returned per session without agent output.
+    """
+    _capture_relay_ctx(ctx)
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("message must not be empty")
+    if expect not in ("any", "steer", "new_turn"):
+        raise ValueError("expect must be one of: any, steer, new_turn")
+    unique_ids = list(dict.fromkeys(str(session_id).strip() for session_id in session_ids))
+    if not unique_ids or any(not session_id for session_id in unique_ids):
+        raise ValueError("session_ids must contain at least one non-empty id")
+    if len(unique_ids) > common.MAX_WATCH_SESSIONS:
+        raise ValueError(
+            f"too many sessions (max {common.MAX_WATCH_SESSIONS})"
+        )
+    try:
+        parallelism = int(parallelism)
+    except (TypeError, ValueError):
+        raise ValueError("parallelism must be an integer") from None
+    if not 1 <= parallelism <= 16:
+        raise ValueError("parallelism must be between 1 and 16")
+    # Validate the complete selection before the first side effect.
+    for session_id in unique_ids:
+        _require_owned(session_id)
+
+    semaphore = asyncio.Semaphore(min(parallelism, len(unique_ids)))
+
+    async def deliver(session_id: str) -> tuple[str, dict]:
+        async with semaphore:
+            try:
+                result = await reasonix_send(
+                    session_id, message, expect=expect
+                )
+            except Exception as exc:
+                error, truncated = common.bounded_orchestrator_message(
+                    str(exc), "broadcast error"
+                )
+                failure = {
+                    "session_id": session_id,
+                    "status": "failed",
+                    "error": error,
+                }
+                if truncated:
+                    failure["error_truncated"] = True
+                return session_id, failure
+            return session_id, {
+                "session_id": session_id,
+                "status": "delivered",
+                "delivered": result.get("delivered"),
+            }
+
+    pairs = await asyncio.gather(*(deliver(session_id) for session_id in unique_ids))
+    results = {session_id: result for session_id, result in pairs}
+    delivered = [
+        session_id for session_id, result in pairs
+        if result.get("status") == "delivered"
+    ]
+    failed = [
+        session_id for session_id, result in pairs
+        if result.get("status") == "failed"
+    ]
+    modes: dict[str, int] = {}
+    for session_id in delivered:
+        mode = str(results[session_id].get("delivered") or "unknown")
+        modes[mode] = modes.get(mode, 0) + 1
+    return {
+        "requested": len(unique_ids),
+        "delivered": delivered,
+        "failed": failed,
+        "delivery_modes": modes,
+        "results": results,
+        "note": (
+            "broadcast delivery is per agent and non-atomic; failed ids can be "
+            "retried without resending to successful ids"
+        ),
+    }
 
 
 @mcp.tool()
