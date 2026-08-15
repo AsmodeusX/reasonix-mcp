@@ -1445,7 +1445,7 @@ async def reasonix_send(
     """
     _capture_relay_ctx(ctx)
     _require_owned(session_id)
-    transcript_offset = common.session_transcript_size(session_id)
+    transcript_offset = common.session_transcript_anchor(session_id)
     result = await _rpc(
         "send", {"session_id": session_id, "message": message, "expect": expect}
     )
@@ -2009,6 +2009,31 @@ def _is_dashboard_process(pid: int) -> bool:
     return os.path.abspath(DASHBOARD_SCRIPT) in command
 
 
+def _dashboard_process_pids() -> list[int]:
+    """Every live dashboard process, including ones no state file names.
+
+    A crashed or superseded starter can delete the state file while the
+    process it described keeps the fixed port, leaving an orphan that pid 0
+    can never reclaim.
+    """
+    pids = []
+    with contextlib.suppress(OSError):
+        for entry in os.listdir("/proc"):
+            if entry.isdigit() and _is_dashboard_process(int(entry)):
+                pids.append(int(entry))
+    return pids
+
+
+def _dashboard_port_free() -> bool:
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", DASHBOARD_PORT))
+        except OSError:
+            return False
+    return True
+
+
 async def _reasonix_dashboard_locked(open_browser: bool) -> dict:
     expected_signature = _dashboard_source_signature()
     state = _read_dashboard_state()
@@ -2030,7 +2055,11 @@ async def _reasonix_dashboard_locked(open_browser: bool) -> dict:
         }
 
     old_pid = int(state.get("pid") or 0)
-    verified_old_process = _is_dashboard_process(old_pid)
+    stale_pids = [
+        pid
+        for pid in sorted({old_pid, *_dashboard_process_pids()} - {0})
+        if _is_dashboard_process(pid)
+    ]
     # The state file is mode 0600 and is the durable dashboard credential.
     # Preserve it across process/IDE restarts unless the environment explicitly
     # supplies a replacement.
@@ -2040,16 +2069,21 @@ async def _reasonix_dashboard_locked(open_browser: bool) -> dict:
         or preserved_password
         or DASHBOARD_PASSWORD
     )
-    if verified_old_process:
+    for pid in stale_pids:
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(old_pid, 15)
-        for _ in range(30):
-            if not _is_dashboard_process(old_pid):
-                break
-            await asyncio.sleep(0.1)
-        if _is_dashboard_process(old_pid):
+            os.kill(pid, 15)
+    for _ in range(30):
+        if not any(_is_dashboard_process(pid) for pid in stale_pids):
+            break
+        await asyncio.sleep(0.1)
+    for pid in stale_pids:
+        if _is_dashboard_process(pid):
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(old_pid, 9)
+                os.kill(pid, 9)
+    for _ in range(30):
+        if _dashboard_port_free():
+            break
+        await asyncio.sleep(0.1)
     with contextlib.suppress(OSError):
         if _read_dashboard_state().get("pid") == state.get("pid"):
             os.unlink(DASHBOARD_STATE)

@@ -176,6 +176,36 @@ def main() -> None:
             "First run", "Second run",
         ]
         assert ordered["runs"][-1]["active"] is True
+
+        # A steer sent before Reasonix flushed the turn has no byte anchor
+        # (older timelines recorded 0 for the same case). Neither may be
+        # hoisted into a run of its own above the task that was steered.
+        common.write_session_owner("unflushed-session", "owner-one")
+        legacy = common.record_orchestrator_message(
+            "unflushed-session", "owner-one", "Legacy steer", "steered",
+            transcript_offset=0,
+        )
+        unanchored = common.record_orchestrator_message(
+            "unflushed-session", "owner-one", "Prefer the smaller fix", "steered"
+        )
+        assert legacy["transcript_offset"] == 0
+        assert unanchored["transcript_offset"] is None
+        unflushed_path = os.path.join(reasonix_home, "sessions", "unflushed-session.jsonl")
+        with open(unflushed_path, "w", encoding="utf-8") as fh:
+            for row in [
+                {"role": "user", "createdAt": 3000, "content": "Only run"},
+                {"role": "assistant", "content": "Only answer"},
+            ]:
+                fh.write(json.dumps(row) + "\n")
+        _, unflushed = dashboard.transcript_messages("unflushed-session")
+        assert len(unflushed["runs"]) == 1, unflushed["runs"]
+        assert [entry["kind"] for entry in unflushed["runs"][0]["entries"]] == [
+            "message", "message", "orchestrator_message", "orchestrator_message",
+        ], unflushed["runs"][0]["entries"]
+        assert [
+            entry["text"] for entry in unflushed["runs"][0]["entries"][-2:]
+        ] == ["Legacy steer", "Prefer the smaller fix"]
+
         original_rpc = mcp_server._rpc
         original_owner = mcp_server._owner_id
         original_owned = mcp_server._owned_sessions

@@ -57,6 +57,7 @@ DEFAULT_PASSWORD = os.environ.get("REASONIX_MCP_DASHBOARD_PASSWORD", "CHANGEME")
 
 
 def dashboard_signature() -> str:
+    """Hash the dashboard sources as they exist on disk right now."""
     digest = hashlib.sha256()
     for path in [
         __file__,
@@ -74,6 +75,12 @@ def dashboard_signature() -> str:
         except OSError:
             digest.update(b"missing")
     return digest.hexdigest()
+
+
+# Snapshot at import so a running dashboard reports the code it actually
+# loaded. Recomputing per request makes every stale process claim the current
+# signature, and the orchestrator's staleness check can then never fire.
+LOADED_SIGNATURE = dashboard_signature()
 
 
 class DashboardError(Exception):
@@ -347,6 +354,25 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
             "event_id": str(event.get("event_id") or ""),
         })
 
+    pending_external: list[dict] = []
+
+    def event_anchor(event: dict) -> int | None:
+        """Byte anchor of an external event, or None when it has none.
+
+        Offset 0 is treated as absent: no steer can precede the task that
+        started the session, and older timelines recorded 0 whenever the
+        transcript had not been flushed yet.
+        """
+        try:
+            return int(event.get("transcript_offset") or 0) or None
+        except (TypeError, ValueError):
+            return None
+
+    def flush_pending() -> None:
+        for event in pending_external:
+            append_external(event)
+        pending_external.clear()
+
     try:
         event_index = 0
         byte_offset = 0
@@ -356,12 +382,19 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
             transcript_fh = contextlib.nullcontext([])
         with transcript_fh as fh:
             for raw_line in fh:
-                while (
-                    event_index < len(external_events)
-                    and int(external_events[event_index].get("transcript_offset") or 0)
-                    <= byte_offset
-                ):
-                    append_external(external_events[event_index])
+                while event_index < len(external_events):
+                    event = external_events[event_index]
+                    anchor = event_anchor(event)
+                    if anchor is not None and anchor > byte_offset:
+                        break
+                    if anchor is None:
+                        # Hold it: an unanchored message belongs after the
+                        # content of the run it was sent into, which has not
+                        # been read yet.
+                        pending_external.append(event)
+                    else:
+                        flush_pending()
+                        append_external(event)
                     event_index += 1
                 byte_offset += len(raw_line)
                 try:
@@ -373,6 +406,8 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
                     text = _clean_user_text(row["content"])
                     if not text:
                         continue
+                    if current_run is not None:
+                        flush_pending()
                     current_run = {
                         "started_at": row.get("createdAt"),
                         "entries": [],
@@ -429,8 +464,14 @@ def transcript_messages(session_id: str) -> tuple[list[dict], dict]:
                         "tool_call_id": str(row.get("tool_call_id") or ""),
                     })
         while event_index < len(external_events):
-            append_external(external_events[event_index])
+            event = external_events[event_index]
+            if event_anchor(event) is None:
+                pending_external.append(event)
+            else:
+                flush_pending()
+                append_external(event)
             event_index += 1
+        flush_pending()
     except OSError as exc:
         raise DashboardError(f"cannot read transcript: {exc}", 500) from exc
 
@@ -755,7 +796,7 @@ async def api_health(request: Request) -> Response:
     return JSONResponse({
         "ok": True,
         "pid": os.getpid(),
-        "source_signature": dashboard_signature(),
+        "source_signature": LOADED_SIGNATURE,
         "agentd_socket": common.agentd_sock_path(),
     })
 
@@ -1093,7 +1134,7 @@ async def api_action(request: Request) -> Response:
         message = str(data.get("message") or "").strip()
         if not message:
             raise DashboardError("message is required")
-        transcript_offset = common.session_transcript_size(session_id)
+        transcript_offset = common.session_transcript_anchor(session_id)
         result = await agentd_rpc(owner, "send", {
             "session_id": session_id,
             "message": message,
@@ -1256,23 +1297,33 @@ def main() -> None:
     password = args.password
     if not password:
         parser.error("dashboard password cannot be empty")
-    if args.port == 0:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        probe.bind(("127.0.0.1", 0))
-        args.port = probe.getsockname()[1]
-        probe.close()
     host = "127.0.0.1" if args.host == "localhost" else args.host
+    # Claim the port before publishing state: a starter that loses the race
+    # must not overwrite the live dashboard's credentials and then delete them
+    # again on its way out.
+    try:
+        sock = socket.create_server(
+            (host, args.port),
+            family=socket.AF_INET6 if ":" in host else socket.AF_INET,
+            backlog=2048,
+        )
+    except OSError as exc:
+        print(f"Reasonix dashboard cannot bind {host}:{args.port}: {exc}", flush=True)
+        raise SystemExit(1) from exc
+    args.port = sock.getsockname()[1]
     url = f"http://{host}:{args.port}/"
     write_state(args.state_file, {
         "pid": os.getpid(), "host": host, "port": args.port,
         "password": password, "url": url, "started_at": time.time(),
-        "source_signature": dashboard_signature(),
+        "source_signature": LOADED_SIGNATURE,
     })
     print(f"Reasonix dashboard: {url}", flush=True)
     if args.open_browser:
         webbrowser.open(url)
     try:
-        uvicorn.run(create_app(password), host=host, port=args.port, log_level="warning")
+        uvicorn.Server(
+            uvicorn.Config(create_app(password), log_level="warning")
+        ).run(sockets=[sock])
     finally:
         with contextlib.suppress(OSError, ValueError, TypeError):
             with open(args.state_file, encoding="utf-8") as fh:

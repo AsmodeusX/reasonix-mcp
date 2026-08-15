@@ -230,12 +230,23 @@ def session_timeline_path(session_id: str) -> str:
     )
 
 
-def session_transcript_size(session_id: str) -> int:
+#: record_orchestrator_message default: derive the anchor at record time.
+AUTO_OFFSET = -1
+
+
+def session_transcript_anchor(session_id: str) -> int | None:
+    """Byte anchor for an orchestrator message, or None when unanchorable.
+
+    Reasonix writes ``<sid>.jsonl`` when a turn ends, so a message steered into
+    the very first turn sees no file at all. Byte 0 would hoist it above the
+    task that spawned it; None means "after whatever content exists by the time
+    the timeline is rendered".
+    """
     path = os.path.join(reasonix_home(), "sessions", f"{session_id}.jsonl")
     try:
-        return os.path.getsize(path)
+        return os.path.getsize(path) or None
     except OSError:
-        return 0
+        return None
 
 
 def record_orchestrator_message(
@@ -243,16 +254,17 @@ def record_orchestrator_message(
     owner_id: str,
     message: str,
     delivered: str,
-    transcript_offset: int | None = None,
+    transcript_offset: int | None = AUTO_OFFSET,
 ) -> dict:
     """Persist an accepted orchestrator message for dashboard chronology.
 
     Mid-turn ACP steering is not consistently written to Reasonix's own JSONL.
     Record the transcript byte boundary so the dashboard can merge the message
-    before agent activity that was persisted after the steer.
+    before agent activity that was persisted after the steer. A None offset is
+    kept as-is and means no boundary existed yet; see session_transcript_anchor.
     """
-    if transcript_offset is None:
-        transcript_offset = session_transcript_size(session_id)
+    if transcript_offset == AUTO_OFFSET:
+        transcript_offset = session_transcript_anchor(session_id)
     created_at = int(time.time() * 1000)
     event = {
         "event_id": hashlib.sha256(
@@ -294,11 +306,13 @@ def read_orchestrator_timeline(session_id: str, owner_id: str) -> list[dict]:
                     events.append(event)
     except OSError:
         pass
+    # Chronological, not by offset: unanchored messages carry no offset, and
+    # the transcript only ever grows, so both orders agree where both exist.
     return sorted(
         events,
         key=lambda event: (
-            int(event.get("transcript_offset") or 0),
             int(event.get("created_at") or 0),
+            int(event.get("transcript_offset") or 0),
         ),
     )
 
