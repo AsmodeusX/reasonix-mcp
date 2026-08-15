@@ -106,7 +106,7 @@ client and verify the server is listed.
 | `reasonix_list(include_task?, pending_only?)` | Sessions with id, status, cwd, compact task preview, plan/current work, and transcript path. `pending_only=true` returns only running, decision-blocked, or uncollected terminal sessions. |
 | `reasonix_respond_permission(session_id, option_id)` | Answer a tool-approval request (`option_id` from watch/poll's `permission_request.options`, or `"cancel"`). |
 | `reasonix_stop(session_id)` | Cancel + close + kill the agent (tombstone: poll keeps reporting `exited`). |
-| `reasonix_restart_agentd(force?)` | Explicitly reload the detached daemon. Source changes already queue a safe automatic reload; `force=true` may terminate live agents. |
+| `reasonix_restart_agentd(force?)` | Verified daemon replacement. Source changes queue a safe automatic reload; `force=true` checkpoints active IDs, then escalates cooperative shutdown through TERM/KILL if needed and returns only after a distinct current-code daemon answers ping. |
 | `reasonix_restart_mcp_server()` | Explicitly restart this orchestrator's MCP server through `launcher.py`; source changes are watched automatically. |
 | `reasonix_dashboard(open_browser?)` | Open or reuse the authenticated local fleet UI for current and previous agents across orchestrators. Supports live steering, stop/resume, configuration, and permission responses. |
 | `reasonix_routine_create(name, prompt, …)` | Create a durable manual, interval, or daily loop agent. Each iteration starts in fresh context and may delegate through native Reasonix subagents. |
@@ -307,6 +307,12 @@ rediscovered as `status: "orphaned"` with `process_alive: false`. Their cwd,
 task, ownership, and configuration remain on disk. Pass the returned ids to
 `reasonix_resume_fleet`; each session is reopened from its persisted transcript
 and failures are isolated per session.
+
+`reasonix_restart_agentd` returns `recoverable_sessions` separately from
+`checkpointed_sessions`. The former is the durable active/interrupted set to
+resume; completed idle history is deliberately excluded. `restarted: true`
+also guarantees the old socket peer is gone and a distinct daemon has answered
+`ping` with the expected code signature.
 
 Python hot reloads safely complete an in-flight watch/wait with
 `server_restarted=true` before replacing the MCP front-end. Agents remain in
@@ -656,6 +662,7 @@ with `reasonix_resume` / `reasonix_resume_fleet`.
 .venv/bin/python tests/selftest_elicitation.py    # ACP decision → MCP elicitation bridge (no model calls)
 .venv/bin/python tests/selftest_watch.py          # watch overlap/cancellation safety (no model calls)
 .venv/bin/python tests/selftest_recovery.py       # dead-child + durable fleet recovery (no model calls)
+.venv/bin/python tests/selftest_agentd_restart_escalation.py # lying shutdown → TERM → verified replacement
 .venv/bin/python tests/selftest_mcp_restart.py   # manual + source-change hot reload (no model calls)
 .venv/bin/python tests/selftest_auto_reload.py   # agentd source watcher + self-replace (no model calls)
 .venv/bin/python tests/selftest_prompt_injection.py # one status contract per session (no model calls)

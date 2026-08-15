@@ -125,6 +125,17 @@ def main() -> None:
         time.sleep(2.0)
         assert client.proc.poll() is None
         assert client.tool("reasonix_list", {})["sessions"] == []
+
+        # An agentd restart is not successful until the old peer is gone and
+        # a distinct current-code daemon answers ping. The other MCP client
+        # must reconnect transparently afterward.
+        restarted = client.tool("reasonix_restart_agentd", {})
+        assert restarted["restarted"] is True and restarted["verified"] is True
+        assert restarted["old_pid"] != restarted["new_pid"]
+        assert restarted["escalation"] in ("cooperative", "term", "kill")
+        assert restarted["recoverable_sessions"] == []
+        assert client.tool("reasonix_list", {})["sessions"] == []
+        assert other.tool("reasonix_list", {})["sessions"] == []
         print("MCP RESTART SELFTEST PASS")
     finally:
         client.close()

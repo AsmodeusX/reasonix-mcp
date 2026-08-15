@@ -84,6 +84,7 @@ class Agentd:
         self._delivery_cache: OrderedDict[tuple[str, str, str], dict] = OrderedDict()
         self._code_signature = common.agentd_code_signature()
         self._auto_restart_requested = False
+        self._shutting_down = False
 
     # ------------------------------------------------------------- registry
 
@@ -134,14 +135,15 @@ class Agentd:
                             error_text=str(payload.get("error_text") or ""),
                         )
                         self._loop.call_soon_threadsafe(self._cancel_idle_cleanup, agent.session_id)
-                    print(
-                        f"reasonix agent_event emit: event={event.get('event')} "
-                        f"session={agent.session_id} owner={getattr(agent, 'owner_id', '')}",
-                        file=sys.stderr, flush=True,
-                    )
-                    asyncio.run_coroutine_threadsafe(
-                        self._broadcast(event, getattr(agent, "owner_id", "")), self._loop
-                    )
+                    if not self._shutting_down:
+                        print(
+                            f"reasonix agent_event emit: event={event.get('event')} "
+                            f"session={agent.session_id} owner={getattr(agent, 'owner_id', '')}",
+                            file=sys.stderr, flush=True,
+                        )
+                        asyncio.run_coroutine_threadsafe(
+                            self._broadcast(event, getattr(agent, "owner_id", "")), self._loop
+                        )
                 except Exception:
                     pass
             agent.on_event = _broadcast
@@ -1228,7 +1230,7 @@ class Agentd:
             lifecycle = common.read_session_lifecycle(sid)
             if lifecycle.get("owner_id") != owner_id:
                 continue
-            if lifecycle.get("state") not in ("running", "idle", "interrupted", "orphaned"):
+            if lifecycle.get("state") not in ("running", "interrupted", "orphaned"):
                 continue
             persisted = os.path.join(common.reasonix_home(), "sessions", f"{sid}.jsonl")
             if not os.path.isfile(persisted):
@@ -1444,6 +1446,7 @@ class Agentd:
         return self._shutdown_agents()
 
     def _shutdown_agents(self) -> dict:
+        self._shutting_down = True
         for session_id in list(self._idle_cleanup_tasks):
             self._cancel_idle_cleanup(session_id)
         for task in self._pending_config_tasks.values():

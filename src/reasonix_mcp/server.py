@@ -30,6 +30,9 @@ import hashlib
 import itertools
 import json
 import os
+import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -102,8 +105,12 @@ Lifecycle controls:
   does not interrupt other orchestrators.
 - reasonix_restart_agentd(force=false) reloads the shared agent daemon after
   its live agents are stopped; force=true terminates live agents and affects
-  every orchestrator connected to that daemon. Use it after agentd or
-  acp_bridge changes. Use reasonix_restart_mcp_server after server.py changes.
+  every orchestrator connected to that daemon. A forced restart verifies the
+  old socket peer exited, escalates TERM/KILL if cooperative shutdown wedges,
+  and returns only after a distinct current-code daemon answers ping. Resume
+  only the returned recoverable_sessions; completed idle history is excluded.
+  Use it after agentd or acp_bridge changes. Use
+  reasonix_restart_mcp_server after server.py changes.
 - reasonix_dashboard() opens a loopback-only authenticated fleet UI. It sees
   current and previous sessions across local orchestrators without consuming
   their watch queues; actions are owner-scoped by persisted session metadata.
@@ -300,6 +307,86 @@ def _discard_agentd_connection(
         writer.close()
     except Exception:
         pass
+
+
+def _process_start_ticks(pid: int) -> str | None:
+    """Linux process birth marker used to prevent PID-reuse signalling."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            stat = fh.read()
+        # Fields after the final ')' begin at process-state (field 3).
+        return stat[stat.rfind(")") + 2:].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def _process_state(pid: int) -> str | None:
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            stat = fh.read()
+        return stat[stat.rfind(")") + 2:].split()[0]
+    except (OSError, IndexError):
+        return None
+
+
+def _agentd_peer_identity(
+    writer: asyncio.StreamWriter | None = None,
+) -> dict[str, object] | None:
+    """Identify the exact process on the other end of the Unix socket."""
+    writer = writer or _agentd_writer
+    if writer is None:
+        return None
+    peer_socket = writer.get_extra_info("socket")
+    if peer_socket is None or not hasattr(socket, "SO_PEERCRED"):
+        return None
+    try:
+        raw = peer_socket.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+        )
+        pid, uid, gid = struct.unpack("3i", raw)
+    except (OSError, struct.error):
+        return None
+    start_ticks = _process_start_ticks(pid)
+    if pid <= 1 or start_ticks is None:
+        return None
+    return {"pid": pid, "uid": uid, "gid": gid, "start_ticks": start_ticks}
+
+
+def _same_process(identity: dict[str, object]) -> bool:
+    pid = int(identity.get("pid") or 0)
+    return (
+        pid > 1
+        and _process_start_ticks(pid) == identity.get("start_ticks")
+        # A zombie has released its socket and flock; waiting for an unrelated
+        # parent to reap it must not prevent replacement startup.
+        and _process_state(pid) not in (None, "Z")
+    )
+
+
+async def _wait_process_gone(
+    identity: dict[str, object], timeout: float
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while _same_process(identity) and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    return not _same_process(identity)
+
+
+def _recoverable_owned_sessions() -> list[str]:
+    """Durably active sessions, excluding completed idle history."""
+    recoverable = []
+    for session_id in _owned_sessions:
+        lifecycle = common.read_session_lifecycle(session_id)
+        if lifecycle.get("owner_id") != _owner_id:
+            continue
+        if lifecycle.get("state") not in ("running", "interrupted", "orphaned"):
+            continue
+        transcript = os.path.join(
+            common.reasonix_home(), "sessions", f"{session_id}.jsonl"
+        )
+        if os.path.isfile(transcript):
+            recoverable.append(session_id)
+    return sorted(recoverable)
 
 
 _DISCONNECT_RETRY_METHODS = {
@@ -2002,16 +2089,24 @@ async def reasonix_dashboard(open_browser: bool = True) -> dict:
 
 @mcp.tool()
 async def reasonix_restart_agentd(force: bool = False, ctx: Context | None = None) -> dict:
-    """Restart the detached agent daemon so it loads updated code.
+    """Replace agentd and verify that the new daemon is serving current code.
 
     By default this refuses while live agents exist. Set force=true only when
-    terminating those agents is acceptable; their transcripts remain
-    resumable. The next Reasonix tool call automatically starts the fresh
-    daemon.
+    terminating those agents is acceptable. A forced restart first requests a
+    cooperative shutdown, then escalates against the socket-authenticated old
+    PID (TERM, then KILL) if it remains alive. Success is returned only after a
+    different daemon accepts a ping with the current source signature.
     """
-    global _agentd_reader, _agentd_writer
     _capture_relay_ctx(ctx)
+    await _ensure_agentd()
+    old_identity = _agentd_peer_identity()
+    if old_identity is None:
+        raise RuntimeError(
+            "cannot verify the agentd peer PID; refusing an unverifiable restart"
+        )
+    old_pid = int(old_identity["pid"])
     checkpointed: list[str] = []
+    recoverable_before = set(_recoverable_owned_sessions())
     try:
         listing = await _rpc("list", {"include_task": True}, timeout=5.0)
         for item in listing.get("sessions", []):
@@ -2031,59 +2126,119 @@ async def reasonix_restart_agentd(force: bool = False, ctx: Context | None = Non
                 "error_text": "agentd was restarted while this session was active",
             })
             checkpointed.append(session_id)
+            transcript = os.path.join(
+                common.reasonix_home(), "sessions", f"{session_id}.jsonl"
+            )
+            if os.path.isfile(transcript):
+                recoverable_before.add(session_id)
     except Exception:
         # A wedged legacy daemon may be unable to answer the snapshot call.
         # Existing Reasonix transcripts and owner manifests still remain; do
         # not make an explicitly forced recovery depend on stale memory.
         pass
+    result: dict = {}
+    cooperative_error = ""
     try:
-        result = await _rpc("restart", {"force": force})
-    except ValueError as exc:
-        # A daemon started before this tool existed only knows `shutdown`.
-        # Use its existing ping method to preserve the safe refusal behavior
-        # before falling back to shutdown.
-        if "unknown method 'restart'" not in str(exc):
-            raise
-        state = await _rpc("ping", {})
-        sessions = int(state.get("sessions", 0))
-        if sessions and not force:
-            # Older daemons expose list but not restart. Terminal idle
-            # sessions are safe to discard; running/unfinished ones are not.
-            try:
-                listing = await _rpc("list", {})
-                live = [
-                    item for item in listing.get("sessions", [])
-                    if item.get("status") == "running"
-                    or (item.get("status") == "idle" and not item.get("stop_reason"))
-                ]
-            except Exception:
-                live = listing = None
-            if live is not None:
-                sessions = len(live)
-        if sessions and not force:
-            raise ValueError(
-                "the running agentd predates restart support and has live "
-                "sessions; stop them first or retry with force=true"
-            )
-        result = await _rpc("shutdown", {})
-        result["compatibility_fallback"] = "shutdown"
-    result["restarted"] = True
-    result["checkpointed_sessions"] = checkpointed
-    result["note"] = (
-        "agentd has stopped; the next Reasonix tool call starts a fresh daemon "
-        "from the current code. Active sessions checkpointed above will appear "
-        "as orphaned and can be revived together with reasonix_resume_fleet. "
-        "Other MCP clients sharing this daemon must reconnect on their next call."
-    )
-    writer = _agentd_writer
-    _agentd_reader = None
-    _agentd_writer = None
-    if writer is not None:
-        writer.close()
         try:
-            await writer.wait_closed()
-        except Exception:
+            result = await _rpc(
+                "restart", {"force": force}, timeout=5.0 if force else _rpc_default_timeout
+            )
+        except ValueError as exc:
+            # A daemon started before restart support only knows shutdown.
+            if "unknown method 'restart'" not in str(exc):
+                raise
+            if not force:
+                state = await _rpc("ping", {}, timeout=5.0)
+                if int(state.get("sessions", 0)):
+                    raise ValueError(
+                        "the running agentd predates restart support and owns "
+                        "sessions; stop them first or retry with force=true"
+                    )
+            result = await _rpc(
+                "shutdown", {}, timeout=5.0 if force else _rpc_default_timeout
+            )
+            result["compatibility_fallback"] = "shutdown"
+    except Exception as exc:
+        if not force:
+            raise
+        # force=true is explicit authority to replace the shared daemon. The
+        # cooperative path can be exactly what is wedged, so continue using
+        # the independently authenticated peer identity.
+        cooperative_error = str(exc)
+        result = {"shutdown": False, "cooperative_shutdown_error": cooperative_error}
+
+    old_writer = _agentd_writer
+    if old_writer is not None:
+        _discard_agentd_connection(old_writer)
+        with contextlib.suppress(Exception):
+            await old_writer.wait_closed()
+
+    escalation = "cooperative"
+    if not await _wait_process_gone(old_identity, 3.0):
+        escalation = "term"
+        if not _same_process(old_identity):
             pass
+        else:
+            try:
+                os.kill(old_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                raise RuntimeError(
+                    f"agentd {old_pid} ignored shutdown and cannot be terminated: {exc}"
+                ) from exc
+        if not await _wait_process_gone(old_identity, 5.0):
+            escalation = "kill"
+            if _same_process(old_identity):
+                try:
+                    os.kill(old_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except PermissionError as exc:
+                    raise RuntimeError(
+                        f"agentd {old_pid} survived TERM and cannot be killed: {exc}"
+                    ) from exc
+            if not await _wait_process_gone(old_identity, 5.0):
+                raise RuntimeError(
+                    f"agentd restart failed: verified old process {old_pid} is still alive"
+                )
+
+    # Do not merely leave a stale socket for the next tool. Start/connect now
+    # and prove the replacement loaded the source this server expects.
+    await _ensure_agentd()
+    new_identity = _agentd_peer_identity()
+    state = await _rpc("ping", {}, timeout=5.0)
+    expected_signature = common.agentd_code_signature()
+    loaded_signature = str(state.get("code_signature") or "")
+    if new_identity is None or int(new_identity["pid"]) == old_pid:
+        raise RuntimeError(
+            "agentd restart failed verification: no distinct replacement process"
+        )
+    if loaded_signature != expected_signature:
+        raise RuntimeError(
+            "agentd replacement is running stale code: "
+            f"expected {expected_signature}, got {loaded_signature or 'unknown'}"
+        )
+
+    recoverable = sorted(recoverable_before | set(_recoverable_owned_sessions()))
+    result.update({
+        "restarted": True,
+        "verified": True,
+        "old_pid": old_pid,
+        "new_pid": int(new_identity["pid"]),
+        "escalation": escalation,
+        "checkpointed_sessions": sorted(set(checkpointed)),
+        "recoverable_sessions": recoverable,
+        "recoverable_count": len(recoverable),
+        "code_signature": loaded_signature,
+        "note": (
+            "verified replacement agentd is running current code. Only the "
+            "recoverable_sessions listed here were active/interrupted; pass "
+            "those ids—not completed history—to reasonix_resume_fleet"
+        ),
+    })
+    if cooperative_error:
+        result["cooperative_shutdown_error"] = cooperative_error
     return result
 
 
