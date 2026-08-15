@@ -11,7 +11,8 @@ server restarts**: close the MCP host, come back, and reasonix_list still shows
 the fleet running; reasonix_resume revives sessions whose process died.
 
 Tools:
-  reasonix_spawn / reasonix_spawn_fleet / reasonix_resume / reasonix_send / reasonix_poll
+  reasonix_spawn / reasonix_spawn_fleet / reasonix_resume / reasonix_resume_fleet /
+  reasonix_send / reasonix_poll
   reasonix_watch / reasonix_wait / reasonix_list / reasonix_models / reasonix_transcript
   reasonix_respond_permission / reasonix_stop / reasonix_restart_agentd /
   reasonix_restart_mcp_server / reasonix_configure / reasonix_dashboard
@@ -49,7 +50,9 @@ to create an assigned fleet from JSON; retain the returned session_ids. Agents
 keep running even if this MCP server (or the MCP host —
 Claude Code, Codex, …) restarts — reasonix_list shows the fleet, reasonix_resume revives a session
 whose process died. Resume is idempotent if recovery races a live process;
-optional model/session changes still follow reasonix_configure semantics. For
+after daemon loss, reasonix_list(pending_only=true) exposes durable orphaned
+sessions and reasonix_resume_fleet revives them with bounded concurrency.
+Optional model/session changes still follow reasonix_configure semantics. For
 multiple children keep one reasonix_watch call in
 flight with all ids; it returns compact results for completion, permission,
 or process death without a follow-up poll. Keep one watch per orchestrator
@@ -163,6 +166,19 @@ FLEET_SPAWN_FIELDS = {
     "cwd", "model", "work_mode", "tool_approval", "effort",
     "keep_alive", "idle_timeout",
 }
+
+
+def _checkpoint_agent_state(session_id: str, status: str, **fields: object) -> None:
+    """Mirror public daemon state for recovery across old-daemon failures."""
+    if not session_id:
+        return
+    value = common.read_session_lifecycle(session_id)
+    value.update({
+        "state": status,
+        "owner_id": _owner_id,
+        **{key: field for key, field in fields.items() if field is not None},
+    })
+    common.write_session_lifecycle(session_id, value)
 
 
 async def _start_agentd(sock: str) -> None:
@@ -286,7 +302,8 @@ def _discard_agentd_connection(
 
 
 _DISCONNECT_RETRY_METHODS = {
-    "configure", "list", "models", "ping", "poll", "transcript", "wait", "watch",
+    "configure", "list", "models", "ping", "poll", "resume_fleet",
+    "transcript", "wait", "watch",
 }
 _CONSUMING_RETRY_METHODS = {"poll", "watch"}
 _next_request_token = itertools.count(1)
@@ -580,7 +597,7 @@ async def _configure_stale_agentd(
     if existing is None:
         raise ValueError(f"unknown session_id {session_id!r}")
     status = str(existing.get("status") or "exited")
-    if status == "exited":
+    if status in ("exited", "orphaned"):
         common.clear_session_runtime_override(session_id)
         return {
             "session_id": session_id,
@@ -1005,6 +1022,10 @@ async def _spawn_agent(
             "model": model, "effort": effort,
             "work_mode": work_mode or "balanced", "tool_approval": tool_approval,
         }, replace=True)
+        _checkpoint_agent_state(
+            session_id, "running", cwd=result.get("cwd") or cwd, task=task,
+            keep_alive=keep_alive, idle_timeout=idle_timeout,
+        )
     return result
 
 
@@ -1140,7 +1161,7 @@ async def reasonix_resume(
         ),
         None,
     )
-    if existing is not None and existing.get("status") != "exited":
+    if existing is not None and existing.get("status") not in ("exited", "orphaned"):
         result = {
             "session_id": session_id,
             "status": existing.get("status"),
@@ -1171,6 +1192,107 @@ async def reasonix_resume(
         "keep_alive": keep_alive, "idle_timeout": idle_timeout,
     })
     _remember_session(session_id)
+    _checkpoint_agent_state(session_id, str(result.get("status") or "idle"), cwd=result.get("cwd"))
+    return result
+
+
+@mcp.tool()
+async def reasonix_resume_fleet(
+    session_ids: list[str],
+    model: str = "",
+    effort: str = "",
+    work_mode: str = "",
+    tool_approval: str = "",
+    keep_alive: bool = False,
+    idle_timeout: float = common.DEFAULT_IDLE_TIMEOUT,
+    parallelism: int = 4,
+    continue_interrupted: bool = True,
+    ctx: Context | None = None,
+) -> dict:
+    """Revive a stopped, crashed, or orphaned fleet from durable transcripts.
+
+    Live sessions are left untouched, failed sessions are reported individually,
+    and saved cwd/config are reused unless common overrides are supplied.
+    Checkpointed interrupted turns continue automatically by default; idle or
+    explicitly stopped sessions remain idle. After
+    a daemon replacement, call reasonix_list(pending_only=true) to rediscover
+    orphaned sessions and pass their ids here.
+    """
+    _capture_relay_ctx(ctx)
+    unique_ids = list(dict.fromkeys(str(session_id) for session_id in session_ids))
+    if not unique_ids:
+        raise ValueError("session_ids must not be empty")
+    for session_id in unique_ids:
+        _require_owned(session_id)
+    prior_states = {
+        session_id: common.read_session_lifecycle(session_id).get("state")
+        for session_id in unique_ids
+    }
+    try:
+        result = await _rpc("resume_fleet", {
+            "session_ids": unique_ids,
+            "model": model,
+            "effort": effort,
+            "work_mode": work_mode,
+            "tool_approval": tool_approval,
+            "keep_alive": keep_alive,
+            "idle_timeout": idle_timeout,
+            "parallelism": parallelism,
+            "continue_interrupted": continue_interrupted,
+        }, timeout=max(_rpc_default_timeout, 60.0 * len(unique_ids)))
+    except ValueError as exc:
+        if "unknown method 'resume_fleet'" not in str(exc):
+            raise
+        values = await asyncio.gather(*(
+            reasonix_resume(
+                session_id,
+                model=model,
+                effort=effort,
+                work_mode=work_mode,
+                tool_approval=tool_approval,
+                keep_alive=keep_alive,
+                idle_timeout=idle_timeout,
+            )
+            for session_id in unique_ids
+        ), return_exceptions=True)
+        if continue_interrupted:
+            for index, (session_id, value) in enumerate(zip(unique_ids, values)):
+                if not (
+                    isinstance(value, dict)
+                    and value.get("resumed")
+                    and prior_states.get(session_id) in ("running", "interrupted", "orphaned")
+                ):
+                    continue
+                try:
+                    await reasonix_send(
+                        session_id,
+                        "Continue the interrupted task from the persisted session history. "
+                        "Verify the current repository state before repeating or changing work.",
+                        expect="new_turn",
+                    )
+                except Exception as continue_exc:
+                    values[index] = continue_exc
+                else:
+                    value["continued_interrupted_turn"] = True
+                    value["status"] = "running"
+        pairs = list(zip(unique_ids, values))
+        result = {
+            "requested": len(unique_ids),
+            "resumed": [sid for sid, value in pairs if isinstance(value, dict) and value.get("resumed")],
+            "already_live": [sid for sid, value in pairs if isinstance(value, dict) and value.get("already_live")],
+            "failed": [sid for sid, value in pairs if isinstance(value, Exception)],
+            "results": {
+                sid: value if isinstance(value, dict) else {
+                    "session_id": sid, "status": "failed", "error": str(value),
+                }
+                for sid, value in pairs
+            },
+            "compatibility_fallback": "individual_resume",
+        }
+    for session_id in result.get("resumed", []):
+        _remember_session(session_id)
+        item = (result.get("results") or {}).get(session_id) or {}
+        _checkpoint_agent_state(session_id, str(item.get("status") or "idle"), cwd=item.get("cwd"))
     return result
 
 
@@ -1223,6 +1345,7 @@ async def reasonix_send(
     result = await _rpc(
         "send", {"session_id": session_id, "message": message, "expect": expect}
     )
+    _checkpoint_agent_state(session_id, "running")
     if result.get("delivered") == "steered":
         try:
             common.record_orchestrator_message(
@@ -1268,6 +1391,7 @@ async def reasonix_poll(
         "include_thought": include_thought, "include_full": include_full,
         "max_events": max_events,
     })
+    _checkpoint_agent_state(session_id, str(result.get("status") or "running"))
     verbose = bool(
         detail
         or include_events is not None
@@ -1324,7 +1448,7 @@ async def reasonix_watch(
     for session_id in session_ids:
         _require_owned(session_id)
     rpc_timeout = None if timeout is None else max(0.0, float(timeout)) + 60.0
-    return await _rpc("watch", {
+    result = await _rpc("watch", {
         "session_ids": session_ids,
         "timeout": timeout,
         "detail": detail,
@@ -1334,6 +1458,11 @@ async def reasonix_watch(
         "include_full": include_full,
         "max_events": max_events,
     }, timeout=rpc_timeout)
+    for session_id, item in (result.get("results") or {}).items():
+        _checkpoint_agent_state(
+            str(session_id), str(item.get("status") or "idle")
+        )
+    return result
 
 
 @mcp.tool()
@@ -1352,6 +1481,14 @@ async def reasonix_list(
     result = await _rpc(
         "list", {"include_task": include_task, "pending_only": pending_only}
     )
+    for session in result.get("sessions", []):
+        if session.get("session_id") not in _owned_sessions:
+            continue
+        _checkpoint_agent_state(
+            str(session.get("session_id") or ""),
+            str(session.get("status") or "idle"),
+            cwd=session.get("cwd"), task=session.get("task"),
+        )
     result["sessions"] = [
         session for session in result.get("sessions", [])
         if session.get("session_id") in _owned_sessions
@@ -1397,7 +1534,9 @@ async def reasonix_stop(session_id: str, ctx: Context | None = None) -> dict:
     reasonix_resume (its transcript is persisted)."""
     _capture_relay_ctx(ctx)
     _require_owned(session_id)
-    return await _rpc("stop", {"session_id": session_id})
+    result = await _rpc("stop", {"session_id": session_id})
+    _checkpoint_agent_state(session_id, "stopped")
+    return result
 
 
 def _routine_for_owner(routine_id: str) -> dict:
@@ -1780,6 +1919,31 @@ async def reasonix_restart_agentd(force: bool = False, ctx: Context | None = Non
     """
     global _agentd_reader, _agentd_writer
     _capture_relay_ctx(ctx)
+    checkpointed: list[str] = []
+    try:
+        listing = await _rpc("list", {"include_task": True}, timeout=5.0)
+        for item in listing.get("sessions", []):
+            status = item.get("status")
+            if status != "running" and not (
+                status == "idle" and not item.get("stop_reason")
+            ):
+                continue
+            session_id = str(item.get("session_id") or "")
+            if not session_id:
+                continue
+            common.write_session_lifecycle(session_id, {
+                "state": "interrupted",
+                "owner_id": _owner_id,
+                "cwd": item.get("cwd") or "",
+                "task": item.get("task") or "",
+                "error_text": "agentd was restarted while this session was active",
+            })
+            checkpointed.append(session_id)
+    except Exception:
+        # A wedged legacy daemon may be unable to answer the snapshot call.
+        # Existing Reasonix transcripts and owner manifests still remain; do
+        # not make an explicitly forced recovery depend on stale memory.
+        pass
     try:
         result = await _rpc("restart", {"force": force})
     except ValueError as exc:
@@ -1812,10 +1976,12 @@ async def reasonix_restart_agentd(force: bool = False, ctx: Context | None = Non
         result = await _rpc("shutdown", {})
         result["compatibility_fallback"] = "shutdown"
     result["restarted"] = True
+    result["checkpointed_sessions"] = checkpointed
     result["note"] = (
         "agentd has stopped; the next Reasonix tool call starts a fresh daemon "
-        "from the current code. Other MCP clients sharing this daemon must "
-        "reconnect on their next call."
+        "from the current code. Active sessions checkpointed above will appear "
+        "as orphaned and can be revived together with reasonix_resume_fleet. "
+        "Other MCP clients sharing this daemon must reconnect on their next call."
     )
     writer = _agentd_writer
     _agentd_reader = None

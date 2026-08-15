@@ -94,6 +94,7 @@ client and verify the server is listed.
 | `reasonix_spawn(task, cwd?, model?, work_mode?, tool_approval?, effort?, keep_alive?, idle_timeout?)` | Start an agent in the daemon on `task`; returns `session_id` + sandbox posture. Completed agents can be cleaned up after the idle grace period when cleanup is enabled, unless `keep_alive=true`. |
 | `reasonix_spawn_fleet(path)` | Validate an assigned-fleet JSON file and spawn all agents in one call. Returns ordered agent/session mappings and `session_ids` ready for one `reasonix_watch` call. |
 | `reasonix_resume(session_id, cwd?, model?, effort?, work_mode?, tool_approval?, keep_alive?, idle_timeout?)` | Revive a stopped/crashed session from its persisted transcript, optionally changing its model/options. Idempotent for live processes. |
+| `reasonix_resume_fleet(session_ids, model?, effort?, work_mode?, tool_approval?, keep_alive?, idle_timeout?, parallelism?, continue_interrupted?)` | Bulk-revive stopped/crashed/orphaned sessions with bounded startup concurrency and per-session results. Interrupted turns continue by default; previously idle/stopped sessions stay idle. |
 | `reasonix_models()` | List selectable models: `provider/model` refs, default, per-model `supported_efforts`, and `price` hints where configured. |
 | `reasonix_send(session_id, message, expect?)` | Forced steer: queue as mid-turn guidance, or start a new turn if idle. Never dropped. `expect="steer"` refuses to start a new turn. |
 | `reasonix_configure(session_id, model?, effort?, work_mode?, tool_approval?)` | Switch session configuration while preserving history. Idle: immediate. Active: queued before next turn. Exited: persisted for `reasonix_resume`. |
@@ -299,6 +300,12 @@ fleet. Always include the complete remaining fleet when replacing a watch. If
 the MCP host or server restarts during a watch, reconnect, recover the owned
 fleet with `reasonix_list(pending_only=true)`, and watch it again; undelivered
 terminal state remains pending in agentd.
+
+If agentd itself dies or is force-restarted, active lifecycle checkpoints are
+rediscovered as `status: "orphaned"` with `process_alive: false`. Their cwd,
+task, ownership, and configuration remain on disk. Pass the returned ids to
+`reasonix_resume_fleet`; each session is reopened from its persisted transcript
+and failures are isolated per session.
 
 Python hot reloads safely complete an in-flight watch/wait with
 `server_restarted=true` before replacing the MCP front-end. Agents remain in
@@ -630,9 +637,10 @@ loops, implementing across many files. The bridge is built for that:
 
 One constraint, now mostly lifted: agents live in the **daemon**, not the MCP
 server — the MCP host can close and come back and the fleet is still running
-(`reasonix_list`). The daemon itself is the survival boundary: kill it and its
-agents die (PDEATHSIG); a crashed session's work survives on disk and can be
-revived with `reasonix_resume`.
+(`reasonix_list`). The daemon itself is the process survival boundary: kill it
+and its agents die (PDEATHSIG). Active sessions are checkpointed as orphaned,
+their work survives on disk, and one session or a whole fleet can be revived
+with `reasonix_resume` / `reasonix_resume_fleet`.
 
 ## Testing
 
@@ -646,6 +654,7 @@ revived with `reasonix_resume`.
 .venv/bin/python tests/selftest_notifications.py # diagnostic event frames (no model calls)
 .venv/bin/python tests/selftest_elicitation.py    # ACP decision → MCP elicitation bridge (no model calls)
 .venv/bin/python tests/selftest_watch.py          # watch overlap/cancellation safety (no model calls)
+.venv/bin/python tests/selftest_recovery.py       # dead-child + durable fleet recovery (no model calls)
 .venv/bin/python tests/selftest_mcp_restart.py   # manual + source-change hot reload (no model calls)
 .venv/bin/python tests/selftest_auto_reload.py   # agentd source watcher + self-replace (no model calls)
 .venv/bin/python tests/selftest_prompt_injection.py # one status contract per session (no model calls)

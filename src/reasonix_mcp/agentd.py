@@ -39,7 +39,10 @@ import common
 
 
 SOURCE_WATCH_INTERVAL = 0.5
+PROCESS_WATCH_INTERVAL = 1.0
+HEARTBEAT_INTERVAL = 60.0
 AUTO_RESTART_IDLE_GRACE = 3.0
+WORKER_METHODS = frozenset({"spawn", "resume"})
 
 
 def acquire_instance_lock(sock_path: str) -> int | None:
@@ -112,6 +115,7 @@ class Agentd:
                         self._wake_watchers, agent.session_id, kind
                     )
                     if kind == acp_bridge.EV_TURN_END:
+                        self._persist_lifecycle(agent, "idle")
                         self._loop.call_soon_threadsafe(self._schedule_idle_cleanup, agent)
                         self._loop.call_soon_threadsafe(
                             self._schedule_pending_config, agent
@@ -121,6 +125,14 @@ class Agentd:
                             self._schedule_pending_config, agent
                         )
                     elif kind == acp_bridge.EV_PROCESS_EXIT:
+                        self._persist_lifecycle(
+                            agent,
+                            "orphaned" if (
+                                getattr(agent, "_orphaned", False)
+                                or payload.get("error") is not None
+                            ) else "exited",
+                            error_text=str(payload.get("error_text") or ""),
+                        )
                         self._loop.call_soon_threadsafe(self._cancel_idle_cleanup, agent.session_id)
                     print(
                         f"reasonix agent_event emit: event={event.get('event')} "
@@ -143,6 +155,7 @@ class Agentd:
             agent.on_activity = _activity
         with self._lock:
             self._registry[agent.session_id] = agent
+        self._persist_lifecycle(agent, common.agent_status(agent))
         # The ACP reader can observe an immediate process death during the
         # constructor, before the daemon has attached its callback. Replay one
         # terminal notification so a fast crash is not silent.
@@ -155,6 +168,20 @@ class Agentd:
                 payload["error"] = agent.last_error
                 payload["error_text"] = agent.last_error_text
             agent.on_event(acp_bridge.EV_PROCESS_EXIT, payload)
+
+    @staticmethod
+    def _persist_lifecycle(
+        agent: acp_bridge.ReasonixAgent, state: str, **extra: object
+    ) -> None:
+        common.write_session_lifecycle(str(agent.session_id), {
+            "state": state,
+            "owner_id": getattr(agent, "owner_id", ""),
+            "cwd": getattr(agent, "cwd", ""),
+            "task": getattr(agent, "task", ""),
+            "keep_alive": bool(getattr(agent, "keep_alive", False)),
+            "idle_timeout": getattr(agent, "idle_timeout", common.DEFAULT_IDLE_TIMEOUT),
+            **extra,
+        })
 
     def _cancel_idle_cleanup(self, session_id: str) -> None:
         task = self._idle_cleanup_tasks.pop(session_id, None)
@@ -288,7 +315,7 @@ class Agentd:
     async def _apply_pending_config(self, agent: acp_bridge.ReasonixAgent) -> None:
         task = asyncio.current_task()
         try:
-            while agent.pending_config and common.agent_status(agent) != "exited":
+            while agent.pending_config and common.agent_status(agent) not in ("exited", "orphaned"):
                 if agent.active_turn:
                     return
                 requested = dict(agent.pending_config)
@@ -404,13 +431,13 @@ class Agentd:
 
     # ---------------------------------------------------------------- methods
 
-    @staticmethod
-    def _start_agent_turn(agent: acp_bridge.ReasonixAgent, message: str) -> None:
+    def _start_agent_turn(self, agent: acp_bridge.ReasonixAgent, message: str) -> None:
         """Start a turn, injecting the progress contract once per ACP session."""
         inject = not bool(getattr(agent, "status_protocol_injected", False))
         agent.start_turn(common.task_with_status_protocol(message) if inject else message)
         if inject:
             agent.status_protocol_injected = True
+        self._persist_lifecycle(agent, "running")
 
     def spawn(self, params: dict) -> dict:
         task = params.get("task", "")
@@ -510,7 +537,7 @@ class Agentd:
         if existing is not None and getattr(existing, "owner_id", "") != owner_id:
             raise AgentdError(f"unknown session_id {session_id!r} — it belongs to another orchestrator")
         requested_config = self._config_updates(params, require_any=False)
-        if existing is not None and common.agent_status(existing) != "exited":
+        if existing is not None and common.agent_status(existing) not in ("exited", "orphaned"):
             # Resume is a recovery operation, but callers can race daemon
             # reconnect/list recovery and invoke it for a process that never
             # died. Treat that as success instead of opening a second ACP
@@ -546,7 +573,14 @@ class Agentd:
                     f"session {session_id!r} is owned by another orchestrator or predates ownership tracking"
                 )
         if not cwd:
-            cwd = getattr(existing, "cwd", None) or os.getcwd()
+            metadata = common.read_acp_session_metadata(session_id)
+            lifecycle = common.read_session_lifecycle(session_id)
+            cwd = (
+                getattr(existing, "cwd", None)
+                or lifecycle.get("cwd")
+                or metadata.get("cwd")
+                or os.getcwd()
+            )
         saved_config = common.read_session_config(session_id)
         if "model" in requested_config and "effort" not in requested_config:
             saved_config.pop("effort", None)
@@ -595,6 +629,71 @@ class Agentd:
         if notes.get("skipped_options"):
             result["skipped_options"] = notes["skipped_options"]
         return result
+
+    async def resume_fleet(self, params: dict) -> dict:
+        """Resume persisted sessions with bounded startup concurrency."""
+        session_ids = list(dict.fromkeys(str(sid) for sid in params.get("session_ids", [])))
+        if not session_ids:
+            raise AgentdError("session_ids must not be empty")
+        if len(session_ids) > common.MAX_WATCH_SESSIONS:
+            raise AgentdError(f"too many sessions (max {common.MAX_WATCH_SESSIONS})")
+        try:
+            parallelism = int(params.get("parallelism", 4))
+        except (TypeError, ValueError):
+            raise AgentdError("parallelism must be an integer") from None
+        parallelism = max(1, min(parallelism, 8, len(session_ids)))
+        continue_interrupted = params.get("continue_interrupted", True)
+        if not isinstance(continue_interrupted, bool):
+            raise AgentdError("continue_interrupted must be a boolean")
+        semaphore = asyncio.Semaphore(parallelism)
+
+        async def one(session_id: str) -> tuple[str, dict]:
+            prior_state = common.read_session_lifecycle(session_id).get("state")
+            child_params = dict(params)
+            child_params.pop("session_ids", None)
+            child_params.pop("parallelism", None)
+            child_params.pop("continue_interrupted", None)
+            child_params["session_id"] = session_id
+            async with semaphore:
+                try:
+                    result = await asyncio.to_thread(self.resume, child_params)
+                    if (
+                        continue_interrupted
+                        and result.get("resumed")
+                        and prior_state in ("running", "interrupted", "orphaned")
+                    ):
+                        resumed_agent = self._get(
+                            session_id, str(params.get("owner_id") or "")
+                        )
+                        self._start_agent_turn(
+                            resumed_agent,
+                            "Continue the interrupted task from the persisted session history. "
+                            "Verify the current repository state before repeating or changing work.",
+                        )
+                        result["continued_interrupted_turn"] = True
+                        result["status"] = "running"
+                except Exception as exc:
+                    result = {
+                        "session_id": session_id,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                return session_id, result
+
+        pairs = await asyncio.gather(*(one(session_id) for session_id in session_ids))
+        results = {session_id: result for session_id, result in pairs}
+        return {
+            "requested": len(session_ids),
+            "resumed": [sid for sid, result in pairs if result.get("resumed")],
+            "already_live": [sid for sid, result in pairs if result.get("already_live")],
+            "failed": [sid for sid, result in pairs if result.get("status") == "failed"],
+            "results": results,
+            "watch_note": (
+                "Interrupted sessions were continued automatically; call "
+                "reasonix_watch once for the running resumed fleet. Idle or "
+                "explicitly stopped sessions wait for reasonix_send."
+            ),
+        }
 
     @staticmethod
     def _config_updates(params: dict, *, require_any: bool = True) -> dict[str, str]:
@@ -651,7 +750,7 @@ class Agentd:
             )
         status = common.agent_status(agent)
         self._persist_config_request(session_id, updates)
-        if status == "exited":
+        if status in ("exited", "orphaned"):
             agent.pending_config.update(updates)
             return {
                 "session_id": session_id,
@@ -773,7 +872,7 @@ class Agentd:
         note = "queued as mid-turn guidance"
         for _ in range(3):
             try:
-                agent.steer(message)
+                await asyncio.to_thread(agent.steer, message)
                 break
             except acp_bridge.ACPError as e:
                 if e.code != acp_bridge.ERR_INVALID_REQUEST:
@@ -1117,12 +1216,46 @@ class Agentd:
                 "config": dict(getattr(a, "config_values", {}) or {}),
                 "pending_config": dict(getattr(a, "pending_config", {}) or {}),
                 "pending_config_error": getattr(a, "pending_config_error", None),
-                "resumable": status in ("idle", "exited") and os.path.isfile(persisted),
+                "process_alive": status not in ("exited", "orphaned"),
+                "resumable": status in ("idle", "exited", "orphaned") and os.path.isfile(persisted),
             }
             if getattr(a, "last_error", None) is not None:
                 session["error"] = a.last_error
                 session["error_text"] = a.last_error_text
             sessions.append(session)
+        live_ids = {sid for sid, _ in items}
+        for sid in sorted(common.load_owner_sessions(owner_id) - live_ids):
+            lifecycle = common.read_session_lifecycle(sid)
+            if lifecycle.get("owner_id") != owner_id:
+                continue
+            if lifecycle.get("state") not in ("running", "idle", "interrupted", "orphaned"):
+                continue
+            persisted = os.path.join(common.reasonix_home(), "sessions", f"{sid}.jsonl")
+            if not os.path.isfile(persisted):
+                continue
+            metadata = common.read_acp_session_metadata(sid)
+            task = lifecycle.get("task") or metadata.get("title") or f"Session {sid[:8]}"
+            sessions.append({
+                "session_id": sid,
+                "status": "orphaned",
+                "cwd": lifecycle.get("cwd") or metadata.get("cwd"),
+                "task": task if include_task else common.task_preview(task),
+                "stop_reason": "agentd_lost_process",
+                "transcript_path": persisted,
+                "permission_request": False,
+                "plan": [],
+                "current_work": None,
+                "config": common.read_session_config(sid) or common.read_acp_session_config(sid),
+                "pending_config": {},
+                "pending_config_error": None,
+                "process_alive": False,
+                "resumable": True,
+                "recovered_from_disk": True,
+                "error_text": lifecycle.get("error_text") or (
+                    "agent process is not owned by the current daemon; "
+                    "resume it from the persisted transcript"
+                ),
+            })
         return {"sessions": sessions}
 
     def models(self, params: dict | None = None) -> dict:
@@ -1152,14 +1285,15 @@ class Agentd:
             raise AgentdError(f"agent {params['session_id']} has no pending permission request")
         return {"session_id": params["session_id"], "answered": params.get("option_id")}
 
-    def stop(self, params: dict) -> dict:
+    async def stop(self, params: dict) -> dict:
         agent = self._get(params["session_id"], str(params.get("owner_id") or ""))
         self._cancel_idle_cleanup(params["session_id"])
         config_task = self._pending_config_tasks.pop(params["session_id"], None)
         if config_task is not None and not config_task.done():
             config_task.cancel()
         agent.cancel_turn()
-        agent.close()
+        await asyncio.to_thread(agent.close)
+        self._persist_lifecycle(agent, "stopped")
         return {"session_id": params["session_id"], "stopped": True}
 
     def ping(self, params: dict | None = None) -> dict:
@@ -1184,7 +1318,7 @@ class Agentd:
         with self._lock:
             agents = list(self._registry.values())
         return all(
-            common.agent_status(agent) == "exited"
+            common.agent_status(agent) in ("exited", "orphaned")
             or (
                 not agent.active_turn
                 and not getattr(agent, "pending_config", None)
@@ -1227,6 +1361,42 @@ class Agentd:
             self._shutdown_agents()
             return
 
+    async def _watch_processes(self) -> None:
+        """Detect dead ACP leaders without depending on pipe EOF."""
+        last_heartbeat = time.monotonic()
+        while True:
+            await asyncio.sleep(PROCESS_WATCH_INTERVAL)
+            with self._lock:
+                agents = list(self._registry.values())
+            for agent in agents:
+                try:
+                    previous = agent.status
+                    alive = agent.reconcile_process_liveness()
+                    if not alive and previous != "exited":
+                        print(
+                            "reasonix agentd: reaped dead ACP process; "
+                            f"session={agent.session_id} pid={agent.proc.pid} resumable=true",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                except Exception as exc:
+                    print(
+                        f"reasonix agentd: process watchdog error: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            now = time.monotonic()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                statuses = [common.agent_status(agent) for agent in agents]
+                print(
+                    "reasonix agentd heartbeat: "
+                    f"sessions={len(agents)} running={statuses.count('running')} "
+                    f"idle={statuses.count('idle')} orphaned={statuses.count('orphaned')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                last_heartbeat = now
+
     def shutdown(self, params: dict | None = None) -> dict:
         """Close every agent and stop the daemon (used by tests; the real
         deployment just leaves the daemon running)."""
@@ -1248,7 +1418,7 @@ class Agentd:
         foreign_live = [
             agent for _, agent in agents
             if getattr(agent, "owner_id", "") != owner_id
-            and common.agent_status(agent) != "exited"
+            and common.agent_status(agent) not in ("exited", "orphaned")
             and (agent.active_turn or getattr(agent, "keep_alive", False) or not agent.stop_reason)
         ]
         if foreign_live and not force:
@@ -1259,7 +1429,7 @@ class Agentd:
         live = [
             sid for sid, agent in agents
             if getattr(agent, "owner_id", "") == owner_id
-            if common.agent_status(agent) != "exited"
+            if common.agent_status(agent) not in ("exited", "orphaned")
             and (
                 agent.active_turn
                 or getattr(agent, "keep_alive", False)
@@ -1284,10 +1454,17 @@ class Agentd:
             agents = list(self._registry.values())
             self._registry.clear()
         for a in agents:
+            lifecycle_state = "interrupted" if a.active_turn else "stopped"
+            # Checkpoint before close because an already degraded daemon may
+            # itself be killed while waiting for a child to tear down. Write
+            # it again afterward because the process-exit callback records an
+            # intermediate exited state during a clean close.
+            self._persist_lifecycle(a, lifecycle_state)
             try:
                 a.close()
             except Exception:
                 pass
+            self._persist_lifecycle(a, lifecycle_state)
         if self._serve_stop is not None:
             self._loop.call_soon_threadsafe(self._serve_stop.set)
         return {"shutdown": True, "agents_stopped": len(agents)}
@@ -1304,7 +1481,10 @@ class Agentd:
                 handler = getattr(self, method, None)
                 if handler is None or not callable(handler):
                     raise AgentdError(f"unknown method {method!r}", -32601)
-                result = handler(params)
+                if method in WORKER_METHODS:
+                    result = await asyncio.to_thread(handler, params)
+                else:
+                    result = handler(params)
                 if asyncio.iscoroutine(result):
                     result = await result
             self._send(writer, {"jsonrpc": "2.0", "id": msg.get("id"), "result": result})
@@ -1410,14 +1590,16 @@ class Agentd:
             pass
         server = await asyncio.start_unix_server(self.client_loop, path=sock_path)
         source_watcher = asyncio.create_task(self._watch_source())
+        process_watcher = asyncio.create_task(self._watch_processes())
         async with server:
             print(f"agentd listening on {sock_path}", flush=True)
             await self._serve_stop.wait()
             server.close()
             await server.wait_closed()
         source_watcher.cancel()
+        process_watcher.cancel()
         try:
-            await source_watcher
+            await asyncio.gather(source_watcher, process_watcher)
         except asyncio.CancelledError:
             pass
 

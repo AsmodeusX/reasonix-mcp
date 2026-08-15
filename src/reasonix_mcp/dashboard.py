@@ -811,8 +811,8 @@ async def fleet_snapshot() -> dict:
             item.update({
                 "session_id": session_id,
                 "owner_id": owner,
-                "live": live is not None and item.get("status") != "exited",
-                "historical": live is None or item.get("status") == "exited",
+                "live": live is not None and item.get("status") not in ("exited", "orphaned"),
+                "historical": live is None or item.get("status") in ("exited", "orphaned"),
                 "task": item.get("task") or preview["task"] or f"Session {session_id[:8]}",
                 "cwd": item.get("cwd") or preview["cwd"],
                 "updated_at": preview["updated_at"],

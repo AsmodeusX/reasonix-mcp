@@ -366,6 +366,49 @@ def read_acp_session_config(session_id: str) -> dict[str, str]:
     return result
 
 
+def read_acp_session_metadata(session_id: str) -> dict:
+    """Read durable fields needed to rediscover a session after agentd loss."""
+    try:
+        with open(session_acp_path(session_id), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: data[key]
+        for key in ("cwd", "title", "createdAt", "updatedAt")
+        if data.get(key) is not None
+    }
+
+
+def session_lifecycle_path(session_id: str) -> str:
+    return os.path.join(
+        reasonix_home(), "sessions", f"{session_id}.orchestrator-lifecycle.json"
+    )
+
+
+def read_session_lifecycle(session_id: str) -> dict:
+    try:
+        with open(session_lifecycle_path(session_id), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_session_lifecycle(session_id: str, data: dict) -> None:
+    path = session_lifecycle_path(session_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    value = dict(data)
+    value["session_id"] = session_id
+    value["updated_at"] = time.time()
+    tmp = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(value, fh, sort_keys=True)
+    os.replace(tmp, path)
+
+
 def write_session_config(
     session_id: str,
     updates: dict[str, str],
@@ -466,8 +509,11 @@ def transcript_has_status_protocol(session_id: str) -> bool:
 
 
 def agent_status(agent: acp_bridge.ReasonixAgent) -> str:
+    reconcile = getattr(agent, "reconcile_process_liveness", None)
+    if callable(reconcile):
+        reconcile()
     if agent.status == "exited":
-        return "exited"
+        return "orphaned" if getattr(agent, "_orphaned", False) else "exited"
     return "running" if agent.active_turn else "idle"
 
 

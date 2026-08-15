@@ -179,6 +179,9 @@ class ReasonixAgent:
         self._permission_lock = threading.Lock()
         self._stderr_tail: list[str] = []
         self._exit_code: int | None = None
+        self._exit_lock = threading.Lock()
+        self._exit_reported = False
+        self._orphaned = False
         self._closed = False
         self._pending_permission: tuple[int, dict] | None = None
         self.full_text_parts: list[str] = []
@@ -397,33 +400,7 @@ class ReasonixAgent:
                         params = msg.get("params") or {}
                         self._enqueue(EV_UPDATE, params.get("update", {}))
         finally:
-            # EOF without a completed prompt is an abnormal turn termination.
-            # Keep it actionable: callers need the stderr/exit detail in the
-            # notification and in the next poll/wait, not just "exited".
-            was_active = self.active_turn
-            stderr = "\n".join(self._stderr_tail[-50:])[-8000:]
-            unexpected = was_active or not self._closed
-            exit_text = stderr or (
-                f"agent process exited with code {self._exit_code}"
-                if self._exit_code is not None else "agent process exited unexpectedly"
-            )
-            process_payload: dict = {
-                "code": self._exit_code,
-                "stderr": stderr,
-            }
-            if unexpected:
-                process_payload["error_text"] = exit_text
-                self.stop_reason = "error"
-                process_payload["error"] = {
-                    "code": self._exit_code if self._exit_code is not None else -1,
-                    "message": exit_text,
-                }
-            self.status = "exited"
-            self._enqueue(EV_PROCESS_EXIT, process_payload)
-            self.active_turn = False
-            for waiter in self._pending.values():
-                waiter.put({"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": "agent process exited"}})
-            self._pending.clear()
+            self._mark_process_exit(self.proc.poll())
 
     def _read_stderr(self) -> None:
         for line in self.proc.stderr:
@@ -439,17 +416,24 @@ class ReasonixAgent:
             self.proc.stdin.write(json.dumps(obj) + "\n")
             self.proc.stdin.flush()
 
-    def _send_request(self, method: str, params: dict) -> int:
-        rid = next(self._ids)
-        self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-        return rid
-
     def _request(self, method: str, params: dict, timeout: float = 30.0) -> dict:
         """Send a request and wait for its response (returns result dict)."""
-        rid = self._send_request(method, params)
+        rid = next(self._ids)
         waiter: queue.Queue = queue.Queue(maxsize=1)
-        with self._wlock:  # guard _pending registration vs reader pop
+        # Register before writing. Fast local ACP responses can otherwise land
+        # between the write and registration and be discarded, pinning the
+        # caller until its timeout.
+        with self._wlock:
             self._pending[rid] = waiter
+            try:
+                if self.proc.stdin is None or self.proc.stdin.closed:
+                    raise ACPError(-1, "agent process stdin is closed")
+                frame = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+                self.proc.stdin.write(json.dumps(frame) + "\n")
+                self.proc.stdin.flush()
+            except Exception:
+                self._pending.pop(rid, None)
+                raise
         try:
             msg = waiter.get(timeout=timeout)
         except queue.Empty:
@@ -457,6 +441,63 @@ class ReasonixAgent:
         if "error" in msg and msg["error"] is not None:
             raise ACPError(msg["error"].get("code", -1), msg["error"].get("message", "unknown error"))
         return msg.get("result", {})
+
+    def reconcile_process_liveness(self) -> bool:
+        """Return process liveness and publish a missed death immediately.
+
+        A child can exit while one of its descendants still owns the ACP pipe.
+        In that case stdout never reaches EOF, so the normal reader-finally
+        path cannot update status. Polling Popen independently breaks that
+        dependency and killing the now-orphaned process group releases pipes.
+        """
+        code = self.proc.poll()
+        if code is None:
+            return True
+        self._exit_code = code
+        if self.status != "exited":
+            self._orphaned = True
+            self._kill_orphaned_process_group()
+            self._mark_process_exit(code)
+        return False
+
+    def _kill_orphaned_process_group(self) -> None:
+        try:
+            os.killpg(self._pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def _mark_process_exit(self, code: int | None) -> bool:
+        """Record process death once, even if watchdog and reader race."""
+        with self._exit_lock:
+            if self._exit_reported:
+                return False
+            self._exit_reported = True
+            self._exit_code = code if code is not None else self._exit_code
+            was_active = self.active_turn
+            stderr = "\n".join(self._stderr_tail[-50:])[-8000:]
+            unexpected = was_active or not self._closed
+            exit_text = stderr or (
+                f"agent process exited with code {self._exit_code}"
+                if self._exit_code is not None else "agent process exited unexpectedly"
+            )
+            payload: dict = {"code": self._exit_code, "stderr": stderr}
+            if unexpected:
+                payload["error_text"] = exit_text
+                self.stop_reason = "error"
+                payload["error"] = {
+                    "code": self._exit_code if self._exit_code is not None else -1,
+                    "message": exit_text,
+                }
+            self.status = "exited"
+            self.active_turn = False
+            self.current_work = None
+            self._enqueue(EV_PROCESS_EXIT, payload)
+            for waiter in list(self._pending.values()):
+                waiter.put({"jsonrpc": "2.0", "id": None, "error": {
+                    "code": -32603, "message": "agent process exited"
+                }})
+            self._pending.clear()
+            return True
 
     # ------------------------------------------------------------------ api
 
@@ -726,6 +767,10 @@ class ReasonixAgent:
             except subprocess.TimeoutExpired:
                 os.killpg(self._pgid, signal.SIGKILL)
                 self.proc.wait(timeout=5)
+            else:
+                # The ACP leader may be gone while descendants keep its pipe
+                # descriptors open. Kill the still-existing process group.
+                self._kill_orphaned_process_group()
         except (ProcessLookupError, PermissionError):
             pass  # already dead
         except Exception:
