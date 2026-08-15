@@ -1173,6 +1173,14 @@ async def reasonix_spawn_fleet(path: str, ctx: Context | None = None) -> dict:
     _capture_relay_ctx(ctx)
     fleet = load_fleet_file(path)
     semaphore = asyncio.Semaphore(fleet["parallelism"])
+    cwd_groups: dict[str, list[str]] = {}
+    for assignment in fleet["agents"]:
+        resolved_cwd = os.path.realpath(assignment["cwd"] or os.getcwd())
+        cwd_groups.setdefault(resolved_cwd, []).append(assignment["name"])
+    shared_workspaces = [
+        {"cwd": cwd, "agents": names}
+        for cwd, names in cwd_groups.items() if len(names) > 1
+    ]
 
     async def spawn_one(index: int, assignment: dict) -> dict:
         async with semaphore:
@@ -1211,6 +1219,14 @@ async def reasonix_spawn_fleet(path: str, ctx: Context | None = None) -> dict:
         "requested": len(results), "spawned": len(session_ids),
         "failed": len(failures), "session_ids": session_ids,
         "agents": results,
+        "shared_workspaces": shared_workspaces,
+        "workspace_note": (
+            "Reasonix serializes active turns that share the same real cwd. "
+            "Assign a separate worktree/cwd to each writing agent for true "
+            "parallel tool execution. Fleet parallelism controls spawn "
+            "handshakes, not this workspace safety lease."
+            if shared_workspaces else None
+        ),
         "watch_note": (
             "Call reasonix_watch once with session_ids, remove terminal ids, "
             "then watch the remaining fleet."
@@ -1870,7 +1886,9 @@ async def reasonix_routine_stop(routine_id: str, ctx: Context | None = None) -> 
     _capture_relay_ctx(ctx)
     value = _routine_for_owner(routine_id)
     run = next((item for item in reversed(value.get("runs", []))
-                if item.get("status") in ("starting", "running")), None)
+                if item.get("status") in (
+                    "starting", "running", "blocked", "stalled"
+                )), None)
     if not run or not run.get("session_id"):
         raise ValueError("routine has no stoppable active agent")
     result = await routined.rpc(
@@ -2111,7 +2129,7 @@ async def reasonix_restart_agentd(force: bool = False, ctx: Context | None = Non
         listing = await _rpc("list", {"include_task": True}, timeout=5.0)
         for item in listing.get("sessions", []):
             status = item.get("status")
-            if status != "running" and not (
+            if status not in ("running", "blocked", "stalled") and not (
                 status == "idle" and not item.get("stop_reason")
             ):
                 continue

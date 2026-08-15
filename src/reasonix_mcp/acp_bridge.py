@@ -182,6 +182,16 @@ class ReasonixAgent:
         self._exit_lock = threading.Lock()
         self._exit_reported = False
         self._orphaned = False
+        now = time.monotonic()
+        self._last_protocol_activity_at = now
+        self._last_stdout_at = now
+        self._last_stderr_at = now
+        self._turn_started_at: float | None = None
+        self._last_runtime_progress_at = now
+        self._runtime_signature: tuple | None = None
+        self.runtime_status = "starting"
+        self.runtime_health: dict = {}
+        self._runtime_alert_observed = False
         self._closed = False
         self._pending_permission: tuple[int, dict] | None = None
         self.full_text_parts: list[str] = []
@@ -361,6 +371,8 @@ class ReasonixAgent:
                 line = self.proc.stdout.readline()
                 if not line:
                     break
+                self._last_stdout_at = time.monotonic()
+                self._last_protocol_activity_at = self._last_stdout_at
                 line = line.strip()
                 if not line:
                     continue
@@ -404,6 +416,7 @@ class ReasonixAgent:
 
     def _read_stderr(self) -> None:
         for line in self.proc.stderr:
+            self._last_stderr_at = time.monotonic()
             self._stderr_tail.append(line.rstrip())
             if len(self._stderr_tail) > 200:
                 self._stderr_tail.pop(0)
@@ -689,6 +702,13 @@ class ReasonixAgent:
         rid = next(self._ids)
         self._turn_rid = rid  # set before writing so the reader never races
         self.active_turn = True
+        self._turn_started_at = time.monotonic()
+        self._last_protocol_activity_at = self._turn_started_at
+        self._last_runtime_progress_at = self._turn_started_at
+        self._runtime_signature = None
+        self.runtime_status = "running"
+        self.runtime_health = {}
+        self._runtime_alert_observed = False
         self.stop_reason = None
         self._terminal_observed = False
         # The turn's response resolves when the turn ends; the reader routes it

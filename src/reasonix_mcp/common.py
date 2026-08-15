@@ -514,7 +514,12 @@ def agent_status(agent: acp_bridge.ReasonixAgent) -> str:
         reconcile()
     if agent.status == "exited":
         return "orphaned" if getattr(agent, "_orphaned", False) else "exited"
-    return "running" if agent.active_turn else "idle"
+    if agent.active_turn:
+        runtime_status = getattr(agent, "runtime_status", "running")
+        if runtime_status in ("blocked", "stalled"):
+            return runtime_status
+        return "running"
+    return "idle"
 
 
 def build_agent_event(agent: acp_bridge.ReasonixAgent, kind: str, payload: dict) -> dict:
@@ -909,6 +914,8 @@ def shape_poll(
         "pending_config": dict(getattr(agent, "pending_config", {}) or {}),
         "pending_config_error": getattr(agent, "pending_config_error", None),
     }
+    if status in ("blocked", "stalled"):
+        result["health"] = dict(getattr(agent, "runtime_health", {}) or {})
     if include_thought:
         thought, thought_truncated = _cap("".join(thought_parts), MAX_DELTA_TEXT)
         full_thought, full_thought_truncated = _cap(agent.full_thought, MAX_FULL_TEXT)
@@ -972,6 +979,8 @@ def compact_poll_result(detailed: dict) -> dict:
         "status": detailed.get("status"),
         "plan": detailed.get("plan") or [],
     }
+    if detailed.get("health"):
+        result["health"] = detailed["health"]
     for key in ("stop_reason", "permission_request"):
         if detailed.get(key) is not None:
             result[key] = detailed[key]

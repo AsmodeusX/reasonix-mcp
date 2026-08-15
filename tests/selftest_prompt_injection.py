@@ -26,6 +26,8 @@ class FakeAgent:
 
 def main() -> None:
     daemon = agentd.Agentd()
+    # This unit exercises prompt composition, not durable lifecycle writes.
+    daemon._persist_lifecycle = lambda *_args, **_kwargs: None
 
     fresh = FakeAgent()
     daemon._start_agent_turn(fresh, "Initial task")

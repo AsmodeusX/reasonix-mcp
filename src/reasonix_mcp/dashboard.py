@@ -508,7 +508,9 @@ def transcript_with_initial_prompt(
     result.update({
         "runs": [{
             "number": 1,
-            "active": bool(is_live and session.get("status") == "running"),
+            "active": bool(
+                is_live and session.get("status") in ("running", "blocked", "stalled")
+            ),
             "started_at": session.get("created_at") or session.get("updated_at"),
             "entries": [{
                 "kind": "message",
@@ -802,7 +804,7 @@ async def fleet_snapshot() -> dict:
                 key: live.get(key)
                 for key in (
                     "session_id", "status", "cwd", "task", "stop_reason",
-                    "resumable", "error", "error_text",
+                    "resumable", "error", "error_text", "health",
                 )
                 if live is not None and live.get(key) is not None
             }
@@ -832,7 +834,10 @@ async def fleet_snapshot() -> dict:
             "projects": projects,
             "sessions": sessions,
             "counts": {
-                "running": sum(item.get("status") == "running" for item in sessions),
+                "running": sum(
+                    item.get("status") in ("running", "blocked", "stalled")
+                    for item in sessions
+                ),
                 "current": sum(bool(item.get("live")) for item in sessions),
                 "previous": sum(bool(item.get("historical")) for item in sessions),
             },
@@ -952,7 +957,9 @@ async def api_routine_action(request: Request) -> Response:
             result["routine_id"] = routine_id
         elif action == "stop":
             run = next((item for item in reversed(value.get("runs", []))
-                        if item.get("status") in ("starting", "running")), None)
+                        if item.get("status") in (
+                            "starting", "running", "blocked", "stalled"
+                        )), None)
             if not run or not run.get("session_id"):
                 raise ValueError("routine has no stoppable active agent")
             result = await agentd_rpc(routined.routine_owner(routine_id), "stop", {

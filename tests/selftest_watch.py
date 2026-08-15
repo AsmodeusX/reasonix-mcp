@@ -357,7 +357,54 @@ def watch_agent(session_id: str) -> SimpleNamespace:
         config_values={},
         pending_config={},
         pending_config_error=None,
+        runtime_status="running",
+        runtime_health={},
+        _runtime_alert_observed=False,
     )
+
+
+async def check_runtime_stall_is_actionable() -> None:
+    daemon = Agentd()
+    agent = watch_agent("runtime-stall")
+    daemon._registry[agent.session_id] = agent
+
+    # Workspace queueing is informational and must not flood a fleet watch.
+    agent.runtime_status = "blocked"
+    agent.runtime_health = {"reason": "workspace_lease"}
+    blocked = await daemon.watch({
+        "session_ids": [agent.session_id],
+        "owner_id": agent.owner_id,
+        "timeout": 0,
+    })
+    assert blocked["timed_out"] and not blocked["woke"], blocked
+
+    agent.runtime_status = "stalled"
+    agent.runtime_health = {"reason": "no_protocol_or_process_progress"}
+
+    def fake_poll(params: dict) -> dict:
+        if params.get("_watch_delivery"):
+            agent._runtime_alert_observed = True
+        return {
+            "session_id": agent.session_id,
+            "status": "stalled",
+            "health": dict(agent.runtime_health),
+            "turns": [],
+            "permission_request": None,
+            "plan": [],
+            "current_work": None,
+            "transcript_path": None,
+        }
+
+    daemon.poll = fake_poll
+    stalled = await daemon.watch({
+        "session_ids": [agent.session_id],
+        "owner_id": agent.owner_id,
+    })
+    assert stalled["woke"] == [agent.session_id], stalled
+    assert stalled["results"][agent.session_id]["status"] == "stalled", stalled
+    assert stalled["results"][agent.session_id]["health"]["reason"] == (
+        "no_protocol_or_process_progress"
+    ), stalled
 
 
 async def check_targeted_watch_wakeups() -> None:
@@ -791,6 +838,7 @@ def check_list_permission_detail_does_not_hide_fleet() -> None:
 
 
 async def main() -> None:
+    await check_runtime_stall_is_actionable()
     await check_connection_probe_serialization()
     await check_old_reader_isolation()
     await check_read_retry()

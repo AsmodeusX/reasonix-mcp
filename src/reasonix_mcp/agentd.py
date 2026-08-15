@@ -26,6 +26,7 @@ import asyncio
 from collections import OrderedDict
 from collections.abc import Iterable
 import fcntl
+import hashlib
 import json
 import os
 import signal
@@ -41,8 +42,90 @@ import common
 SOURCE_WATCH_INTERVAL = 0.5
 PROCESS_WATCH_INTERVAL = 1.0
 HEARTBEAT_INTERVAL = 60.0
+WORKSPACE_BLOCKED_AFTER = float(os.environ.get(
+    "REASONIX_MCP_WORKSPACE_BLOCKED_AFTER", "5"
+))
+RUNTIME_STALLED_AFTER = float(os.environ.get(
+    "REASONIX_MCP_RUNTIME_STALLED_AFTER", "600"
+))
 AUTO_RESTART_IDLE_GRACE = 3.0
 WORKER_METHODS = frozenset({"spawn", "resume"})
+
+
+def workspace_lease_path(cwd: str) -> str:
+    """Return Reasonix's per-real-workspace lease path."""
+    key = hashlib.sha256(os.path.realpath(cwd).encode()).hexdigest()
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache"
+    )
+    return os.path.join(cache, "reasonix", "workspace-leases", f"{key}.lock")
+
+
+def process_tree_snapshot(root_pid: int) -> dict:
+    """Cheap Linux process-tree progress receipt used only for diagnostics."""
+    pending = [int(root_pid)]
+    seen: set[int] = set()
+    processes: list[tuple[int, str]] = []
+    cpu_ticks = read_chars = write_chars = 0
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                stat = fh.read()
+            fields = stat[stat.rfind(")") + 2:].split()
+            state = fields[0]
+            cpu_ticks += int(fields[11]) + int(fields[12])
+            processes.append((pid, state))
+        except (OSError, ValueError, IndexError):
+            continue
+        try:
+            with open(f"/proc/{pid}/task/{pid}/children", encoding="utf-8") as fh:
+                pending.extend(int(value) for value in fh.read().split())
+        except (OSError, ValueError):
+            pass
+        try:
+            with open(f"/proc/{pid}/io", encoding="utf-8") as fh:
+                io_values = {
+                    key: int(value.strip())
+                    for key, value in (line.split(":", 1) for line in fh)
+                }
+            # rchar/wchar include pipes and sockets as well as disk. That is
+            # the useful signal for compilers, emulators, and provider streams.
+            read_chars += io_values.get("rchar", 0)
+            write_chars += io_values.get("wchar", 0)
+        except (OSError, ValueError):
+            pass
+    processes.sort()
+    return {
+        "signature": (tuple(processes), cpu_ticks, read_chars, write_chars),
+        "pids": [pid for pid, _state in processes],
+        "processes": len(processes),
+        "children": max(0, len(processes) - 1),
+        "cpu_ticks": cpu_ticks,
+        "read_chars": read_chars,
+        "write_chars": write_chars,
+    }
+
+
+def lease_holder_pid(path: str) -> int | None:
+    """Return the kernel-reported advisory lock owner for a lease file."""
+    try:
+        value = os.stat(path)
+        lock_key = (
+            f"{os.major(value.st_dev):02x}:{os.minor(value.st_dev):02x}:"
+            f"{value.st_ino}"
+        )
+        with open("/proc/locks", encoding="utf-8") as locks:
+            for line in locks:
+                fields = line.split()
+                if len(fields) >= 6 and fields[5] == lock_key:
+                    return int(fields[4])
+    except OSError:
+        pass
+    return None
 
 
 def acquire_instance_lock(sock_path: str) -> int | None:
@@ -196,6 +279,7 @@ class Agentd:
             acp_bridge.EV_TURN_END,
             acp_bridge.EV_PERMISSION,
             acp_bridge.EV_PROCESS_EXIT,
+            "runtime_stalled",
         ):
             return
         waiters = list(self._watch_waiters.pop(session_id, ()))
@@ -919,7 +1003,7 @@ class Agentd:
         )
         result = detailed if verbose else self._compact_poll_result(detailed)
         if (
-            result.get("status") != "running"
+            result.get("status") not in ("running", "blocked", "stalled")
             and result.get("stop_reason")
             and (
                 params.get("_watch_delivery")
@@ -931,6 +1015,11 @@ class Agentd:
             # A diagnostic poll must not steal that result from an in-flight
             # fleet watch.
             agent._terminal_observed = True
+        if result.get("status") == "stalled" and (
+            params.get("_watch_delivery")
+            or agent.session_id not in self._active_watch_sessions
+        ):
+            agent._runtime_alert_observed = True
         return self._cache_delivery("poll", params, result)
 
     async def wait(self, params: dict) -> dict:
@@ -957,7 +1046,11 @@ class Agentd:
                     "status": status,
                     "has_new": has_new,
                     "permission_request": pending,
-                    "stop_reason": a.stop_reason if status != "running" else None,
+                    "stop_reason": (
+                        a.stop_reason
+                        if status not in ("running", "blocked", "stalled") else None
+                    ),
+                    "health": dict(getattr(a, "runtime_health", {}) or {}),
                     "plan": list(getattr(a, "plan_entries", []) or []),
                     "current_work": (
                         dict(getattr(a, "current_work", None))
@@ -967,7 +1060,9 @@ class Agentd:
                 if getattr(a, "last_error", None) is not None:
                     states[sid]["error"] = a.last_error
                     states[sid]["error_text"] = a.last_error_text
-                if has_new or pending or status != "running":
+                if has_new or pending or status == "stalled" or status not in (
+                    "running", "blocked"
+                ):
                     woke.append(sid)
             return woke, states
 
@@ -1065,7 +1160,14 @@ class Agentd:
             if agent._pending_permission is not None:
                 return True
             status = common.agent_status(agent)
-            terminal = status == "exited" or (status != "running" and bool(agent.stop_reason))
+            if status == "stalled" and not bool(
+                getattr(agent, "_runtime_alert_observed", False)
+            ):
+                return True
+            terminal = status == "exited" or (
+                status not in ("running", "blocked", "stalled")
+                and bool(agent.stop_reason)
+            )
             return terminal and not bool(getattr(agent, "_terminal_observed", False))
 
         while True:
@@ -1155,6 +1257,7 @@ class Agentd:
             "config": detailed.get("config") or {},
             "pending_config": detailed.get("pending_config") or {},
             "pending_config_error": detailed.get("pending_config_error"),
+            "health": detailed.get("health") or {},
             "transcript_path": detailed.get("transcript_path"),
             "detail_available": True,
         }
@@ -1178,12 +1281,12 @@ class Agentd:
         for sid, a in items:
             status = common.agent_status(a)
             unobserved_terminal = (
-                status != "running"
+                status not in ("running", "blocked", "stalled")
                 and bool(a.stop_reason)
                 and not bool(getattr(a, "_terminal_observed", False))
             )
             if pending_only and not (
-                status == "running"
+                status in ("running", "blocked", "stalled")
                 or a._pending_permission is not None
                 or unobserved_terminal
             ):
@@ -1218,6 +1321,7 @@ class Agentd:
                 "config": dict(getattr(a, "config_values", {}) or {}),
                 "pending_config": dict(getattr(a, "pending_config", {}) or {}),
                 "pending_config_error": getattr(a, "pending_config_error", None),
+                "health": dict(getattr(a, "runtime_health", {}) or {}),
                 "process_alive": status not in ("exited", "orphaned"),
                 "resumable": status in ("idle", "exited", "orphaned") and os.path.isfile(persisted),
             }
@@ -1363,8 +1467,142 @@ class Agentd:
             self._shutdown_agents()
             return
 
+    def _update_runtime_health(
+        self, agents: list[acp_bridge.ReasonixAgent], now: float
+    ) -> None:
+        """Classify live turns from protocol, process-tree, and lease progress.
+
+        A quiet ACP pipe is normal while a child tool or model request runs, so
+        it is never sufficient evidence by itself. Conversely, a live ACP PID
+        is not proof that its turn can advance. Reasonix serializes turns by
+        real workspace; expose that queue explicitly and reserve ``stalled``
+        for a holder with neither protocol nor process-tree progress.
+        """
+        active = [
+            agent for agent in agents
+            if agent.active_turn and agent.status != "exited"
+        ]
+        snapshots: dict[object, dict] = {}
+        lease_paths: dict[object, str] = {}
+        for agent in active:
+            snapshot = process_tree_snapshot(agent.proc.pid)
+            snapshots[agent] = snapshot
+            lease_path = workspace_lease_path(getattr(agent, "cwd", ""))
+            lease_paths[agent] = lease_path
+        holder_pids = {
+            path: lease_holder_pid(path) for path in set(lease_paths.values())
+        }
+        holders: dict[str, acp_bridge.ReasonixAgent] = {}
+        for path, holder_pid in holder_pids.items():
+            if holder_pid is None:
+                continue
+            holder = next((
+                agent for agent, snapshot in snapshots.items()
+                if holder_pid in snapshot["pids"]
+            ), None)
+            if holder is not None:
+                holders[path] = holder
+
+        for agent in agents:
+            previous = getattr(agent, "runtime_status", "running")
+            if agent not in snapshots:
+                agent.runtime_status = "idle" if agent.status != "exited" else "exited"
+                agent.runtime_health = {}
+                agent._runtime_alert_observed = False
+                continue
+
+            snapshot = snapshots[agent]
+            signature = snapshot["signature"]
+            protocol_at = float(getattr(agent, "_last_protocol_activity_at", now))
+            progress_at = float(getattr(agent, "_last_runtime_progress_at", now))
+            previous_signature = getattr(agent, "_runtime_signature", None)
+            previous_had_children = bool(
+                previous_signature and len(previous_signature[0]) > 1
+            )
+            # ACP leader CPU alone can be Go GC/keepalive bookkeeping and did
+            # exactly mask the reported wedge. Only a changing tool subtree,
+            # or bytes received on ACP stdout above, proves turn progress.
+            if signature != previous_signature and (
+                snapshot["children"] > 0 or previous_had_children
+            ):
+                progress_at = now
+            agent._runtime_signature = signature
+            progress_at = max(progress_at, protocol_at)
+            agent._last_runtime_progress_at = progress_at
+            protocol_idle = max(0.0, now - protocol_at)
+            runtime_idle = max(0.0, now - progress_at)
+            lease_path = lease_paths[agent]
+            holder = holders.get(lease_path)
+            holder_pid = holder_pids.get(lease_path)
+
+            status = "running"
+            reason = None
+            if (
+                holder_pid is not None
+                and holder is not agent
+                and protocol_idle >= WORKSPACE_BLOCKED_AFTER
+            ):
+                status = "blocked"
+                reason = "workspace_lease"
+            elif (
+                protocol_idle >= RUNTIME_STALLED_AFTER
+                and runtime_idle >= RUNTIME_STALLED_AFTER
+            ):
+                status = "stalled"
+                reason = "no_protocol_or_process_progress"
+
+            health = {
+                "reason": reason,
+                "protocol_idle_seconds": round(protocol_idle, 1),
+                "runtime_idle_seconds": round(runtime_idle, 1),
+                "process_alive": bool(snapshot["processes"]),
+                "child_processes": snapshot["children"],
+            }
+            if holder is not None:
+                health["workspace_lease_holder"] = holder.session_id
+            elif holder_pid is not None:
+                health["workspace_lease_holder_pid"] = holder_pid
+            if status == "blocked":
+                health["note"] = (
+                    "queued behind another Reasonix turn in the same real "
+                    "workspace; use separate worktrees/cwd values for parallel tools"
+                )
+            elif status == "stalled":
+                health["note"] = (
+                    "ACP process is alive but neither its protocol nor process tree "
+                    "has advanced; inspect or stop/resume this session"
+                )
+            agent.runtime_status = status
+            agent.runtime_health = health
+
+            if status != previous:
+                print(
+                    "reasonix agentd runtime: "
+                    f"session={agent.session_id} status={status} "
+                    f"reason={reason or '-'} holder={health.get('workspace_lease_holder', '-')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if self._loop is not None and not self._shutting_down:
+                    asyncio.create_task(self._broadcast({
+                        "session_id": agent.session_id,
+                        "event": "runtime_status",
+                        "status": status,
+                        "health": dict(health),
+                        "note": (
+                            "agent runtime health changed; reasonix_watch wakes "
+                            "only for stalled, not ordinary workspace queueing"
+                        ),
+                    }, getattr(agent, "owner_id", "")))
+            if status == "stalled" and previous != "stalled":
+                agent._runtime_alert_observed = False
+                self._wake_watchers(str(agent.session_id), "runtime_stalled")
+                self._wake_waiters(str(agent.session_id))
+            elif status != "stalled":
+                agent._runtime_alert_observed = False
+
     async def _watch_processes(self) -> None:
-        """Detect dead ACP leaders without depending on pipe EOF."""
+        """Detect dead ACP leaders and report whether live turns can advance."""
         last_heartbeat = time.monotonic()
         while True:
             await asyncio.sleep(PROCESS_WATCH_INTERVAL)
@@ -1388,11 +1626,21 @@ class Agentd:
                         flush=True,
                     )
             now = time.monotonic()
+            try:
+                self._update_runtime_health(agents, now)
+            except Exception as exc:
+                print(
+                    f"reasonix agentd: runtime health error: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                 statuses = [common.agent_status(agent) for agent in agents]
                 print(
                     "reasonix agentd heartbeat: "
                     f"sessions={len(agents)} running={statuses.count('running')} "
+                    f"blocked={statuses.count('blocked')} "
+                    f"stalled={statuses.count('stalled')} "
                     f"idle={statuses.count('idle')} orphaned={statuses.count('orphaned')}",
                     file=sys.stderr,
                     flush=True,

@@ -49,7 +49,7 @@ function renderRoutines(){const root=$("routines");root.innerHTML="";for(const r
 function matches(session) {
   const q=$("search").value.trim().toLowerCase(), f=$("status-filter").value;
   if(q && !`${session.task} ${session.cwd} ${session.session_id}`.toLowerCase().includes(q)) return false;
-  if(f==="active" && session.status!=="running" && !(session.live&&session.permission_request)) return false;
+  if(f==="active" && !["running","blocked","stalled"].includes(session.status) && !(session.live&&session.permission_request)) return false;
   if(f==="running" && session.status!=="running") return false;
   if(f==="current" && !session.live) return false;
   if(f==="previous" && !session.historical) return false;
@@ -105,13 +105,14 @@ function renderDetail() {
   $("plan").innerHTML=plan.length?plan.map(item=>`<div class="plan-item ${escapeHtml(item.status)}"><span class="plan-state ${escapeHtml(item.status)}">${escapeHtml(item.status||"pending")}</span><span class="plan-text">${escapeHtml(item.content||item.title||"")}</span></div>`).join(""):`<div class="plan-empty">No structured plan reported.</div>`;
   const runs=state.detail.transcript.runs||[],timeline=$("messages"),scroller=$("session-content");$("run-count").textContent=state.detail.transcript.runs_total?`${state.detail.transcript.runs_total} runs`:"";
   const changedSession=state.timelineSession!==state.selected,signature=[state.selected,summary.status,state.detail.transcript.updated_at,state.detail.transcript.timeline_entries,state.detail.transcript.runs_total].join("|"),nearLatest=scroller.scrollHeight-scroller.scrollTop-scroller.clientHeight<100,previousScroll=scroller.scrollTop,opened=changedSession?new Set():new Set([...timeline.querySelectorAll("details[open][data-entry]")].map(node=>node.dataset.entry));
-  if(signature!==state.timelineSignature){timeline.innerHTML=runs.length?runs.map(run=>renderRun(run,summary.status==="running")).join(""):`<div class="plan-empty">No persisted runs yet.</div>`;for(const node of timeline.querySelectorAll("details[data-entry]"))if(opened.has(node.dataset.entry))node.open=true;state.timelineSignature=signature;state.timelineSession=state.selected;const restoreTimeline=()=>{scroller.scrollTop=(changedSession||nearLatest)?scroller.scrollHeight:previousScroll;};requestAnimationFrame(restoreTimeline);setTimeout(restoreTimeline,0);}
+  if(signature!==state.timelineSignature){timeline.innerHTML=runs.length?runs.map(run=>renderRun(run,["running","blocked","stalled"].includes(summary.status))).join(""):`<div class="plan-empty">No persisted runs yet.</div>`;for(const node of timeline.querySelectorAll("details[data-entry]"))if(opened.has(node.dataset.entry))node.open=true;state.timelineSignature=signature;state.timelineSession=state.selected;const restoreTimeline=()=>{scroller.scrollTop=(changedSession||nearLatest)?scroller.scrollHeight:previousScroll;};requestAnimationFrame(restoreTimeline);setTimeout(restoreTimeline,0);}
   renderPermission(session.permission_request||summary.permission_request_detail||null);
   populateConfig(config,session.config_known,session.config_source,session.pending_config||{});
   $("stop-button").disabled=!summary.live; $("resume-button").disabled=summary.live;
   $("resume-button").classList.toggle("hidden", summary.live);
   $("message-input").disabled=!summary.live; $("composer").querySelector("button[type=submit]").disabled=!summary.live;
-  $("session-facts").innerHTML=facts({Status:summary.status,Project:summary.cwd||"—",Owner:state.detail.owner_id,Resumable:String(Boolean(summary.resumable)),"Stop reason":summary.stop_reason||"—"});
+  const health=session.health||summary.health||{};
+  $("session-facts").innerHTML=facts({Status:summary.status,Project:summary.cwd||"—",Owner:state.detail.owner_id,Resumable:String(Boolean(summary.resumable)),"Stop reason":summary.stop_reason||"—","Health reason":health.reason||"—","Lease holder":health.workspace_lease_holder||"—","Protocol idle":health.protocol_idle_seconds==null?"—":`${health.protocol_idle_seconds}s`,"Runtime idle":health.runtime_idle_seconds==null?"—":`${health.runtime_idle_seconds}s`});
   $("transcript-facts").innerHTML=facts({Runs:state.detail.transcript.runs_total||0,Messages:state.detail.transcript.messages_total||0,"Tool calls":state.detail.transcript.tool_calls_total||0,Updated:when(state.detail.transcript.updated_at),Path:state.detail.transcript.transcript_path||"—"});
 }
 function renderRun(run,isLive){const active=Boolean(run.active&&isLive),entries=renderEntries(run.entries||[],run.number);return `<section class="run-card ${active?"active-run":""}"><header><span>Run ${run.number}</span>${active?`<b class="live-run"><i></i>Active now</b>`:""}<time>${escapeHtml(dateTime(run.started_at))}</time></header><div class="run-timeline">${entries||`<div class="plan-empty">No recorded activity.</div>`}</div></section>`;}

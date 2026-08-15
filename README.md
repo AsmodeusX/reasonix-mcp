@@ -158,6 +158,29 @@ path, and configuration errors reject the whole file before spawning. A
 provider/process failure during startup is returned on that agent while the
 other successful session IDs remain usable.
 
+Reasonix holds a safety lease per real workspace while a turn is active. Fleet
+members with the same `cwd` therefore queue rather than execute tools in
+parallel. Give each writing agent its own worktree and `cwd` for true
+concurrency. `reasonix_spawn_fleet` reports `shared_workspaces` when its JSON
+would create this contention; its `parallelism` setting controls concurrent
+spawn handshakes, not workspace tool execution.
+
+Agent health distinguishes three active states. `running` means the ACP pipe or
+a live tool subprocess has advanced recently; `blocked` means the turn is
+queued behind the named `workspace_lease_holder`; `stalled` means the ACP
+process is alive but neither its protocol nor process tree has advanced for 10
+minutes. The heartbeat reports these separately, `reasonix_list` and anomalous
+poll/watch results include compact `health` evidence, and the dashboard updates
+the status automatically. A stalled transition wakes `reasonix_watch` once;
+ordinary workspace queueing does not. This is diagnostic only—Reasonix MCP does
+not kill a quiet turn automatically. Override the diagnostic threshold with
+`REASONIX_MCP_RUNTIME_STALLED_AFTER` when a provider legitimately needs longer.
+
+Each ACP child has one stdout and one stderr reader thread. Those threads
+normally sleep in `anon_pipe_read` while the child is quiet; their count alone
+is not evidence of a daemon wedge. The liveness decision uses protocol and
+process-tree progress instead of thread count or PID existence.
+
 ## Local fleet dashboard
 
 The dashboard starts automatically with the first Reasonix MCP server and is
@@ -663,6 +686,7 @@ with `reasonix_resume` / `reasonix_resume_fleet`.
 .venv/bin/python tests/selftest_watch.py          # watch overlap/cancellation safety (no model calls)
 .venv/bin/python tests/selftest_recovery.py       # dead-child + durable fleet recovery (no model calls)
 .venv/bin/python tests/selftest_agentd_restart_escalation.py # lying shutdown → TERM → verified replacement
+.venv/bin/python tests/selftest_runtime_health.py # workspace-blocked vs process-stalled classification
 .venv/bin/python tests/selftest_mcp_restart.py   # manual + source-change hot reload (no model calls)
 .venv/bin/python tests/selftest_auto_reload.py   # agentd source watcher + self-replace (no model calls)
 .venv/bin/python tests/selftest_prompt_injection.py # one status contract per session (no model calls)
