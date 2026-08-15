@@ -147,6 +147,21 @@ class AgentdError(Exception):
         self.code = code
 
 
+BACKGROUND_FAILURE_MARKER = "failed: needs attention"
+BACKGROUND_RECOVERY_MAX_ATTEMPTS = max(
+    0, int(os.environ.get("REASONIX_MCP_BACKGROUND_RECOVERY_ATTEMPTS", "3"))
+)
+BACKGROUND_RECOVERY_PROMPT = """
+Reasonix reported that a background bash job failed and ended the previous
+turn. Continue the original task in this same session. Treat the failed job as
+terminal: do not poll or wait on that job id again. Inspect its already-captured
+output once if useful, diagnose the failure, and retry the necessary work with
+a corrected command. Prefer a foreground command unless the work genuinely
+needs to remain detached. Preserve completed work and finish the remaining
+todo items.
+""".strip()
+
+
 class Agentd:
     def __init__(self):
         self._registry: dict[str, acp_bridge.ReasonixAgent] = {}
@@ -194,21 +209,36 @@ class Agentd:
                             # Already answered: do not wake a watch or open a
                             # stale elicitation form for this request.
                             return
-                    event = common.build_agent_event(agent, kind, payload)
-                    self._loop.call_soon_threadsafe(
-                        self._wake_watchers, agent.session_id, kind
-                    )
                     if kind == acp_bridge.EV_TURN_END:
-                        self._persist_lifecycle(agent, "idle")
-                        self._loop.call_soon_threadsafe(self._schedule_idle_cleanup, agent)
-                        self._loop.call_soon_threadsafe(
-                            self._schedule_pending_config, agent
-                        )
+                        if self._prepare_background_recovery(agent, payload):
+                            event = common.build_agent_event(
+                                agent, "background_failure_recovery", payload
+                            )
+                            event.update({
+                                "note": "recoverable background bash failure; same-session continuation scheduled",
+                                "attempt": payload["recovery_attempt"],
+                                "max_attempts": payload["recovery_max_attempts"],
+                            })
+                            self._loop.call_soon_threadsafe(
+                                self._schedule_background_recovery, agent, payload
+                            )
+                        else:
+                            agent._background_recovery_attempts = 0
+                            event = common.build_agent_event(agent, kind, payload)
+                            self._handle_terminal_turn(agent)
                     elif kind == acp_bridge.EV_STATUS and agent.pending_config:
+                        event = common.build_agent_event(agent, kind, payload)
+                        self._loop.call_soon_threadsafe(
+                            self._wake_watchers, agent.session_id, kind
+                        )
                         self._loop.call_soon_threadsafe(
                             self._schedule_pending_config, agent
                         )
                     elif kind == acp_bridge.EV_PROCESS_EXIT:
+                        event = common.build_agent_event(agent, kind, payload)
+                        self._loop.call_soon_threadsafe(
+                            self._wake_watchers, agent.session_id, kind
+                        )
                         self._persist_lifecycle(
                             agent,
                             "orphaned" if (
@@ -218,6 +248,11 @@ class Agentd:
                             error_text=str(payload.get("error_text") or ""),
                         )
                         self._loop.call_soon_threadsafe(self._cancel_idle_cleanup, agent.session_id)
+                    else:
+                        event = common.build_agent_event(agent, kind, payload)
+                        self._loop.call_soon_threadsafe(
+                            self._wake_watchers, agent.session_id, kind
+                        )
                     if not self._shutting_down:
                         print(
                             f"reasonix agent_event emit: event={event.get('event')} "
@@ -253,6 +288,117 @@ class Agentd:
                 payload["error"] = agent.last_error
                 payload["error_text"] = agent.last_error_text
             agent.on_event(acp_bridge.EV_PROCESS_EXIT, payload)
+
+    @staticmethod
+    def _background_failure_text(agent: acp_bridge.ReasonixAgent, payload: dict) -> str:
+        parts = [
+            common.error_text(payload.get("error")),
+            str(payload.get("error_text") or ""),
+        ]
+        turns = getattr(agent, "turns", []) or []
+        if turns:
+            parts.extend((
+                str(turns[-1].get("text") or ""),
+                str(turns[-1].get("error_text") or ""),
+            ))
+        return "\n".join(parts).lower()
+
+    def _prepare_background_recovery(
+        self, agent: acp_bridge.ReasonixAgent, payload: dict
+    ) -> bool:
+        """Mark one exact native background-bash failure for continuation."""
+        if self._shutting_down or payload.get("stopReason") != "error":
+            return False
+        text = self._background_failure_text(agent, payload)
+        if "background bash" not in text or BACKGROUND_FAILURE_MARKER not in text:
+            return False
+        attempts = int(getattr(agent, "_background_recovery_attempts", 0) or 0)
+        if attempts >= BACKGROUND_RECOVERY_MAX_ATTEMPTS:
+            print(
+                "reasonix background recovery exhausted: "
+                f"session={agent.session_id} attempts={attempts}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+        attempts += 1
+        agent._background_recovery_attempts = attempts
+        agent._background_recovery_pending = True
+        payload.update({
+            "recovery_pending": True,
+            "recovery_attempt": attempts,
+            "recovery_max_attempts": BACKGROUND_RECOVERY_MAX_ATTEMPTS,
+        })
+        turns = getattr(agent, "turns", []) or []
+        if turns:
+            turns[-1].update({
+                "auto_recovered": True,
+                "recovery_attempt": attempts,
+            })
+        return True
+
+    def _handle_terminal_turn(self, agent: acp_bridge.ReasonixAgent) -> None:
+        self._loop.call_soon_threadsafe(
+            self._wake_watchers, agent.session_id, acp_bridge.EV_TURN_END
+        )
+        self._persist_lifecycle(agent, "idle")
+        self._loop.call_soon_threadsafe(self._schedule_idle_cleanup, agent)
+        self._loop.call_soon_threadsafe(self._schedule_pending_config, agent)
+
+    def _schedule_background_recovery(
+        self, agent: acp_bridge.ReasonixAgent, payload: dict
+    ) -> None:
+        asyncio.create_task(self._recover_background_failure(agent, payload))
+
+    async def _recover_background_failure(
+        self, agent: acp_bridge.ReasonixAgent, payload: dict
+    ) -> None:
+        try:
+            # Honor model/effort/approval changes queued during the failed
+            # turn before the automatic continuation begins.
+            await self._flush_pending_config(agent)
+            self._start_agent_turn(
+                agent, BACKGROUND_RECOVERY_PROMPT, auto_recovery=True
+            )
+        except Exception as exc:
+            # Recovery itself failed to start. Restore ordinary terminal
+            # delivery so a watch never hangs behind a swallowed error.
+            payload["recovery_pending"] = False
+            agent._background_recovery_pending = False
+            payload["recovery_start_error"] = str(exc)
+            turns = getattr(agent, "turns", []) or []
+            if turns:
+                turns[-1]["auto_recovered"] = False
+                turns[-1]["recovery_start_error"] = str(exc)
+            print(
+                "reasonix background recovery failed to start: "
+                f"session={agent.session_id} error={exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if agent.status == "exited":
+                # A concurrent process-exit event owns lifecycle persistence;
+                # only ensure a terminal watch cannot remain asleep.
+                self._loop.call_soon_threadsafe(
+                    self._wake_watchers,
+                    agent.session_id,
+                    acp_bridge.EV_TURN_END,
+                )
+            else:
+                self._handle_terminal_turn(agent)
+            if not self._shutting_down:
+                event = common.build_agent_event(
+                    agent, acp_bridge.EV_TURN_END, payload
+                )
+                await self._broadcast(event, getattr(agent, "owner_id", ""))
+            return
+        agent._background_recovery_pending = False
+        print(
+            "reasonix background recovery started: "
+            f"session={agent.session_id} attempt={payload['recovery_attempt']}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     @staticmethod
     def _persist_lifecycle(
@@ -517,8 +663,16 @@ class Agentd:
 
     # ---------------------------------------------------------------- methods
 
-    def _start_agent_turn(self, agent: acp_bridge.ReasonixAgent, message: str) -> None:
+    def _start_agent_turn(
+        self,
+        agent: acp_bridge.ReasonixAgent,
+        message: str,
+        *,
+        auto_recovery: bool = False,
+    ) -> None:
         """Start a turn, injecting the progress contract once per ACP session."""
+        if not auto_recovery:
+            agent._background_recovery_attempts = 0
         inject = not bool(getattr(agent, "status_protocol_injected", False))
         agent.start_turn(common.task_with_status_protocol(message) if inject else message)
         if inject:

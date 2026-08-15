@@ -710,6 +710,11 @@ class ReasonixAgent:
         self.runtime_health = {}
         self._runtime_alert_observed = False
         self.stop_reason = None
+        # Errors belong to the completed turn that produced them. Retaining
+        # them on a successful follow-up makes poll/list falsely report that
+        # the live continuation is still errored.
+        self.last_error = None
+        self.last_error_text = ""
         self._terminal_observed = False
         # The turn's response resolves when the turn ends; the reader routes it
         # to the event stream as EV_TURN_END so poll() sees the stop reason.

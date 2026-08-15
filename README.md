@@ -181,6 +181,15 @@ normally sleep in `anon_pipe_read` while the child is quiet; their count alone
 is not evidence of a daemon wedge. The liveness decision uses protocol and
 process-tree progress instead of thread count or PID existence.
 
+If native Reasonix ends a turn with `background bash failed: needs attention`,
+agentd treats that exact error as recoverable and starts a fresh turn on the
+same session. The continuation is told to inspect the failed job once, stop
+polling its terminal job id, correct the command, and continue the remaining
+task. This is capped at three consecutive attempts; after that, or if the new
+turn cannot start, normal terminal watch/error delivery resumes. Override the
+cap with `REASONIX_MCP_BACKGROUND_RECOVERY_ATTEMPTS` (set it to `0` to disable
+automatic recovery). Other errors are never retried automatically.
+
 ## Local fleet dashboard
 
 The dashboard starts automatically with the first Reasonix MCP server and is
@@ -357,6 +366,7 @@ For diagnostics, the server also emits this custom notification on the wire:
 ```
 
 - Events: `status` (plan/current-work update), `turn_end` (done/stopped/errored, with `stop_reason`),
+  `background_failure_recovery` (diagnostic same-session continuation),
   `permission_request` (a tool-approval **or an agent question** — see
   below), `process_exited`.
 - Diagnostic only: JSON-RPC clients silently ignore unknown notifications,
@@ -690,6 +700,7 @@ with `reasonix_resume` / `reasonix_resume_fleet`.
 .venv/bin/python tests/selftest_mcp_restart.py   # manual + source-change hot reload (no model calls)
 .venv/bin/python tests/selftest_auto_reload.py   # agentd source watcher + self-replace (no model calls)
 .venv/bin/python tests/selftest_prompt_injection.py # one status contract per session (no model calls)
+.venv/bin/python tests/selftest_background_recovery.py # bounded failed-background-job continuation
 .venv/bin/python tests/selftest_chaos.py       # cwd allowlist + dual notify + PDEATHSIG (no model calls)
 .venv/bin/python tests/selftest_allow_write.py  # cross-cwd write via allow_write (real provider)
 ```

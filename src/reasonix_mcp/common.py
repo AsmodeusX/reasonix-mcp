@@ -66,6 +66,12 @@ tool sequence, use the native plan tool for non-trivial work:
 - do not mark a step completed until it is actually verified.
 Keep the plan factual and concise. This is machine-readable progress state;
 you do not need to narrate it in every response.
+
+Use background bash only for genuinely long-lived or independent work. Prefer
+foreground bash for finite commands whose result you need immediately. If a
+background job reports that it failed or needs attention, treat that job as
+terminal: inspect its captured output, diagnose the failure, and continue the
+task without polling or waiting on the same failed job again.
 """.strip()
 
 
@@ -514,6 +520,8 @@ def agent_status(agent: acp_bridge.ReasonixAgent) -> str:
         reconcile()
     if agent.status == "exited":
         return "orphaned" if getattr(agent, "_orphaned", False) else "exited"
+    if getattr(agent, "_background_recovery_pending", False):
+        return "running"
     if agent.active_turn:
         runtime_status = getattr(agent, "runtime_status", "running")
         if runtime_status in ("blocked", "stalled"):
@@ -927,21 +935,32 @@ def shape_poll(
         full_text, full_text_truncated = _cap(agent.full_text, MAX_FULL_TEXT)
         result["full_text"] = full_text
         result["full_text_truncated"] = full_text_truncated
-    if turn_end is not None:
+    # A narrowly recoverable native background-job failure can end one ACP
+    # prompt while agentd immediately starts a continuation on the same
+    # session. Keep that historical boundary in `turns`, but do not let its
+    # queued terminal event overwrite the live continuation's status/error.
+    recovery_pending = bool(turn_end and turn_end.get("recovery_pending"))
+    if recovery_pending:
+        result["auto_recovery"] = {
+            "reason": "background_job_failed",
+            "attempt": turn_end.get("recovery_attempt"),
+            "max_attempts": turn_end.get("recovery_max_attempts"),
+        }
+    if turn_end is not None and not recovery_pending:
         agent.stop_reason = turn_end.get("stopReason")
         result["stop_reason"] = turn_end.get("stopReason")
         result["transcript_path"] = turn_end.get("transcriptPath")
-    if agent.stop_reason and "stop_reason" not in result:
+    if agent.stop_reason and "stop_reason" not in result and not recovery_pending:
         result["stop_reason"] = agent.stop_reason
     if process_exit is not None:
         result["process_exit"] = process_exit
-    if turn_end is not None and turn_end.get("error") is not None:
+    if turn_end is not None and not recovery_pending and turn_end.get("error") is not None:
         result["error"] = turn_end["error"]
         result["error_text"] = error_text(turn_end["error"])
     elif process_exit is not None and process_exit.get("error_text"):
         result["error"] = process_exit.get("error") or process_exit["error_text"]
         result["error_text"] = process_exit["error_text"]
-    elif getattr(agent, "last_error", None) is not None:
+    elif not recovery_pending and getattr(agent, "last_error", None) is not None:
         result["error"] = agent.last_error
         result["error_text"] = getattr(agent, "last_error_text", "") or error_text(agent.last_error)
     return result
@@ -981,6 +1000,8 @@ def compact_poll_result(detailed: dict) -> dict:
     }
     if detailed.get("health"):
         result["health"] = detailed["health"]
+    if detailed.get("auto_recovery"):
+        result["auto_recovery"] = detailed["auto_recovery"]
     for key in ("stop_reason", "permission_request"):
         if detailed.get(key) is not None:
             result[key] = detailed[key]
